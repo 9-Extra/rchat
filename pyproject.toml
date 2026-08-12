@@ -1,0 +1,11 @@
+[project]
+name = "airp"
+version = "0.1.0"
+description = "简化版 SillyTavern：AIRP 后端"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "pyyaml",
+]

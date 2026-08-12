@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>上下文预览</title>
+<style>
+  body { font-family: "Microsoft YaHei", system-ui, sans-serif; background: #1a1b1e; color: #ddd; padding: 20px; }
+  h1 { font-size: 18px; margin-bottom: 14px; }
+  details.msg { max-width: 900px; margin: 0 auto 10px; background: #24262b; border: 1px solid #35383e; border-radius: 8px; padding: 8px 14px; }
+  details.msg summary { cursor: pointer; font-size: 13px; color: #999; }
+  details.msg summary .role { font-weight: bold; margin-right: 8px; }
+  .role.system { color: #7ab; } .role.user { color: #ba7; } .role.assistant { color: #7ba; } .role.tool { color: #c8c; }
+  .body { white-space: pre-wrap; line-height: 1.6; font-size: 13px; word-break: break-word; margin-top: 8px; }
+  .toolcall { background: #1f2620; border-radius: 6px; padding: 6px 10px; margin-top: 6px; font-size: 13px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>上下文预览 — 将发送给 AI 的完整提示词</h1>
+<div id="list">加载中…</div>
+<script>
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+(async () => {
+  const session = new URLSearchParams(location.search).get('session');
+  const input = sessionStorage.getItem('preview_draft') || '';
+  const r = await fetch('/api/preview', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session, input }),
+  });
+  const data = await r.json();
+  if (!r.ok) { document.getElementById('list').textContent = data.detail || '加载失败'; return; }
+  let html = '';
+  for (const m of data.messages) {
+    let inner = '';
+    if (m.content) inner += `<div class="body">${esc(m.content)}</div>`;
+    for (const tc of m.tool_calls || []) {
+      let args = tc.function.arguments;
+      try { args = JSON.stringify(JSON.parse(args), null, 2); } catch (e) {}
+      inner += `<div class="toolcall">工具调用 ${esc(tc.function.name)}：\n${esc(args)}</div>`;
+    }
+    const head = (m.content || (m.tool_calls || []).map(t => '[工具调用 ' + t.function.name + ']').join(' '))
+      .replace(/\s+/g, ' ').slice(0, 60);
+    // 默认折叠，只显示 role 和开头内容
+    html += `<details class="msg"><summary><span class="role ${m.role}">${m.role}</span>${esc(head)}…</summary>${inner}</details>`;
+  }
+  html += `<details class="msg"><summary><span class="role">tools</span>工具定义</summary><div class="body">${esc(JSON.stringify(data.tools, null, 2))}</div></details>`;
+  document.getElementById('list').innerHTML = html;
+})();
+</script>
+</body>
+</html>

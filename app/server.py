@@ -1,0 +1,236 @@
+"""FastAPI 服务端：页面、会话管理、流式对话。"""
+import json
+import re
+import time
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+
+from app import core
+from app.llm import stream_respond
+
+STATIC = core.ROOT / "app" / "static"
+
+app = FastAPI(title="AIRP")
+
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC / "index.html")
+
+
+@app.get("/preview.html")
+def preview_page():
+    return FileResponse(STATIC / "preview.html")
+
+
+# ---------- 资源列表 ----------
+
+@app.get("/api/presets")
+def get_presets():
+    return [
+        {"id": p["id"], "name": p["name"], "description": p["description"]}
+        for p in core.load_presets().values()
+    ]
+
+
+@app.get("/api/cards")
+def get_cards():
+    return [
+        {
+            "id": c["id"],
+            "name": c["name"],
+            "description": c["description"],
+            "beginnings": [b[:60] for b in c["beginnings"]],
+        }
+        for c in core.load_cards().values()
+    ]
+
+
+@app.get("/api/sessions")
+def get_sessions():
+    return core.list_sessions()
+
+
+# ---------- 会话管理 ----------
+
+class CreateSession(BaseModel):
+    name: str = ""
+    preset: str
+    card: str
+    beginning_index: int | None = None
+
+
+@app.post("/api/sessions")
+def post_session(req: CreateSession):
+    name = req.name.strip()
+    if not name:
+        # 自动生成：角色卡 id 清洗掉非法字符 + 时间戳
+        safe_card = re.sub(r"[^\w\-一-鿿]+", "_", req.card).strip("_") or "session"
+        name = f"{safe_card}-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        return core.create_session(name, req.preset, req.card, req.beginning_index)
+    except (ValueError, IndexError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/sessions/{name}")
+def get_session(name: str):
+    try:
+        state = core.load_state(name)
+        state["history"] = core.load_history(name)
+        return state
+    except FileNotFoundError:
+        raise HTTPException(404, "session 不存在")
+
+
+@app.delete("/api/sessions/{name}")
+def delete_session(name: str):
+    import shutil
+    try:
+        shutil.rmtree(core._session_dir(name))
+    except FileNotFoundError:
+        raise HTTPException(404, "session 不存在")
+    return {"ok": True}
+
+
+class SwitchPreset(BaseModel):
+    preset: str
+
+
+@app.post("/api/sessions/{name}/preset")
+def switch_preset(name: str, req: SwitchPreset):
+    if req.preset not in core.load_presets():
+        raise HTTPException(400, "预设不存在")
+    state = core.load_state(name)
+    state["preset"] = req.preset
+    core.save_state(state)
+    return state
+
+
+class EditBeginning(BaseModel):
+    text: str
+
+
+@app.post("/api/sessions/{name}/beginning")
+def edit_beginning(name: str, req: EditBeginning):
+    state = core.load_state(name)
+    state["beginning_text"] = req.text
+    core.save_state(state)
+    return state
+
+
+class EditAI(BaseModel):
+    index: int
+    content: str
+    options: list[str] = []
+
+
+@app.post("/api/sessions/{name}/edit_ai")
+def edit_ai(name: str, req: EditAI):
+    history = core.load_history(name)
+    if not (0 <= req.index < len(history)) or history[req.index]["role"] != "assistant":
+        raise HTTPException(400, "目标不是 AI 块")
+    history[req.index]["content"] = req.content
+    history[req.index]["options"] = req.options
+    core.save_history(name, history)
+    return {"ok": True}
+
+
+class Rollback(BaseModel):
+    index: int
+
+
+@app.post("/api/sessions/{name}/rollback")
+def rollback(name: str, req: Rollback):
+    history = core.load_history(name)
+    if not (0 <= req.index < len(history)) or history[req.index]["role"] != "user":
+        raise HTTPException(400, "目标不是用户块")
+    text = history[req.index]["content"]
+    core.save_history(name, history[: req.index])
+    return {"input": text}
+
+
+# ---------- 上下文预览 ----------
+
+class Preview(BaseModel):
+    session: str
+    input: str = ""
+
+
+@app.post("/api/preview")
+def preview(req: Preview):
+    state = core.load_state(req.session)
+    history = core.load_history(req.session)
+    messages = core.build_messages(state, history, draft=req.input or None)
+    return {"tools": [core.RESPOND_TOOL], "messages": messages}
+
+
+# ---------- 流式对话 ----------
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def _generate(name: str, mode: str, user_input: str | None):
+    """mode: start（首轮）/ chat（带用户输入）/ regenerate（重发最后一轮）。"""
+    try:
+        state = core.load_state(name)
+        history = core.load_history(name)
+        if mode == "start":
+            if history:
+                raise ValueError("会话已开始，不能再次开局")
+            draft = None
+        elif mode == "chat":
+            if not history or history[-1]["role"] != "assistant":
+                raise ValueError("当前不能发送：没有待回复的 AI 块")
+            draft = user_input
+        else:  # regenerate：丢弃最后一个 AI 块，用它回复的用户输入重新生成
+            if history and history[-1]["role"] == "assistant":
+                history.pop()
+            if history and history[-1]["role"] == "user":
+                draft = history.pop()["content"]
+            else:
+                draft = None  # 首轮重新生成
+        messages = core.build_messages(state, history, draft=draft)
+        config = core.load_config()
+        done = None
+        async for event in stream_respond(messages, config):
+            if event["type"] == "done":
+                done = event
+            yield _sse(event)
+        if done is None:
+            raise RuntimeError("API 未返回完整结果")
+        # 成功后一次性落盘
+        if mode == "chat":
+            history.append({"role": "user", "content": user_input})
+        elif mode == "regenerate" and draft is not None:
+            history.append({"role": "user", "content": draft})
+        history.append({"role": "assistant", "content": done["content"], "options": done["options"], "reasoning": done.get("reasoning", "")})
+        core.save_history(name, history)
+    except Exception as e:
+        yield _sse({"type": "error", "message": str(e)})
+
+
+class ChatInput(BaseModel):
+    input: str
+
+
+@app.post("/api/sessions/{name}/chat")
+def chat(name: str, req: ChatInput):
+    return StreamingResponse(
+        _generate(name, "chat", req.input), media_type="text/event-stream"
+    )
+
+
+@app.post("/api/sessions/{name}/start")
+def start(name: str):
+    return StreamingResponse(_generate(name, "start", None), media_type="text/event-stream")
+
+
+@app.post("/api/sessions/{name}/regenerate")
+def regenerate(name: str):
+    return StreamingResponse(
+        _generate(name, "regenerate", None), media_type="text/event-stream"
+    )
