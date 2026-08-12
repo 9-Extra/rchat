@@ -28,7 +28,7 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
   });
   const data = await r.json();
   if (!r.ok) { document.getElementById('list').textContent = data.detail || '加载失败'; return; }
-  let html = '';
+  let html = `<details class="msg"><summary><span class="role">tools</span>工具定义</summary><div class="body">${esc(JSON.stringify(data.tools, null, 2))}</div></details>`;
   for (const m of data.messages) {
     let inner = '';
     if (m.content) inner += `<div class="body">${esc(m.content)}</div>`;
@@ -42,7 +42,6 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
     // 默认折叠，只显示 role 和开头内容
     html += `<details class="msg"><summary><span class="role ${m.role}">${m.role}</span>${esc(head)}…</summary>${inner}</details>`;
   }
-  html += `<details class="msg"><summary><span class="role">tools</span>工具定义</summary><div class="body">${esc(JSON.stringify(data.tools, null, 2))}</div></details>`;
   document.getElementById('list').innerHTML = html;
 })();
 </script>

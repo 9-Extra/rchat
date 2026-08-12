@@ -12,13 +12,13 @@ GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
 # AIRP 任务提示词：使 AI 明确自身任务（只通过 respond 工具输出）。
+# 通过预设中的 {{airp_task}} 宏显式插入，代码不会自动注入任何额外系统提示词。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
+# 实际上用户可以看到思考内容，但不需要告诉模型
 AIRP_PROMPT = """<airp_task>
-你是一个互动式角色扮演（AIRP）引擎，负责根据角色设定与对话历史推进剧情。
 你的唯一输出通道是 respond 工具：
 - 你必须通过调用 respond 工具输出剧情正文（content）与后续选项（options）。
 - 只有工具调用内部的内容对用户可见，工具之外的任何文本用户都看不到。
-- options 是供用户快速选择的剧情推进方向，数量为 0 到多个，可以为空数组；具体数量与内容由系统/用户提示中的要求决定。
 - 用户的新一轮输入会作为你上一次工具调用的结果（tool 消息）返回给你，你需要将其融入后续剧情。
 </airp_task>"""
 
@@ -171,16 +171,13 @@ def build_messages(state: dict, history: list, draft=None) -> list:
     card = load_cards()[state["card"]]
     messages = []
     for sec in preset["sections"]:
-        content = sec["content"].replace("{{game_setting}}", card["setting"]).replace(
-            "{{game_beginning}}", state["beginning_text"]
+        content = (
+            sec["content"]
+            .replace("{{game_setting}}", card["setting"])
+            .replace("{{game_beginning}}", state["beginning_text"])
+            .replace("{{airp_task}}", AIRP_PROMPT)
         )
         messages.append({"role": sec["role"], "content": content})
-    # AIRP 任务提示词插到最后一条 system 消息之后
-    idx = 0
-    for i, m in enumerate(messages):
-        if m["role"] == "system":
-            idx = i + 1
-    messages.insert(idx, {"role": "system", "content": AIRP_PROMPT})
     # 对话历史：assistant 块 -> respond 工具调用；user 块 -> 工具调用结果
     call_n = 0
     for entry in history:

@@ -1,4 +1,6 @@
 """FastAPI 服务端：页面、会话管理、流式对话。"""
+
+import asyncio
 import json
 import re
 import time
@@ -27,6 +29,7 @@ def preview_page():
 
 # ---------- 资源列表 ----------
 
+
 @app.get("/api/presets")
 def get_presets():
     return [
@@ -54,6 +57,7 @@ def get_sessions():
 
 
 # ---------- 会话管理 ----------
+
 
 class CreateSession(BaseModel):
     name: str = ""
@@ -88,6 +92,7 @@ def get_session(name: str):
 @app.delete("/api/sessions/{name}")
 def delete_session(name: str):
     import shutil
+
     try:
         shutil.rmtree(core._session_dir(name))
     except FileNotFoundError:
@@ -154,6 +159,7 @@ def rollback(name: str, req: Rollback):
 
 # ---------- 上下文预览 ----------
 
+
 class Preview(BaseModel):
     session: str
     input: str = ""
@@ -169,19 +175,44 @@ def preview(req: Preview):
 
 # ---------- 流式对话 ----------
 
+# 每个 session 当前正在进行的生成任务，用于打断
+_active: dict = {}
+
+
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def _persist(name, history, mode, user_input, draft, content, options, reasoning):
+    if mode == "chat":
+        history.append({"role": "user", "content": user_input})
+    elif mode == "regenerate" and draft is not None:
+        history.append({"role": "user", "content": draft})
+    history.append(
+        {
+            "role": "assistant",
+            "content": content,
+            "options": options,
+            "reasoning": reasoning,
+        }
+    )
+    core.save_history(name, history)
+
+
 async def _generate(name: str, mode: str, user_input: str | None):
     """mode: start（首轮）/ chat（带用户输入）/ regenerate（重发最后一轮）。"""
+    _active[name] = asyncio.current_task()
+    history = []
+    draft = None
+    partial_content = ""
+    partial_reasoning = ""
+    streaming_started = False
     try:
         state = core.load_state(name)
         history = core.load_history(name)
         if mode == "start":
             if history:
                 raise ValueError("会话已开始，不能再次开局")
-            draft = None
         elif mode == "chat":
             if not history or history[-1]["role"] != "assistant":
                 raise ValueError("当前不能发送：没有待回复的 AI 块")
@@ -191,26 +222,60 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 history.pop()
             if history and history[-1]["role"] == "user":
                 draft = history.pop()["content"]
-            else:
-                draft = None  # 首轮重新生成
         messages = core.build_messages(state, history, draft=draft)
         config = core.load_config()
         done = None
+        streaming_started = True
         async for event in stream_respond(messages, config):
             if event["type"] == "done":
                 done = event
+            elif event["type"] == "content":
+                partial_content += event["delta"]
+            elif event["type"] == "reasoning":
+                partial_reasoning += event["delta"]
             yield _sse(event)
         if done is None:
             raise RuntimeError("API 未返回完整结果")
         # 成功后一次性落盘
-        if mode == "chat":
-            history.append({"role": "user", "content": user_input})
-        elif mode == "regenerate" and draft is not None:
-            history.append({"role": "user", "content": draft})
-        history.append({"role": "assistant", "content": done["content"], "options": done["options"], "reasoning": done.get("reasoning", "")})
-        core.save_history(name, history)
+        _persist(
+            name,
+            history,
+            mode,
+            user_input,
+            draft,
+            done["content"],
+            done["options"],
+            done.get("reasoning", ""),
+        )
+    except asyncio.CancelledError:
+        # 用户打断：半截输出落盘，由用户手动回滚或修改
+        if streaming_started:
+            _persist(
+                name,
+                history,
+                mode,
+                user_input,
+                draft,
+                partial_content or "（输出已被打断）",
+                [],
+                partial_reasoning,
+            )
     except Exception as e:
         yield _sse({"type": "error", "message": str(e)})
+    finally:
+        _active.pop(name, None)
+
+
+@app.post("/api/sessions/{name}/interrupt")
+async def interrupt(name: str):
+    task = _active.get(name)
+    if task is not None:
+        task.cancel()
+        try:
+            await task  # 等半截输出落盘后再返回
+        except BaseException:
+            pass
+    return {"ok": True}
 
 
 class ChatInput(BaseModel):
@@ -226,7 +291,9 @@ def chat(name: str, req: ChatInput):
 
 @app.post("/api/sessions/{name}/start")
 def start(name: str):
-    return StreamingResponse(_generate(name, "start", None), media_type="text/event-stream")
+    return StreamingResponse(
+        _generate(name, "start", None), media_type="text/event-stream"
+    )
 
 
 @app.post("/api/sessions/{name}/regenerate")
