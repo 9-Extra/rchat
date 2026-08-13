@@ -324,9 +324,16 @@ function editBlock(div, text, onSave) {
 const enc = () => encodeURIComponent(cur.name);
 const post = obj => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) });
 
-async function streamInto(url, opts) {
+async function streamInto(url, opts, userText) {
   streaming = true; updateComposer();
   const chat = $('chat');
+  // 用户输入块立即显示
+  if (userText != null) {
+    const u = document.createElement('div');
+    u.className = 'block user';
+    u.innerHTML = `<div class="tag">你</div><div class="content">${esc(userText)}</div>`;
+    chat.appendChild(u);
+  }
   const div = document.createElement('div');
   div.className = 'block ai';
   div.innerHTML = `<div class="tag">AI（生成中…）</div>
@@ -379,11 +386,14 @@ function send() {
   $('input').value = '';
   autoGrow();
   if (!cur.history.length) return; // 首轮用「开始」
-  streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }));
+  streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }), text);
 }
 
 function regenerate() {
   if (streaming) return;
+  // 立即移除旧的最后一个 AI 块，避免新旧两块同时显示
+  const blocks = $('chat').querySelectorAll('.block.ai');
+  if (blocks.length) blocks[blocks.length - 1].remove();
   streamInto(`/api/sessions/${enc()}/regenerate`, { method: 'POST' });
 }
 

@@ -46,6 +46,7 @@ SECTION_RE = re.compile(
     r'<preset_section\s+role="(system|user|assistant)"\s*>(.*?)</preset_section>', re.S
 )
 SETTING_RE = re.compile(r"<game_setting>(.*?)</game_setting>", re.S)
+USER_SETTING_RE = re.compile(r"<user_setting>(.*?)</user_setting>", re.S)
 BEGINNING_RE = re.compile(r"<game_beginning>(.*?)</game_beginning>", re.S)
 NAME_RE = re.compile(r"[\w\-一-鿿]+")
 
@@ -80,11 +81,13 @@ def load_cards() -> dict:
     for p in sorted(GAMES_DIR.glob("*.md")):
         meta, body = _split_frontmatter(p.read_text(encoding="utf-8"))
         m = SETTING_RE.search(body)
+        um = USER_SETTING_RE.search(body)
         cards[p.stem] = {
             "id": p.stem,
             "name": meta.get("name") or p.stem,
             "description": meta.get("description") or "",
             "setting": m.group(1).strip() if m else "",
+            "user_setting": um.group(1).strip() if um else "",
             "beginnings": [b.group(1).strip() for b in BEGINNING_RE.finditer(body)],
         }
     return cards
@@ -175,6 +178,7 @@ def build_messages(state: dict, history: list, draft=None) -> list:
             sec["content"]
             .replace("{{game_setting}}", card["setting"])
             .replace("{{game_beginning}}", state["beginning_text"])
+            .replace("{{user_setting}}", card["user_setting"])
             .replace("{{airp_task}}", AIRP_PROMPT)
         )
         messages.append({"role": sec["role"], "content": content})
