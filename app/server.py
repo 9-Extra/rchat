@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -70,9 +69,8 @@ class CreateSession(BaseModel):
 def post_session(req: CreateSession):
     name = req.name.strip()
     if not name:
-        # 自动生成：角色卡 id 清洗掉非法字符 + 时间戳
-        safe_card = re.sub(r"[^\w\-一-鿿]+", "_", req.card).strip("_") or "session"
-        name = f"{safe_card}-{time.strftime('%Y%m%d-%H%M%S')}"
+        # 自动生成：角色卡 id + 时间戳（目录名由 core 在落盘时安全化，显示名保持原样）
+        name = f"{req.card}-{time.strftime('%Y%m%d-%H%M%S')}"
     try:
         return core.create_session(name, req.preset, req.card, req.beginning_index)
     except (ValueError, IndexError) as e:

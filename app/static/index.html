@@ -170,15 +170,15 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 async function loadSessions() {
   const list = await api('/api/sessions');
   $('sessionList').innerHTML = list.map(s =>
-    `<li data-n="${esc(s.name)}" class="${cur && cur.name === s.name ? 'active' : ''}">` +
+    `<li data-i="${esc(s.id)}" data-n="${esc(s.name)}" class="${cur && cur.id === s.id ? 'active' : ''}">` +
     `<span class="sname">${esc(s.name)}</span><button class="del" title="删除会话">×</button></li>`).join('');
   document.querySelectorAll('#sessionList li').forEach(li => {
-    li.onclick = () => selectSession(li.dataset.n);
+    li.onclick = () => selectSession(li.dataset.i);
     li.querySelector('.del').onclick = async e => {
       e.stopPropagation();
       if (!confirm(`删除会话「${li.dataset.n}」？此操作不可恢复。`)) return;
-      await api('/api/sessions/' + encodeURIComponent(li.dataset.n), { method: 'DELETE' });
-      if (cur && cur.name === li.dataset.n) {
+      await api('/api/sessions/' + encodeURIComponent(li.dataset.i), { method: 'DELETE' });
+      if (cur && cur.id === li.dataset.i) {
         cur = null;
         $('toolbar').style.display = 'none';
         $('composer').style.display = 'none';
@@ -189,8 +189,8 @@ async function loadSessions() {
   });
 }
 
-async function selectSession(name) {
-  cur = await api('/api/sessions/' + encodeURIComponent(name));
+async function selectSession(id) {
+  cur = await api('/api/sessions/' + encodeURIComponent(id));
   stickBottom = true;
   render();
   loadSessions();
@@ -321,7 +321,7 @@ function editBlock(div, text, onSave) {
 }
 
 // ---------- 流式对话 ----------
-const enc = () => encodeURIComponent(cur.name);
+const enc = () => encodeURIComponent(cur.id);
 const post = obj => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) });
 
 async function streamInto(url, opts, userText) {
@@ -450,7 +450,7 @@ $('mCreate').onclick = async () => {
   try {
     const s = await api('/api/sessions', post(body));
     $('modalMask').style.display = 'none';
-    await selectSession(s.name);
+    await selectSession(s.id);
   } catch (e) { alert(e.message); }
 };
 

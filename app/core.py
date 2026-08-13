@@ -12,15 +12,15 @@ GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
 # AIRP 任务提示词：使 AI 明确自身任务（只通过 respond 工具输出）。
-# 通过预设中的 {{airp_task}} 宏显式插入，代码不会自动注入任何额外系统提示词。
+# 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
 # 实际上用户可以看到思考内容，但不需要告诉模型
-AIRP_PROMPT = """<airp_task>
+AIRP_PROMPT = """
 你的唯一输出通道是 respond 工具：
 - 你必须通过调用 respond 工具输出剧情正文（content）与后续选项（options）。
 - 只有工具调用内部的内容对用户可见，工具之外的任何文本用户都看不到。
 - 用户的新一轮输入会作为你上一次工具调用的结果（tool 消息）返回给你，你需要将其融入后续剧情。
-</airp_task>"""
+"""
 
 RESPOND_TOOL = {
     "type": "function",
@@ -30,11 +30,11 @@ RESPOND_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "剧情正文"},
+                "content": {"type": "string", "description": "正文"},
                 "options": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "0 到多个剧情推进选项，可为空数组",
+                    "description": "正文后的剧情推进选项",
                 },
             },
             "required": ["content"],
@@ -48,7 +48,27 @@ SECTION_RE = re.compile(
 SETTING_RE = re.compile(r"<game_setting>(.*?)</game_setting>", re.S)
 USER_SETTING_RE = re.compile(r"<user_setting>(.*?)</user_setting>", re.S)
 BEGINNING_RE = re.compile(r"<game_beginning>(.*?)</game_beginning>", re.S)
-NAME_RE = re.compile(r"[\w\-一-鿿]+")
+# 文件系统明确不允许的字符（Windows 保留字符 + 控制字符）
+INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Windows 保留设备名
+RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def safe_dir_name(name: str) -> str:
+    """把任意 session 名映射为可正常创建的文件夹名。幂等：对结果再次调用结果不变。
+
+    只影响磁盘上的目录名；session 的原始名不做任何修改，保存在 state.json 中。
+    """
+    safe = INVALID_NAME_RE.sub("_", name).rstrip(". ")
+    if not safe:
+        safe = "session"
+    if safe.split(".")[0].lower() in RESERVED_NAMES:
+        safe = "_" + safe
+    return safe
 
 
 def _split_frontmatter(text: str):
@@ -100,9 +120,7 @@ def load_config() -> dict:
 # ---------- session 存储 ----------
 
 def _session_dir(name: str) -> Path:
-    if not NAME_RE.fullmatch(name):
-        raise ValueError("非法 session 名称")
-    return SESSIONS_DIR / name
+    return SESSIONS_DIR / safe_dir_name(name)
 
 
 def list_sessions() -> list:
@@ -131,6 +149,7 @@ def create_session(name: str, preset: str, card: str, beginning_index):
     d.mkdir(parents=True)
     (d / "history.jsonl").touch()
     state = {
+        "id": d.name,
         "name": name,
         "preset": preset,
         "card": card,
@@ -143,7 +162,10 @@ def create_session(name: str, preset: str, card: str, beginning_index):
 
 
 def load_state(name: str) -> dict:
-    return json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
+    state = json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
+    # 旧版 state.json 没有 id 字段，按目录名规则补上
+    state.setdefault("id", safe_dir_name(state["name"]))
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -179,7 +201,7 @@ def build_messages(state: dict, history: list, draft=None) -> list:
             .replace("{{game_setting}}", card["setting"])
             .replace("{{game_beginning}}", state["beginning_text"])
             .replace("{{user_setting}}", card["user_setting"])
-            .replace("{{airp_task}}", AIRP_PROMPT)
+            .replace("{{respond_tool}}", AIRP_PROMPT)
         )
         messages.append({"role": sec["role"], "content": content})
     # 对话历史：assistant 块 -> respond 工具调用；user 块 -> 工具调用结果

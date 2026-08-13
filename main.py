@@ -1,4 +1,4 @@
-"""AIRP 后端入口：uv run -m main [--port 25530]"""
+"""AIRP 后端入口：uv run -m main [--port 25530] [--no-browser]"""
 import argparse
 import asyncio
 import socket
@@ -13,9 +13,11 @@ from app.server import app
 def main() -> None:
     parser = argparse.ArgumentParser(description="AIRP 后端")
     parser.add_argument("--port", type=int, default=25530, help="监听端口（默认 25530）")
+    parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     args = parser.parse_args()
 
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
+    if not args.no_browser:
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
     # 手动创建 IPV6_V6ONLY=0 的监听 socket，实现单 socket 双栈（IPv4 + IPv6）
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
