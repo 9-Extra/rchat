@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -9,21 +10,26 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app import core
-from app.llm import stream_respond
+from app.llm import build_request, stream_respond
+
+logger = logging.getLogger("airp")
 
 STATIC = core.ROOT / "app" / "static"
+
+# 单页应用、文件少且常改：禁用缓存，避免浏览器拿旧版 JS
+NO_CACHE = {"Cache-Control": "no-cache"}
 
 app = FastAPI(title="AIRP")
 
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    return FileResponse(STATIC / "index.html", headers=NO_CACHE)
 
 
 @app.get("/preview.html")
 def preview_page():
-    return FileResponse(STATIC / "preview.html")
+    return FileResponse(STATIC / "preview.html", headers=NO_CACHE)
 
 
 # ---------- 资源列表 ----------
@@ -167,8 +173,13 @@ class Preview(BaseModel):
 def preview(req: Preview):
     state = core.load_state(req.session)
     history = core.load_history(req.session)
-    messages = core.build_messages(state, history, draft=req.input or None)
-    return {"tools": [core.RESPOND_TOOL], "messages": messages}
+    try:
+        input_items = core.build_input(state, history, draft=req.input or None)
+    except ValueError as e:
+        # 预设宏执行失败：用户侧错误，返回 400 而非 500
+        raise HTTPException(400, str(e))
+    # 展示实际发送给 Responses API 的请求参数
+    return build_request(input_items, core.load_config())
 
 
 # ---------- 流式对话 ----------
@@ -220,11 +231,11 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 history.pop()
             if history and history[-1]["role"] == "user":
                 draft = history.pop()["content"]
-        messages = core.build_messages(state, history, draft=draft)
+        input_items = core.build_input(state, history, draft=draft)
         config = core.load_config()
         done = None
         streaming_started = True
-        async for event in stream_respond(messages, config):
+        async for event in stream_respond(input_items, config):
             if event["type"] == "done":
                 done = event
             elif event["type"] == "content":
@@ -258,7 +269,13 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 [],
                 partial_reasoning,
             )
+    except ValueError as e:
+        # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
+        logger.warning("会话 %s 用户侧错误: %s", name, e)
+        yield _sse({"type": "error", "message": str(e), "popup": True})
     except Exception as e:
+        # 后端/API 错误：控制台保留完整堆栈，同时发给前端内联显示
+        logger.exception("会话 %s 生成失败", name)
         yield _sse({"type": "error", "message": str(e)})
     finally:
         _active.pop(name, None)

@@ -8,4 +8,9 @@ dependencies = [
     "uvicorn",
     "httpx",
     "pyyaml",
+    "openai>=3.0.0",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true

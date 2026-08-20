@@ -360,7 +360,12 @@ async function streamInto(url, opts, userText) {
         const ev = JSON.parse(line.slice(5));
         if (ev.type === 'reasoning') { thinkDiv.textContent += ev.delta; scrollBottom(); }
         else if (ev.type === 'content') { contentDiv.textContent += ev.delta; scrollBottom(); }
-        else if (ev.type === 'error') { div.querySelector('.tag').textContent = '出错'; contentDiv.textContent = ev.message; }
+        else if (ev.type === 'error') {
+          // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块
+          if (ev.popup) alert(ev.message);
+          div.querySelector('.tag').textContent = '出错';
+          contentDiv.textContent = ev.message;
+        }
       }
     }
   } catch (err) {
