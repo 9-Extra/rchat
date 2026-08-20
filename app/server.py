@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import core
+from app import core, tools, world
 from app.llm import build_request, stream_respond
 
 logger = logging.getLogger("airp")
@@ -101,6 +101,7 @@ def delete_session(name: str):
         shutil.rmtree(core._session_dir(name))
     except FileNotFoundError:
         raise HTTPException(404, "session 不存在")
+    world.drop(name)
     return {"ok": True}
 
 
@@ -158,6 +159,8 @@ def rollback(name: str, req: Rollback):
         raise HTTPException(400, "目标不是用户块")
     text = history[req.index]["content"]
     core.save_history(name, history[: req.index])
+    # 世界状态跟着历史回滚到同一位置
+    world.sync(name, req.index)
     return {"input": text}
 
 
@@ -192,19 +195,21 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-def _persist(name, history, mode, user_input, draft, content, options, reasoning):
+def _persist(name, history, mode, user_input, draft, content, options, reasoning, tool_calls):
     if mode == "chat":
         history.append({"role": "user", "content": user_input})
     elif mode == "regenerate" and draft is not None:
         history.append({"role": "user", "content": draft})
-    history.append(
-        {
-            "role": "assistant",
-            "content": content,
-            "options": options,
-            "reasoning": reasoning,
-        }
-    )
+    entry = {
+        "role": "assistant",
+        "content": content,
+        "options": options,
+        "reasoning": reasoning,
+    }
+    # 回合内 respond 之前的 world_run/read_file 调用,重放上下文时用
+    if tool_calls:
+        entry["tool_calls"] = tool_calls
+    history.append(entry)
     core.save_history(name, history)
 
 
@@ -213,8 +218,10 @@ async def _generate(name: str, mode: str, user_input: str | None):
     _active[name] = asyncio.current_task()
     history = []
     draft = None
+    tool_calls = []
     partial_content = ""
-    partial_reasoning = ""
+    # 当前未完成轮(自上次工具事件后)累积的思维链;打断落盘时作为 respond 前的 reasoning
+    tail_reasoning = ""
     streaming_started = False
     try:
         state = core.load_state(name)
@@ -231,17 +238,30 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 history.pop()
             if history and history[-1]["role"] == "user":
                 draft = history.pop()["content"]
+        # 世界状态对齐到当前历史长度（重生成/回滚后状态跟着回退；
+        # 上一轮被打断时丢弃未提交的内存改动）
+        world.sync(name, len(history))
         input_items = core.build_input(state, history, draft=draft)
         config = core.load_config()
         done = None
         streaming_started = True
-        async for event in stream_respond(input_items, config):
+        run_tool = lambda tool_name, arguments: tools.execute_tool(name, tool_name, arguments)
+        async for event in stream_respond(input_items, config, run_tool):
             if event["type"] == "done":
                 done = event
             elif event["type"] == "content":
                 partial_content += event["delta"]
             elif event["type"] == "reasoning":
-                partial_reasoning += event["delta"]
+                tail_reasoning += event["delta"]
+            elif event["type"] == "tool":
+                tool_calls.append({
+                    "name": event["name"],
+                    "arguments": event["arguments"],
+                    "result": event["result"],
+                    # 产生该调用的那一轮思维链,重放时放在它的 function_call 前
+                    "reasoning": event.get("reasoning", ""),
+                })
+                tail_reasoning = ""
             yield _sse(event)
         if done is None:
             raise RuntimeError("API 未返回完整结果")
@@ -255,7 +275,10 @@ async def _generate(name: str, mode: str, user_input: str | None):
             done["content"],
             done["options"],
             done.get("reasoning", ""),
+            tool_calls,
         )
+        # 世界状态随历史提交,快照键为落盘后的历史长度
+        world.commit_turn(name, len(history))
     except asyncio.CancelledError:
         # 用户打断：半截输出落盘，由用户手动回滚或修改
         if streaming_started:
@@ -267,14 +290,21 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 draft,
                 partial_content or "（输出已被打断）",
                 [],
-                partial_reasoning,
+                tail_reasoning,
+                tool_calls,
             )
+            # 半截回合已进历史,其世界状态改动一并提交,保持叙事与状态一致
+            world.commit_turn(name, len(history))
+        else:
+            world.abort_turn(name)
     except ValueError as e:
         # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
+        world.abort_turn(name)
         logger.warning("会话 %s 用户侧错误: %s", name, e)
         yield _sse({"type": "error", "message": str(e), "popup": True})
     except Exception as e:
         # 后端/API 错误：控制台保留完整堆栈，同时发给前端内联显示
+        world.abort_turn(name)
         logger.exception("会话 %s 生成失败", name)
         yield _sse({"type": "error", "message": str(e)})
     finally:

@@ -14,22 +14,23 @@ PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
-# AIRP 任务提示词：使 AI 明确自身任务（只通过 respond 工具输出）。
+# AIRP 任务提示词：使 AI 明确自身任务（通过 respond 工具输出，world_run/read_file 辅助）。
 # 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
 # 实际上用户可以看到思考内容，但不需要告诉模型
 AIRP_PROMPT = """\
-你的唯一输出通道是 respond 工具：
-- 你必须通过调用 respond 工具输出剧情正文（content）与后续选项（options）
-- 只有工具调用内部的内容对用户可见，工具之外的任何文本用户都看不到
-- 用户的新一轮输入会作为你上一次工具调用的结果（tool 消息）返回给你
+你的输出通道与可用工具：
+- respond：唯一对用户可见的输出通道。你必须通过调用 respond 输出剧情正文（content）与后续选项（options），工具之外的任何文本用户都看不到。它必须是一轮回复中最后一次工具调用。
+- world_run：持久的 Python 环境，是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。查看具体值用 print(...) 或给 result 变量赋值；定义 normalize() 函数可在每次执行后自动整理（变量钳制、阈值提醒）。代码出错会自动回滚，传 dry=true 可试运行。
+- read_file：读取文本文件（设定文档、笔记、规则书等），大文件用 offset/limit 分页。
+- 一轮回复中可以先多次调用 world_run / read_file，最后调用 respond 结束。用户的新一轮输入会作为 respond 调用的结果（tool 消息）返回给你。
 """
 
 # Responses API 风格的 function 工具定义
 RESPOND_TOOL = {
     "type": "function",
     "name": "respond",
-    "description": "输出剧情正文与后续选项。只有此工具内的内容对用户可见。",
+    "description": "输出剧情正文与后续选项。只有此工具内的内容对用户可见。每轮回复必须调用本工具。",
     "parameters": {
         "type": "object",
         "properties": {
@@ -43,6 +44,61 @@ RESPOND_TOOL = {
         "required": ["content"],
     },
 }
+
+WORLD_RUN_TOOL = {
+    "type": "function",
+    "name": "world_run",
+    "description": (
+        "在持久的 Python 环境中执行一段代码，用于一切涉及数值与规则的判定与状态更新。"
+        "跨调用保留：全局对象 state 与顶层 def 定义的函数自动持久化。"
+        "约定：所有需要追踪的游戏数据放进 state；辅助函数在程序顶层用 def 定义即可跨调用保留（函数内部的 def 是局部的，调用结束即消失）。"
+        "输出：print(...值) 写入当次日志返回；给 result 变量赋值作为返回值返回。注意 normalize 之外的 print/result 是 normalize 执行前的值，normalize 执行后的结果在 state diff 中自动返回。"
+        "原子执行：代码出错时自动回滚到执行前（state、函数定义全部还原），不会留下半更新的状态。"
+        "自动整理：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
+        "把变量钳制（如 if state['hp'] < 0: state['hp'] = 0）、阈值提醒（函数里 print 即提醒）、派生量自动更新写在里面避免遗忘；"
+        "normalize 出错只回滚它自己的改动并记录，不影响本次代码的成果。"
+        "每次执行返回：返回值、日志、state 的变化 diff、normalize 错误（如有）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "program": {
+                "type": "string",
+                "description": "要执行的 Python 代码。读取/修改 state，或在顶层定义函数供后续调用使用",
+            },
+            "dry": {
+                "type": "boolean",
+                "description": "试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。用于复杂更新前排错确认。",
+            },
+        },
+        "required": ["program"],
+    },
+}
+
+READ_FILE_TOOL = {
+    "type": "function",
+    "name": "read_file",
+    "description": (
+        "读取一个 UTF-8 文本文件并返回其内容。"
+        "用于读取玩家提供的设定文档、笔记、角色卡、存档等文本文件；"
+        "相对路径以项目根目录为基准，也支持绝对路径；"
+        "大文件可用 offset/limit 分页继续读取（分页信息在返回末尾）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "要读取的文件路径（相对项目根目录，或绝对路径）。",
+            },
+            "offset": {"type": "number", "description": "起始行号（1 起），默认 1。"},
+            "limit": {"type": "number", "description": "最多返回行数，默认 2000，最大 2000。"},
+        },
+        "required": ["file_path"],
+    },
+}
+
+TOOLS = [RESPOND_TOOL, WORLD_RUN_TOOL, READ_FILE_TOOL]
 
 SECTION_RE = re.compile(
     r'<preset_section\s+role="(system|user|assistant)"\s*>(.*?)</preset_section>', re.S
@@ -235,17 +291,38 @@ def build_input(state: dict, history: list, draft=None) -> list:
         "respond_tool": AIRP_PROMPT,
     }
     items = [_message_item(sec["role"], render_template(sec["content"], env)) for sec in preset["sections"]]
-    # 对话历史：assistant 块 -> respond 的 function_call 项；user 块 -> function_call_output 项
+    # 对话历史：assistant 块 -> 若干 world_run/read_file 的 function_call/output 对
+    # （回合内的工具循环）+ respond 的 function_call 项；user 块 -> respond 的
+    # function_call_output 项。call_n 对每个 function_call 项递增。
+    # DeepSeek 思考模式要求每个 function_call 前都紧跟产生它的那一轮非空思维链
+    # （缺失或空串会 400；同一段文本重复传是合法的），实在没有时用单空格占位。
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
-            call_n += 1
-            # 思考模式要求把 reasoning 原样传回
-            if entry.get("reasoning"):
+            for tc in entry.get("tool_calls", []):
+                # 新格式逐项带 reasoning;旧格式没有,用整轮合并的 entry["reasoning"] 兜底
+                reasoning = tc.get("reasoning") or entry.get("reasoning") or " "
                 items.append({
                     "type": "reasoning",
-                    "content": [{"type": "reasoning_text", "text": entry["reasoning"]}],
+                    "content": [{"type": "reasoning_text", "text": reasoning}],
                 })
+                call_n += 1
+                items.append({
+                    "type": "function_call",
+                    "call_id": f"call_{call_n}",
+                    "name": tc["name"],
+                    "arguments": tc["arguments"],
+                })
+                items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": tc["result"]})
+            call_n += 1
+            # 产生 respond 的那一轮思维链,放在 respond 调用前;为空时(模型收尾轮没思考,
+            # 或旧格式数据)兜底用最后一个工具调用的思维链,避免 respond 调用前缺 reasoning 被 400
+            respond_reasoning = entry.get("reasoning") or next(
+                (tc["reasoning"] for tc in reversed(entry.get("tool_calls", [])) if tc.get("reasoning")), " ")
+            items.append({
+                "type": "reasoning",
+                "content": [{"type": "reasoning_text", "text": respond_reasoning}],
+            })
             args = {"content": entry["content"]}
             if entry.get("options"):
                 args["options"] = entry["options"]

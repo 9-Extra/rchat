@@ -75,6 +75,10 @@
   details.thinking { margin-bottom: 10px; background: #191b20; border: 1px solid #26282f; border-radius: 8px; padding: 7px 12px; }
   details.thinking summary { color: #7a9b7a; font-size: 12px; cursor: pointer; }
   details.thinking div { white-space: pre-wrap; color: #9095a0; font-size: 13px; margin-top: 8px; line-height: 1.7; }
+  details.toolcall { margin-bottom: 10px; background: #1a1c23; border: 1px solid #2a2d38; border-radius: 8px; padding: 7px 12px; }
+  details.toolcall summary { color: #8198bd; font-size: 12px; cursor: pointer; }
+  details.toolcall .tc-label { color: #5c6068; font-size: 11px; margin-top: 8px; }
+  details.toolcall .tc { white-space: pre-wrap; color: #9095a0; font-size: 13px; margin-top: 3px; line-height: 1.7; word-break: break-word; }
   .edittext { width: 100%; min-height: 140px; background: #17191e; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-family: inherit; line-height: 1.7; font-size: 14px; }
 
   #composer { border-top: 1px solid var(--border); padding: 14px 24px 16px; background: var(--panel); }
@@ -258,11 +262,35 @@ function makeBeginningBlock() {
   return div;
 }
 
+// 工具调用块（与思考块一样默认折叠）：参数尽量按 JSON 美化，调用结果拼在同一块里
+function toolDetailsHTML(tc) {
+  let args = tc.arguments || '';
+  try { args = JSON.stringify(JSON.parse(args), null, 2); } catch (e) {}
+  return `<details class="toolcall"><summary>工具调用：${esc(tc.name)}</summary>` +
+    `<div class="tc-label">参数</div><div class="tc">${esc(args)}</div>` +
+    `<div class="tc-label">结果</div><div class="tc">${esc(tc.result || '')}</div></details>`;
+}
+
+// 历史 AI 块的思考/工具调用部分:按回合内真实顺序交替(思考→工具→思考→…);
+// 同一轮多个调用共享一段思考,只显示一次;占位/空思考不显示
+function aiMiddleHTML(e) {
+  const thinking = r => `<details class="thinking"><summary>思考</summary><div>${esc(r)}</div></details>`;
+  let html = '', lastReasoning = null;
+  for (const tc of e.tool_calls || []) {
+    const r = (tc.reasoning || '').trim();
+    if (r && r !== lastReasoning) { html += thinking(tc.reasoning); lastReasoning = r; }
+    html += toolDetailsHTML(tc);
+  }
+  const r = (e.reasoning || '').trim();
+  if (r && r !== lastReasoning) html += thinking(e.reasoning);
+  return html;
+}
+
 function makeAIBlock(e, i) {
   const div = document.createElement('div');
   div.className = 'block ai';
   div.innerHTML = `<div class="tag">AI</div>` +
-    (e.reasoning ? `<details class="thinking"><summary>思考</summary><div>${esc(e.reasoning)}</div></details>` : '') +
+    aiMiddleHTML(e) +
     `<div class="content">${esc(e.content)}</div>`;
   if (e.options && e.options.length) {
     const opts = document.createElement('div');
@@ -337,12 +365,12 @@ async function streamInto(url, opts, userText) {
   const div = document.createElement('div');
   div.className = 'block ai';
   div.innerHTML = `<div class="tag">AI（生成中…）</div>
-    <details class="thinking"><summary>思考</summary><div></div></details>
     <div class="content"></div>`;
   chat.appendChild(div);
   scrollBottom();
-  const thinkDiv = div.querySelector('.thinking div');
   const contentDiv = div.querySelector('.content');
+  // 当前思考块:工具调用会切分思考,下一段思考另起新块(思考→工具→思考→…→正文)
+  let thinkDiv = null;
   try {
     const resp = await fetch(url, opts);
     activeReader = resp.body.getReader();
@@ -358,8 +386,21 @@ async function streamInto(url, opts, userText) {
         const line = raw.split('\n').find(l => l.startsWith('data:'));
         if (!line) continue;
         const ev = JSON.parse(line.slice(5));
-        if (ev.type === 'reasoning') { thinkDiv.textContent += ev.delta; scrollBottom(); }
+        if (ev.type === 'reasoning') {
+          if (!thinkDiv) {
+            contentDiv.insertAdjacentHTML('beforebegin',
+              '<details class="thinking"><summary>思考</summary><div></div></details>');
+            thinkDiv = contentDiv.previousElementSibling.querySelector('div');
+          }
+          thinkDiv.textContent += ev.delta; scrollBottom();
+        }
         else if (ev.type === 'content') { contentDiv.textContent += ev.delta; scrollBottom(); }
+        // 工具调用块随流逐个出现（事件在工具执行完后到达，参数与结果一起拼入）
+        else if (ev.type === 'tool') {
+          contentDiv.insertAdjacentHTML('beforebegin', toolDetailsHTML(ev));
+          thinkDiv = null;
+          scrollBottom();
+        }
         else if (ev.type === 'error') {
           // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块
           if (ev.popup) alert(ev.message);
