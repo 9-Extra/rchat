@@ -69,6 +69,7 @@
   .block:hover .ops { opacity: 1; }
   .block .ops button { font-size: 12px; padding: 2px 9px; background: rgba(35,38,46,.9); }
   .block .content { white-space: pre-wrap; line-height: 1.85; word-break: break-word; font-size: 15px; }
+  .errnote { color: #e07a5f; font-size: 13px; line-height: 1.6; margin-bottom: 8px; padding: 6px 10px; background: rgba(224,122,95,.08); border-left: 3px solid #e07a5f; border-radius: 0 6px 6px 0; }
   .options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
   .options button { background: #253047; border-color: #35466b; color: #a9c4f5; font-size: 12px; border-radius: 20px; padding: 4px 14px; max-width: 100%; white-space: normal; text-align: left; }
   .options button:hover { background: #2c3a58; border-color: #4a5f8f; }
@@ -289,8 +290,9 @@ function aiMiddleHTML(e) {
 function makeAIBlock(e, i) {
   const div = document.createElement('div');
   div.className = 'block ai';
-  div.innerHTML = `<div class="tag">AI</div>` +
+  div.innerHTML = `<div class="tag">${e.error ? '出错' : 'AI'}</div>` +
     aiMiddleHTML(e) +
+    (e.error ? `<div class="errnote">〔生成出错〕${esc(e.error)}</div>` : '') +
     `<div class="content">${esc(e.content)}</div>`;
   if (e.options && e.options.length) {
     const opts = document.createElement('div');
@@ -328,6 +330,11 @@ function makeUserBlock(e, i) {
     autoGrow();
     cur = await api('/api/sessions/' + enc());
     render();
+  }));
+  // 分支：以该用户块为断点复制出一个新会话（原会话不动），并切换过去
+  ops.appendChild(makeOpsBtn('分支', async () => {
+    const s = await api(`/api/sessions/${enc()}/fork`, post({ index: i }));
+    await selectSession(s.id);
   }));
   div.appendChild(ops);
   return div;
@@ -402,10 +409,14 @@ async function streamInto(url, opts, userText) {
           scrollBottom();
         }
         else if (ev.type === 'error') {
-          // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块
+          // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块。
+          // 半截输出已落盘时保留已流出的正文，错误说明另起一行（刷新后按 history 重渲染）
           if (ev.popup) alert(ev.message);
           div.querySelector('.tag').textContent = '出错';
-          contentDiv.textContent = ev.message;
+          if (ev.persisted && contentDiv.textContent)
+            contentDiv.textContent += `\n\n〔生成出错〕${ev.message}`;
+          else
+            contentDiv.textContent = ev.message;
         }
       }
     }

@@ -221,6 +221,29 @@ def commit_turn(name: str, turn_len: int):
     _write_disk(name, rt["committed"], turn_len)
 
 
+def fork(src: str, dst: str, turn_len: int):
+    """fork：把 src 在 turn_len 处的世界状态（及更早的快照）复制到新会话 dst。
+
+    优先取该历史长度的快照；没有快照（功能上线前的旧会话）时与 sync 一样
+    退化为复制当前 committed 状态。只读 src，不影响其运行时。
+    """
+    src_dir = _world_dir(src)
+    if not src_dir.exists():
+        return  # 源会话从未使用过 world_run，没有世界状态可复制
+    snaps = _snapshots(src)
+    committed = snaps.get(str(turn_len)) or _load_committed(src)
+    d = _world_dir(dst)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "state.json").write_text(
+        json.dumps(committed["state"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (d / "lib.py").write_text("\n\n".join(committed["lib"].values()), encoding="utf-8")
+    # 保留 fork 点及更早的快照，新会话内继续回滚/重生成时状态仍能对齐
+    dst_snaps = {k: v for k, v in snaps.items() if int(k) <= turn_len}
+    dst_snaps[str(turn_len)] = committed
+    (d / "snapshots.json").write_text(json.dumps(dst_snaps, ensure_ascii=False), encoding="utf-8")
+
+
 def drop(name: str):
     _runtimes.pop(name, None)
 

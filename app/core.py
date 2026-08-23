@@ -14,34 +14,39 @@ PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
-# AIRP 任务提示词：使 AI 明确自身任务（通过 respond 工具输出，world_run/read_file 辅助）。
+# AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，选项走 respond 工具，world_run/read_file 辅助）。
 # 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
 # 实际上用户可以看到思考内容，但不需要告诉模型
 AIRP_PROMPT = """\
-你的输出通道与可用工具：
-- respond：唯一对用户可见的输出通道。你必须通过调用 respond 输出剧情正文（content）与后续选项（options），工具之外的任何文本用户都看不到。它必须是一轮回复中最后一次工具调用。
+你的输出通道与可用工具——每轮回复的固定流程：
+1.（可选）多次调用 world_run / read_file 收集信息、完成判定，执行结果作为工具结果返回给你，继续推理；中间轮次不要输出正文。
+2. 输出正文：剧情正文、旁白、对白直接写成普通文本输出——这是用户唯一可见的内容，也是每轮必不可少的部分。思考内容用户不可见，不要把正文写在思考里：思考只做规划，正文必须完整输出到正文通道。
+3. 调用 respond 提交正文之后的剧情推进选项（options）并结束本轮。respond 的参数里只有选项，没有正文；没有合适的选项时传空数组。
+
+工具说明：
 - world_run：持久的 Python 环境，是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。查看具体值用 print(...) 或给 result 变量赋值；定义 normalize() 函数可在每次执行后自动整理（变量钳制、阈值提醒）。代码出错会自动回滚，传 dry=true 可试运行。
 - read_file：读取文本文件（设定文档、笔记、规则书等），大文件用 offset/limit 分页。
-- 一轮回复中可以先多次调用 world_run / read_file，最后调用 respond 结束。用户的新一轮输入会作为 respond 调用的结果（tool 消息）返回给你。
+
+用户的新一轮输入会作为 user 消息返回给你。
+再次提醒：正文是第 2 步的普通文本输出，每轮必须有；respond 只提交选项。两者缺一不可。
 """
 
 # Responses API 风格的 function 工具定义
 RESPOND_TOOL = {
     "type": "function",
     "name": "respond",
-    "description": "输出剧情正文与后续选项。只有此工具内的内容对用户可见。每轮回复必须调用本工具。",
+    "description": "提交剧情推进选项并结束本轮回复。调用本工具之前，必须已经以普通文本输出了完整正文（正文不写在本工具里）。参数只含选项；无选项时传空数组。",
     "parameters": {
         "type": "object",
         "properties": {
-            "content": {"type": "string", "description": "正文"},
             "options": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "正文后的剧情推进选项",
+                "description": "正文之后的剧情推进选项，无选项时传空数组",
             },
         },
-        "required": ["content"],
+        "required": ["options"],
     },
 }
 
@@ -243,6 +248,32 @@ def create_session(name: str, preset: str, card: str, beginning_index):
     return state
 
 
+def fork_session(name: str, index: int) -> dict:
+    """在用户块 index 处分叉：复制会话状态与 history[:index] 为新会话，原会话不动。
+
+    新会话最后一项是 assistant 块（或空历史），可直接继续输入。世界状态由
+    world.fork 按同一 index 复制。
+    """
+    state = load_state(name)
+    history = load_history(name)
+    if not (0 <= index < len(history)) or history[index]["role"] != "user":
+        raise ValueError("fork 目标不是用户块")
+    base = f"{state['name']}-fork-{time.strftime('%Y%m%d-%H%M%S')}"
+    new_name, n = base, 2
+    while _session_dir(new_name).exists():
+        new_name, n = f"{base}-{n}", n + 1
+    new_state = {
+        **state,
+        "id": safe_dir_name(new_name),
+        "name": new_name,
+        "created_at": time.time(),
+    }
+    _session_dir(new_name).mkdir(parents=True)
+    save_state(new_state)
+    save_history(new_name, history[:index])
+    return new_state
+
+
 def load_state(name: str) -> dict:
     state = json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
     # 旧版 state.json 没有 id 字段，按目录名规则补上
@@ -292,10 +323,11 @@ def build_input(state: dict, history: list, draft=None) -> list:
     }
     items = [_message_item(sec["role"], render_template(sec["content"], env)) for sec in preset["sections"]]
     # 对话历史：assistant 块 -> 若干 world_run/read_file 的 function_call/output 对
-    # （回合内的工具循环）+ respond 的 function_call 项；user 块 -> respond 的
-    # function_call_output 项。call_n 对每个 function_call 项递增。
-    # DeepSeek 思考模式要求每个 function_call 前都紧跟产生它的那一轮非空思维链
-    # （缺失或空串会 400；同一段文本重复传是合法的），实在没有时用单空格占位。
+    # （回合内的工具循环）+ 正文 message + respond 的 function_call/output 对（只含选项）；
+    # user 块 -> 普通 user message。call_n 对每个 function_call 项递增。
+    # 请求以 user message 结尾（不再是未闭合的工具循环），历史里的 reasoning 回放
+    # 因此不受 DeepSeek「reasoning_text must be passed back」强制约束（实验 G 验证），
+    # 但仍全部回传，与官方文档口径一致。旧格式历史（正文也在 entry 上）同样适用。
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
@@ -314,32 +346,34 @@ def build_input(state: dict, history: list, draft=None) -> list:
                     "arguments": tc["arguments"],
                 })
                 items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": tc["result"]})
-            call_n += 1
-            # 产生 respond 的那一轮思维链,放在 respond 调用前;为空时(模型收尾轮没思考,
-            # 或旧格式数据)兜底用最后一个工具调用的思维链,避免 respond 调用前缺 reasoning 被 400
+            # 正文:普通 assistant message(新旧格式都存在 entry["content"] 上)
+            if entry.get("content"):
+                items.append(_message_item("assistant", entry["content"]))
+            # respond 只提交选项。无论有无选项都回放这次调用,让模型每轮看到一致的收尾模式
+            # (DeepSeek 会模仿旧轮次的行为,固定模式反而强化选项的稳定生成)
             respond_reasoning = entry.get("reasoning") or next(
                 (tc["reasoning"] for tc in reversed(entry.get("tool_calls", [])) if tc.get("reasoning")), " ")
             items.append({
                 "type": "reasoning",
                 "content": [{"type": "reasoning_text", "text": respond_reasoning}],
             })
-            args = {"content": entry["content"]}
-            if entry.get("options"):
-                args["options"] = entry["options"]
+            call_n += 1
             items.append({
                 "type": "function_call",
                 "call_id": f"call_{call_n}",
                 "name": "respond",
-                "arguments": json.dumps(args, ensure_ascii=False),
+                "arguments": json.dumps({"options": entry.get("options") or []}, ensure_ascii=False),
             })
+            items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": "ok"})
         else:
-            items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": entry["content"]})
-    # 输入框中的本次输入：作为最后一个工具调用的结果拼入。
+            # 用户输入:普通 user message(不再伪装成 respond 的工具结果)
+            items.append(_message_item("user", entry["content"]))
+    # 输入框中的本次输入：作为新的 user message 拼在末尾,请求以 user message 结尾。
     # 预设含 preset_user_input 块时,先按模板渲染(提供 user_input 变量);
     # 渲染只影响本次发送,落盘的 history 仍是渲染前的原文。
     if draft and history and history[-1]["role"] == "assistant":
         template = preset.get("user_input_template")
         if template is not None:
             draft = render_template(template, {**env, "user_input": draft})
-        items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": draft})
+        items.append(_message_item("user", draft))
     return items

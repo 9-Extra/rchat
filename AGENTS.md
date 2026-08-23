@@ -24,10 +24,17 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 
 # 工具
 模型有三个工具（schema 在 app/core.py，通过 Responses API function calling）：
-- respond：唯一对用户可见的输出（正文+选项），必须是一轮回复的最后一次调用
-- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state 与顶层 def 函数持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致。无超时保护
+- respond：提交剧情推进选项并结束本轮回复（只含 options，无选项传空数组）；必须是一轮回复的最后一次调用。正文不经过工具，是模型的普通文本输出（output_text），直接流式给用户
+- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state 与顶层 def 函数持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致；fork 时由 world.fork 把断点处的快照（及更早快照）复制到新会话，无快照则兜底复制当前 committed。无超时保护
 - read_file：只读分页读文件（app/tools.py），相对路径以项目根为基准，允许绝对路径
 
-一轮回复是工具循环（app/llm.py 的 stream_respond）：模型可多次调用 world_run/read_file（执行结果追加进 input 继续请求），最后以 respond 结束。回合内 respond 之前的工具调用记录在 history 的 assistant 块 tool_calls 字段中，build_input 重放为 function_call/output 对。
+生成失败的处理（server.py _generate）：后端/API 错误不再丢弃半截结果——照打断的先例落盘（正文或「（生成失败，无正文输出）」占位、已执行的 tool_calls、tail 思维链），entry 上加 error 字段（前端以「出错」标签+错误条显示；build_input 回放时忽略该字段，不进模型上下文），已执行的工具调用改动一并 commit 保持叙事与世界状态一致；用户可修改/回滚/重新输出。仅当尚未开始流式输出（无内容可落盘）时才只 abort 世界状态。
 
-思维链回传（DeepSeek 思考模式的硬性要求，违反会 400 "reasoning_text must be passed back"）：每个 function_call 前都必须紧跟产生它的那一轮**非空**思维链，同一轮多个调用重复传同一段文本（重复合法，缺失或空串不行）。因此 tool_calls 逐项带 reasoning 字段，assistant 块的 reasoning 字段只存 respond 轮的思维链；build_input 与工具循环都在每个 function_call 前插入对应 reasoning 项。模型个别轮（甚至整个回合）可能不输出思维链：先用前轮兜底，全都没有时用单空格占位（实测合法）。旧格式历史（tool_calls 无 reasoning）用整轮合并的 entry.reasoning 兜底。
+一轮回复是工具循环（app/llm.py 的 stream_respond）：模型可多次调用 world_run/read_file（执行结果追加进 input 继续请求），最后一轮输出正文（普通文本，output_text 事件流式直出）并调用 respond 提交选项收尾。history 格式不变（content/options/reasoning/tool_calls 都在 entry 上）。build_input 回放：assistant 块 -> 工具循环的 function_call/output 对 + 正文 message + respond 调用（options JSON）+ "ok" 输出；user 块 -> 普通 user message，本次输入也拼成 user message，**请求以 user message 结尾**（不再是未闭合的工具循环）。
+
+respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；实测与工具命名无关（respond vs submit_options 失败率无差异，实验五 experiment_api5.py）。上下文中的完整示范轮（正文 message + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传（fco 写错误说明）让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 developer 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。预设侧配合：梦鲸的思考仪式里已把「输出正文 + 调用 respond」写成仪式的收尾步骤（模型对仪式遵循度很高）。
+
+思维链回传（DeepSeek 思考模式，违反会 400 "reasoning_text must be passed back"）：**触发条件是请求以未闭合的工具循环结尾**（最后一个 user message 之后还有 function_call/output，即模型正处于工具循环中场）——此时该循环内每个 function_call 前都必须紧跟产生它的那一轮**非空**思维链，同一轮多个调用重复传同一段文本（重复合法，缺失或空串不行）。已被 user message 闭合的旧轮次不强制（实测 Responses API 放行，v4-flash 2026-08 验证；官方 Chat Completions 文档口径更严——带 tools 时所有轮次的 reasoning 都应回传，当前代码全部回传，与文档一致也更稳妥）。工具循环中场只存在于 stream_respond 的回合内（llm.py 在每个 function_call 前插入对应 reasoning 项）；build_input 拼出的请求以 user message 结尾，历史回放的 reasoning 不受该约束，但仍全部回传（tool_calls 逐项带 reasoning，assistant 块的 reasoning 存收尾轮思维链）。模型个别轮（甚至整个回合）可能不输出思维链：先用前轮兜底，全都没有时用单空格占位（实测合法）。旧格式历史（tool_calls 无 reasoning）用整轮合并的 entry.reasoning 兜底。验证实验见根目录 experiment_api*.py。
+
+# 会话 fork
+用户块上的「分支」按钮：POST /api/sessions/{name}/fork {index} 在用户块断点处复制出一个新会话（core.fork_session：state 复制 + history[:index]，新名为 原名-fork-时间戳，原会话不动），world.fork 按同一 index 复制世界状态。新会话末尾是 assistant 块（或空历史），可直接继续输入。

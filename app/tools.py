@@ -76,7 +76,7 @@ def read_file(file_path: str, offset: int = 1, limit: int = READ_LIMIT) -> str:
     else:
         footer = f"(文件结束 - 共 {total} 行)"
     body = "\n".join(out)
-    return f"<path>{absolute}</path>\n<type>file</type>\n<content>\n{body + chr(10) + chr(10) if body else ''}{footer}\n</content>"
+    return f"<path>{absolute}</path>\n<content>\n{body + chr(10) + chr(10) if body else ''}</content>\n{footer}"
 
 
 def execute_tool(session: str, name: str, arguments: str) -> str:

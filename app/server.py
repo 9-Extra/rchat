@@ -164,6 +164,21 @@ def rollback(name: str, req: Rollback):
     return {"input": text}
 
 
+class Fork(BaseModel):
+    index: int
+
+
+@app.post("/api/sessions/{name}/fork")
+def fork(name: str, req: Fork):
+    try:
+        state = core.fork_session(name, req.index)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # 世界状态复制到同一断点
+    world.fork(name, state["id"], req.index)
+    return state
+
+
 # ---------- 上下文预览 ----------
 
 
@@ -195,7 +210,7 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-def _persist(name, history, mode, user_input, draft, content, options, reasoning, tool_calls):
+def _persist(name, history, mode, user_input, draft, content, options, reasoning, tool_calls, error=None):
     if mode == "chat":
         history.append({"role": "user", "content": user_input})
     elif mode == "regenerate" and draft is not None:
@@ -206,6 +221,9 @@ def _persist(name, history, mode, user_input, draft, content, options, reasoning
         "options": options,
         "reasoning": reasoning,
     }
+    # 生成失败时落盘的错误说明(前端显示;build_input 回放时忽略,不进模型上下文)
+    if error:
+        entry["error"] = error
     # 回合内 respond 之前的 world_run/read_file 调用,重放上下文时用
     if tool_calls:
         entry["tool_calls"] = tool_calls
@@ -303,10 +321,28 @@ async def _generate(name: str, mode: str, user_input: str | None):
         logger.warning("会话 %s 用户侧错误: %s", name, e)
         yield _sse({"type": "error", "message": str(e), "popup": True})
     except Exception as e:
-        # 后端/API 错误：控制台保留完整堆栈，同时发给前端内联显示
-        world.abort_turn(name)
+        # 后端/API 错误：控制台保留完整堆栈。半截结果照打断的先例落盘（带 error
+        # 标记），让用户看到到底发生了什么，可修改/回滚/重新输出；已执行的工具
+        # 调用改动一并提交，保持叙事与世界状态一致。尚未开始流式输出时无内容可
+        # 落盘，只丢弃未提交的世界状态改动。
         logger.exception("会话 %s 生成失败", name)
-        yield _sse({"type": "error", "message": str(e)})
+        if streaming_started:
+            _persist(
+                name,
+                history,
+                mode,
+                user_input,
+                draft,
+                partial_content or "（生成失败，无正文输出）",
+                [],
+                tail_reasoning,
+                tool_calls,
+                error=str(e),
+            )
+            world.commit_turn(name, len(history))
+        else:
+            world.abort_turn(name)
+        yield _sse({"type": "error", "message": str(e), "persisted": streaming_started})
     finally:
         _active.pop(name, None)
 
