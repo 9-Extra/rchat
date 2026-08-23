@@ -21,7 +21,7 @@ def main() -> None:
     # 手动创建 IPV6_V6ONLY=0 的监听 socket，实现单 socket 双栈（IPv4 + IPv6）
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    # 不设 SO_REUSEADDR：Windows 上它会让第二个实例静默抢占同一端口
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("::", args.port))
     sock.listen(2048)
     server = uvicorn.Server(uvicorn.Config(app, log_level="info"))
