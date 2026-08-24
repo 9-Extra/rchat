@@ -19,17 +19,14 @@ SESSIONS_DIR = ROOT / "sessions"
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
 # 实际上用户可以看到思考内容，但不需要告诉模型
 AIRP_PROMPT = """\
-你的输出通道与可用工具——每轮回复的固定流程：
-1.（可选）多次调用 world_run / read_file 收集信息、完成判定，执行结果作为工具结果返回给你，继续推理；中间轮次不要输出正文。
-2. 输出正文：剧情正文、旁白、对白直接写成普通文本输出——这是用户唯一可见的内容，也是每轮必不可少的部分。思考内容用户不可见，不要把正文写在思考里：思考只做规划，正文必须完整输出到正文通道。
-3. 调用 respond 提交正文之后的剧情推进选项（options）并结束本轮。respond 的参数里只有选项，没有正文；没有合适的选项时传空数组。
+每轮回复的固定流程：
+1.（可选）任意时刻调用 world_run / read_file 收集信息、执行计算、完成判定，执行结果作为工具结果返回给你；
+2. 输出正文。需要的话中间可以插入world_run / read_file。
+3. 在正文写完后，调用 respond 提交的剧情推进选项（options）同时结束本轮。没有合适的选项时传空数组。
 
-工具说明：
-- world_run：持久的 Python 环境，是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。查看具体值用 print(...) 或给 result 变量赋值；定义 normalize() 函数可在每次执行后自动整理（变量钳制、阈值提醒）。代码出错会自动回滚，传 dry=true 可试运行。
-- read_file：读取文本文件（设定文档、笔记、规则书等），大文件用 offset/limit 分页。
+world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
 
-用户的新一轮输入会作为 user 消息返回给你。
-再次提醒：正文是第 2 步的普通文本输出，每轮必须有；respond 只提交选项。两者缺一不可。
+再次提醒：正文写完后不要忘respond提交选项。
 """
 
 # Responses API 风格的 function 工具定义
@@ -56,13 +53,13 @@ WORLD_RUN_TOOL = {
     "description": (
         "在持久的 Python 环境中执行一段代码，用于一切涉及数值与规则的判定与状态更新。"
         "跨调用保留：全局对象 state 与顶层 def 定义的函数自动持久化。"
-        "约定：所有需要追踪的游戏数据放进 state；辅助函数在程序顶层用 def 定义即可跨调用保留（函数内部的 def 是局部的，调用结束即消失）。"
-        "输出：print(...值) 写入当次日志返回；给 result 变量赋值作为返回值返回。注意 normalize 之外的 print/result 是 normalize 执行前的值，normalize 执行后的结果在 state diff 中自动返回。"
+        "约定：需要追踪的游戏数据放进 state；辅助函数在程序顶层用 def 定义即可跨调用保留（函数内部的 def 是局部的，调用结束即消失）。"
+        "输出：print(...值) 写入当次日志返回。注意 normalize 之外的 print 是 normalize 执行前的值，normalize 执行后的结果在 state diff 中自动返回。"
         "原子执行：代码出错时自动回滚到执行前（state、函数定义全部还原），不会留下半更新的状态。"
-        "自动整理：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
+        "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
         "把变量钳制（如 if state['hp'] < 0: state['hp'] = 0）、阈值提醒（函数里 print 即提醒）、派生量自动更新写在里面避免遗忘；"
         "normalize 出错只回滚它自己的改动并记录，不影响本次代码的成果。"
-        "每次执行返回：返回值、日志、state 的变化 diff、normalize 错误（如有）。"
+        "每次执行返回：日志、state 的变化 diff、normalize 错误（如有）。"
     ),
     "parameters": {
         "type": "object",
@@ -73,7 +70,7 @@ WORLD_RUN_TOOL = {
             },
             "dry": {
                 "type": "boolean",
-                "description": "试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。用于复杂更新前排错确认。",
+                "description": "试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。",
             },
         },
         "required": ["program"],
@@ -325,7 +322,7 @@ def build_input(state: dict, history: list, draft=None) -> list:
     # 对话历史：assistant 块 -> 若干 world_run/read_file 的 function_call/output 对
     # （回合内的工具循环）+ 正文 message + respond 的 function_call/output 对（只含选项）；
     # user 块 -> 普通 user message。call_n 对每个 function_call 项递增。
-    # 请求以 user message 结尾（不再是未闭合的工具循环），历史里的 reasoning 回放
+    # 请求以 user message 结尾，历史里的 reasoning 回放
     # 因此不受 DeepSeek「reasoning_text must be passed back」强制约束（实验 G 验证），
     # 但仍全部回传，与官方文档口径一致。旧格式历史（正文也在 entry 上）同样适用。
     call_n = 0

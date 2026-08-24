@@ -12,7 +12,7 @@
 - dry=True 试运行：返回完整结果但一切变化不生效；
 - 约定式整理：定义了全局函数 normalize() 时，每次成功执行后、生成 diff 前
   自动调用一次；normalize 出错只回滚它自己的改动；
-- 每次返回 state 的变化 diff；查看具体值用 print(...) 或给 result 变量赋值。
+- 每次返回 state 的变化 diff；查看具体值用 print(...)。
 - 无超时保护：预设可信，假设模型不会写出死循环。
 """
 import ast
@@ -258,10 +258,8 @@ def run(name: str, program: str, dry: bool = False) -> str:
     lib_backup = dict(rt["lib"])
     logs = []
     rt["logs"] = logs
-    value = None
     error = None
     hook_errors = []
-    ns.pop("result", None)
     try:
         exec(program, ns)
     except Exception as e:
@@ -271,11 +269,6 @@ def run(name: str, program: str, dry: bool = False) -> str:
         defs = _extract_defs(program)
         if defs:
             rt["lib"].update(defs)
-        if "result" in ns:
-            value = ns.pop("result")
-            if not _json_safe(value):
-                error = "result 的值不是可 JSON 序列化的数据;如需查看复杂对象请先转换"
-                value = None
     if error is None and callable(ns.get("normalize")):
         # 约定式整理:normalize 出错只回滚它自己的改动
         hook_ns = dict(ns)
@@ -304,8 +297,6 @@ def run(name: str, program: str, dry: bool = False) -> str:
     parts = []
     if error:
         parts.append(f"执行出错：{error}")
-    if value is not None:
-        parts.append(f"返回值：{json.dumps(value, ensure_ascii=False)}")
     if logs:
         parts.append("日志：\n" + "\n".join(logs))
     if diff:

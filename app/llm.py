@@ -127,6 +127,15 @@ async def stream_respond(input_items: list, config: dict, run_tool):
                 if out["kind"] == "text":
                     text = texts.get(out["ref"], "")
                     if text:
+                        # 正文也是 assistant 的一轮输出。DeepSeek 带 tools 时要求每一轮
+                        # 的 reasoning 都必须回传(即使该轮没有工具调用),正文 message 前
+                        # 同样必须紧跟非空 reasoning,否则 400(实验 A/D 验证)。
+                        call_reasoning = round_reasoning or last_reasoning or PLACEHOLDER
+                        if call_reasoning:
+                            input_items.append({
+                                "type": "reasoning",
+                                "content": [{"type": "reasoning_text", "text": call_reasoning}],
+                            })
                         input_items.append({
                             "type": "message",
                             "role": "assistant",
@@ -207,8 +216,8 @@ async def stream_respond(input_items: list, config: dict, run_tool):
             if not calls:
                 if not content:
                     raise RuntimeError("模型未输出任何内容")
-                # 纯文本收尾(模型没调 respond):修复——请求以 assistant 正文结尾(前插
-                # 本轮思维链,实测 API 要求其前紧跟 reasoning),再追加一条 developer
+                # 纯文本收尾(模型没调 respond):修复——回放循环已把正文 message 连同其
+                # reasoning 一起放进 input(见上方回放),这里只需追加一条 developer
                 # 元指令要求补 respond(实测模型会照做)。该消息只存在于本次工具循环,
                 # 不进落盘的 history,下次请求由 build_input 重新拼装,无污染。
                 # 修复次数用尽仍失败才宽容接受为无选项结束。
@@ -217,11 +226,6 @@ async def stream_respond(input_items: list, config: dict, run_tool):
                            "reasoning": round_reasoning or last_reasoning or PLACEHOLDER}
                     return
                 respond_repairs += 1
-                input_items.insert(len(input_items) - 1, {
-                    "type": "reasoning",
-                    "content": [{"type": "reasoning_text",
-                                 "text": round_reasoning or last_reasoning or PLACEHOLDER}],
-                })
                 input_items.append({
                     "type": "message",
                     "role": "developer",
