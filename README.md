@@ -5,8 +5,15 @@ SillyTavern过于复杂，并且对工具调用的支持很糟糕，所以需要
 本项目不兼容SillyTavern格式的预设和角色卡，而是使用一个简化的版本
 
 # 用法
-uv run -m main
-在端口25530上启动一个双栈访问的服务器，访问后打开对话页面
+
+1. 配置 API key：复制 `config.yaml.example` 为 `config.yaml`，将 `api_key` 替换为你的真实 key。
+2. 启动服务器：
+   ```bash
+   uv run -m main
+   ```
+   默认在端口 25530 上启动双栈访问的服务器，并自动打开浏览器。
+
+测试时可使用 `uv run -m main --port 25531 --no-browser` 避免与主实例冲突。
 
 # 预设和角色卡
 这两个概念来自SillyTavern，但本项目将它们大幅度简化
