@@ -25,7 +25,7 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 # 工具
 模型有三个工具（schema 在 app/core.py，通过 Responses API function calling）：
 - respond：提交剧情推进选项并结束本轮回复（只含 options，无选项传空数组）；必须是一轮回复的最后一次调用。正文不经过工具，是模型的普通文本输出（output_text），直接流式给用户
-- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state 与顶层 def 函数持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致；fork 时由 world.fork 把断点处的快照（及更早快照）复制到新会话，无快照则兜底复制当前 committed。无超时保护
+- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state、顶层 def 函数、全大写全局变量（常量，识别规则 `^[A-Z][A-Z0-9_]*$`）三者持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json，函数与常量都存源码进 lib.py，重放时按 tree.body 顺序 exec）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致；fork 时由 world.fork 把断点处的快照（及更早快照）复制到新会话，无快照则兜底复制当前 committed。无超时保护
 - read_file：只读分页读文件（app/tools.py），相对路径以项目根为基准，允许绝对路径
 
 生成失败的处理（server.py _generate）：后端/API 错误不再丢弃半截结果——照打断的先例落盘（正文或「（生成失败，无正文输出）」占位、已执行的 tool_calls、tail 思维链），entry 上加 error 字段（前端以「出错」标签+错误条显示；build_input 回放时忽略该字段，不进模型上下文），已执行的工具调用改动一并 commit 保持叙事与世界状态一致；用户可修改/回滚/重新输出。仅当尚未开始流式输出（无内容可落盘）时才只 abort 世界状态。

@@ -3,12 +3,12 @@
 每个会话一个 exec 命名空间：预置全局对象 state（dict）与 print。
 持久化到 sessions/<name>/world/：
 - state.json   当前 state（JSON）
-- lib.py       模型定义的顶层函数源码（重放恢复）
+- lib.py       模型定义的顶层函数与全大写常量源码（重放恢复）
 - snapshots.json  按历史长度存档的 {state, lib} 快照，会话回滚/重生成时
   状态跟着回到对应位置（server 在截断 history 后调用 sync）。
 
 语义（与原 JS 版对齐）：
-- 原子执行：代码出错自动回滚（state、本次新增/覆盖的函数），不留半更新；
+- 原子执行：代码出错自动回滚（state、本次新增/覆盖的函数与常量），不留半更新；
 - dry=True 试运行：返回完整结果但一切变化不生效；
 - 约定式整理：定义了全局函数 normalize() 时，每次成功执行后、生成 diff 前
   自动调用一次；normalize 出错只回滚它自己的改动；
@@ -19,6 +19,7 @@ import ast
 import copy
 import json
 import logging
+import re
 
 from app.core import SESSIONS_DIR, load_history
 
@@ -73,8 +74,20 @@ def _diff(before, after, base="", out=None):
     return out
 
 
+# 全大写变量 = 常量(Python 约定)。排除 _ 开头的私有名与 __dunder__。
+CONST_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _is_const_name(name: str) -> bool:
+    return bool(CONST_NAME_RE.match(name))
+
+
 def _extract_defs(program: str) -> dict:
-    """提取程序中顶层 def 的 {name: 源码}。语法错误返回 None(由 exec 报错)。"""
+    """提取程序中顶层 def 与全大写常量赋值的 {name: 源码}。
+
+    全大写全局变量(如 TIERS = [...])按常量持久化,跨 turn 恢复;
+    语法错误返回 None(由 exec 报错)。
+    """
     try:
         tree = ast.parse(program)
     except SyntaxError:
@@ -85,6 +98,21 @@ def _extract_defs(program: str) -> dict:
             src = ast.get_source_segment(program, node)
             if src:
                 out[node.name] = src
+        elif isinstance(node, ast.Assign):
+            # 顶层单目标赋值: TIERS = [...](多目标 A=B=1 忽略,避免依赖顺序歧义)
+            if len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name) and _is_const_name(target.id):
+                    src = ast.get_source_segment(program, node)
+                    if src:
+                        out[target.id] = src
+        elif isinstance(node, ast.AnnAssign):
+            # 带类型注解的赋值: TIERS: list = [...]
+            target = node.target
+            if isinstance(target, ast.Name) and _is_const_name(target.id) and node.value is not None:
+                src = ast.get_source_segment(program, node)
+                if src:
+                    out[target.id] = src
     return out
 
 
@@ -104,7 +132,7 @@ def _print_part(p):
 
 
 def _fresh_ns(rt):
-    """重建命名空间：重放 lib 函数源码，恢复 committed state。"""
+    """重建命名空间：重放 lib 函数与常量源码，恢复 committed state。"""
     ns = {
         "state": copy.deepcopy(rt["committed"]["state"]),
         "print": lambda *parts: _push_log(rt, " ".join(_print_part(p) for p in parts)),
@@ -265,7 +293,7 @@ def run(name: str, program: str, dry: bool = False) -> str:
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
     if error is None:
-        # 用户代码成功:收集顶层 def 进 lib
+        # 用户代码成功:收集顶层 def 与全大写常量进 lib
         defs = _extract_defs(program)
         if defs:
             rt["lib"].update(defs)
