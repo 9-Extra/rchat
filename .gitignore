@@ -1,12 +1,12 @@
 __pycache__
 .venv
-/需求.md
 uv.lock
 /sessions
+config.yaml
 
-# 有版权问题的本地预设/角色卡，保留在工作区但不提交
-/preset/梦鲸.md
-/games/少女勇者的轮回冒险.md
-/games/k❤s99.md
-/games/susu_magic.md
-/games/TS龙娘的RPG冒险.md
+# 本地预设/角色卡：白名单模式，默认不提交，仅保留以下文件
+/preset/*
+!/preset/GM.md
+/games/*
+!/games/龙娘x猫娘.md
+
