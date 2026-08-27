@@ -6,7 +6,7 @@ config.yaml
 
 # 本地预设/角色卡：白名单模式，默认不提交，仅保留以下文件
 /preset/*
-!/preset/GM.md
+!/preset/GM-safe.md
 /games/*
 !/games/龙娘x猫娘.md
 
