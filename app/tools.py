@@ -3,8 +3,7 @@ import json
 import logging
 from pathlib import Path
 
-from app import world
-from app.core import ROOT
+from app import core, world
 
 logger = logging.getLogger("airp.tools")
 
@@ -18,10 +17,13 @@ MAX_BYTES = 50 * 1024
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
 
-def read_file(file_path: str, offset: int = 1, limit: int = READ_LIMIT) -> str:
+def read_file(
+    file_path: str, offset: int = 1, limit: int = READ_LIMIT, base_dir: str | None = None
+) -> str:
     """读取一个 UTF-8 文本文件,返回带分页信息的内容窗口。
 
-    相对路径以项目根目录为基准,也接受绝对路径。所有错误以文本返回,
+    相对路径以 base_dir 为基准（工具调用时传当前会话角色卡所在目录）,
+    未提供 base_dir 时以项目根目录为基准。也接受绝对路径。所有错误以文本返回,
     由模型自行纠正(与原插件把异常作为工具结果的行为一致)。
     """
     try:
@@ -35,7 +37,8 @@ def read_file(file_path: str, offset: int = 1, limit: int = READ_LIMIT) -> str:
             return f"错误：limit 不能超过 {READ_LIMIT}"
         absolute = Path(file_path)
         if not absolute.is_absolute():
-            absolute = ROOT / absolute
+            root = Path(base_dir) if base_dir else core.ROOT
+            absolute = root / absolute
         try:
             size = absolute.stat().st_size
         except OSError:
@@ -92,7 +95,18 @@ def execute_tool(session: str, name: str, arguments: str) -> str:
         if name == "world_run":
             return world.run(session, str(args.get("program", "")), dry=args.get("dry") is True)
         if name == "read_file":
-            return read_file(args.get("file_path", ""), args.get("offset", 1), args.get("limit", READ_LIMIT))
+            try:
+                state = core.load_state(session)
+                card = core.load_cards().get(state.get("card", ""))
+                base_dir = Path(card["path"]).parent if card and card.get("path") else None
+            except Exception as e:
+                return f"错误：无法确定角色卡目录：{type(e).__name__}: {e}"
+            return read_file(
+                args.get("file_path", ""),
+                args.get("offset", 1),
+                args.get("limit", READ_LIMIT),
+                base_dir=str(base_dir) if base_dir else None,
+            )
         return f"错误：未知工具 {name}"
     except Exception as e:
         logger.exception("工具 %s 执行失败", name)

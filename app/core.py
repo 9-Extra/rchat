@@ -25,6 +25,7 @@ AIRP_PROMPT = """\
 3. 在正文写完后，调用 respond 提交的剧情推进选项（options）同时结束本轮。没有合适的选项时传空数组。
 
 world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
+state只记当前状态，不记录长期日志，防止无效信息堆积。
 
 再次提醒：正文写完后不要忘respond提交选项。
 """
@@ -80,7 +81,7 @@ _READ_FILE_TOOL_DEF = {
     "description": (
         "读取一个 UTF-8 文本文件并返回其内容。"
         "用于读取玩家提供的设定文档、笔记、角色卡、存档等文本文件；"
-        "相对路径以项目根目录为基准，也支持绝对路径；"
+        "相对路径以当前会话角色卡所在目录为基准，也支持绝对路径；"
         "大文件可用 offset/limit 分页继续读取（分页信息在返回末尾）。"
     ),
     "parameters": {
@@ -88,7 +89,7 @@ _READ_FILE_TOOL_DEF = {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "要读取的文件路径（相对项目根目录，或绝对路径）。",
+                "description": "要读取的文件路径（相对角色卡所在目录，或绝对路径）。",
             },
             "offset": {"type": "number", "description": "起始行号（1 起），默认 1。"},
             "limit": {"type": "number", "description": "最多返回行数，默认 2000，最大 2000。"},
@@ -207,7 +208,7 @@ def load_presets() -> dict:
 
 def load_cards() -> dict:
     cards = {}
-    for p in sorted(GAMES_DIR.glob("*.md")):
+    for p in sorted(GAMES_DIR.rglob("*.md")):
         meta, body = _split_frontmatter(p.read_text(encoding="utf-8"))
         m = SETTING_RE.search(body)
         um = USER_SETTING_RE.search(body)
@@ -215,6 +216,7 @@ def load_cards() -> dict:
             "id": p.stem,
             "name": meta.get("name") or p.stem,
             "description": meta.get("description") or "",
+            "path": str(p),
             "setting": m.group(1).strip() if m else "",
             "user_setting": um.group(1).strip() if um else "",
             "beginnings": [b.group(1).strip() for b in BEGINNING_RE.finditer(body)],
