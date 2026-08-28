@@ -29,9 +29,8 @@ world_run是你的计算器兼笔记本。所有数值与随机性判定（战�
 再次提醒：正文写完后不要忘respond提交选项。
 """
 
-# Responses API 风格的 function 工具定义
-RESPOND_TOOL = {
-    "type": "function",
+# api_type 无关的基础工具定义（只含 name/description/parameters）
+_RESPOND_TOOL_DEF = {
     "name": "respond",
     "description": "提交剧情推进选项并结束本轮回复。调用本工具之前，必须已经以普通文本输出了完整正文（正文不写在本工具里）。参数只含选项；无选项时传空数组。",
     "parameters": {
@@ -47,8 +46,7 @@ RESPOND_TOOL = {
     },
 }
 
-WORLD_RUN_TOOL = {
-    "type": "function",
+_WORLD_RUN_TOOL_DEF = {
     "name": "world_run",
     "description": (
         "在持久的 Python 环境中执行一段代码，用于一切涉及数值与规则的判定与状态更新。"
@@ -77,8 +75,7 @@ WORLD_RUN_TOOL = {
     },
 }
 
-READ_FILE_TOOL = {
-    "type": "function",
+_READ_FILE_TOOL_DEF = {
     "name": "read_file",
     "description": (
         "读取一个 UTF-8 文本文件并返回其内容。"
@@ -100,7 +97,35 @@ READ_FILE_TOOL = {
     },
 }
 
-TOOLS = [RESPOND_TOOL, WORLD_RUN_TOOL, READ_FILE_TOOL]
+_BASE_TOOLS = [_RESPOND_TOOL_DEF, _WORLD_RUN_TOOL_DEF, _READ_FILE_TOOL_DEF]
+
+
+def _to_responses_format(tool: dict) -> dict:
+    """把基础定义转为 Responses API 工具格式。"""
+    return {"type": "function", **tool}
+
+
+def _to_chat_completions_format(tool: dict) -> dict:
+    """把基础定义转为 Chat Completions API 工具格式。"""
+    return {"type": "function", "function": tool}
+
+
+# Responses API 风格的工具定义
+RESPOND_TOOL = _to_responses_format(_RESPOND_TOOL_DEF)
+WORLD_RUN_TOOL = _to_responses_format(_WORLD_RUN_TOOL_DEF)
+READ_FILE_TOOL = _to_responses_format(_READ_FILE_TOOL_DEF)
+TOOLS = [_to_responses_format(t) for t in _BASE_TOOLS]
+
+# Chat Completions API 风格的工具定义
+CHAT_COMPLETIONS_TOOLS = [_to_chat_completions_format(t) for t in _BASE_TOOLS]
+
+
+def get_tools(api_type: str) -> list:
+    """根据 api_type 返回对应格式的工具定义。"""
+    if api_type == "chat_completions":
+        return CHAT_COMPLETIONS_TOOLS
+    return TOOLS
+
 
 SECTION_RE = re.compile(
     r'<preset_section\s+role="(system|user|assistant)"\s*>(.*?)</preset_section>', re.S
@@ -306,25 +331,9 @@ def _message_item(role: str, content: str) -> dict:
     return {"type": "message", "role": role, "content": [{"type": part_type, "text": content}]}
 
 
-def build_input(state: dict, history: list, draft=None) -> list:
-    """拼装发送给 Responses API 的完整 input 列表。每次调用都用当前保存的开局重新渲染预设。"""
-    preset = load_presets()[state["preset"]]
-    card = load_cards()[state["card"]]
-    # 宏求值环境: 模块 + 四个固定宏(同名变量,与旧版 .replace() 行为一致)
-    env = {
-        **MACRO_MODULES,
-        "game_setting": card["setting"],
-        "game_beginning": state["beginning_text"],
-        "user_setting": card["user_setting"],
-        "respond_tool": AIRP_PROMPT,
-    }
+def _build_input_responses(state, history, draft, preset, env):
+    """拼装 Responses API 的 input_items。"""
     items = [_message_item(sec["role"], render_template(sec["content"], env)) for sec in preset["sections"]]
-    # 对话历史：assistant 块 -> 若干 world_run/read_file 的 function_call/output 对
-    # （回合内的工具循环）+ 正文 message + respond 的 function_call/output 对（只含选项）；
-    # user 块 -> 普通 user message。call_n 对每个 function_call 项递增。
-    # 请求以 user message 结尾，历史里的 reasoning 回放
-    # 因此不受 DeepSeek「reasoning_text must be passed back」强制约束（实验 G 验证），
-    # 但仍全部回传，与官方文档口径一致。旧格式历史（正文也在 entry 上）同样适用。
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
@@ -374,3 +383,85 @@ def build_input(state: dict, history: list, draft=None) -> list:
             draft = render_template(template, {**env, "user_input": draft})
         items.append(_message_item("user", draft))
     return items
+
+
+def _build_input_chat_completions(state, history, draft, preset, env):
+    """拼装 Chat Completions API 的 messages 列表。"""
+    messages = [{"role": sec["role"], "content": render_template(sec["content"], env)} for sec in preset["sections"]]
+    call_n = 0
+    for entry in history:
+        if entry["role"] == "assistant":
+            entry_reasoning = entry.get("reasoning") or " "
+            # 辅助工具调用：每个 tool_call 独立成 assistant(tool_calls) + tool 消息
+            for tc in entry.get("tool_calls", []):
+                call_n += 1
+                reasoning = tc.get("reasoning") or entry_reasoning
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": reasoning,
+                    "tool_calls": [{
+                        "id": f"call_{call_n}",
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": f"call_{call_n}",
+                    "content": tc["result"],
+                })
+            # 正文
+            if entry.get("content"):
+                messages.append({
+                    "role": "assistant",
+                    "content": entry["content"],
+                    "reasoning_content": entry_reasoning,
+                })
+            # respond 调用
+            call_n += 1
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": entry_reasoning,
+                "tool_calls": [{
+                    "id": f"call_{call_n}",
+                    "type": "function",
+                    "function": {
+                        "name": "respond",
+                        "arguments": json.dumps({"options": entry.get("options") or []}, ensure_ascii=False),
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{call_n}",
+                "content": "ok",
+            })
+        else:
+            messages.append({"role": "user", "content": entry["content"]})
+    # 输入框中的本次输入：作为新的 user message 拼在末尾。
+    if draft and history and history[-1]["role"] == "assistant":
+        template = preset.get("user_input_template")
+        if template is not None:
+            draft = render_template(template, {**env, "user_input": draft})
+        messages.append({"role": "user", "content": draft})
+    return messages
+
+
+def build_input(state: dict, history: list, draft=None) -> list:
+    """拼装发送给模型的完整输入。根据 config['api_type'] 返回 Responses input_items 或 Chat Completions messages。"""
+    config = load_config()
+    api_type = config.get("api_type", "responses")
+    preset = load_presets()[state["preset"]]
+    card = load_cards()[state["card"]]
+    env = {
+        **MACRO_MODULES,
+        "game_setting": card["setting"],
+        "game_beginning": state["beginning_text"],
+        "user_setting": card["user_setting"],
+        "respond_tool": AIRP_PROMPT,
+    }
+    if api_type == "chat_completions":
+        return _build_input_chat_completions(state, history, draft, preset, env)
+    return _build_input_responses(state, history, draft, preset, env)

@@ -1,6 +1,7 @@
 api_base: "https://api.deepseek.com"
 model: "deepseek-v4-flash"
 api_key: "YOUR_API_KEY_HERE"
+api_type: "responses"  # "responses" 或 "chat_completions"
 temperature: 0.7
 max_tokens: 100000
 reasoning_effort: "medium"

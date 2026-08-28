@@ -26,6 +26,9 @@
 <div id="list">加载中…</div>
 <script>
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtArgs(args) {
+  try { return JSON.stringify(JSON.parse(args), null, 2); } catch (e) { return args; }
+}
 (async () => {
   const session = new URLSearchParams(location.search).get('session');
   const input = sessionStorage.getItem('preview_draft') || '';
@@ -36,8 +39,9 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
   const data = await r.json();
   if (!r.ok) { document.getElementById('list').textContent = data.detail || '加载失败'; return; }
   let html = `<details class="msg"><summary><span class="role">tools</span>工具定义</summary><div class="body">${esc(JSON.stringify(data.tools, null, 2))}</div></details>`;
-  for (const m of data.input) {
-    let role = m.type, inner = '', head = '';
+  const items = data.messages || data.input || [];
+  for (const m of items) {
+    let role = m.type || m.role, inner = '', head = '';
     if (m.type === 'message') {
       role = m.role;
       const text = (m.content || []).map(p => p.text || '').join('');
@@ -45,9 +49,7 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
       head = text;
     } else if (m.type === 'function_call') {
       role = 'assistant';
-      let args = m.arguments;
-      try { args = JSON.stringify(JSON.parse(args), null, 2); } catch (e) {}
-      inner = `<div class="toolcall">工具调用 ${esc(m.name)}：\n${esc(args)}</div>`;
+      inner = `<div class="toolcall">工具调用 ${esc(m.name)}：\n${esc(fmtArgs(m.arguments))}</div>`;
       head = `[工具调用 ${m.name}]`;
     } else if (m.type === 'function_call_output') {
       role = 'tool';
@@ -57,11 +59,35 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
       const text = (m.content || []).map(p => p.text || '').join('');
       inner = `<div class="body">${esc(text)}</div>`;
       head = '[思考] ' + text;
+    } else if (data.messages) {
+      // Chat Completions 标准 message 格式
+      role = m.role;
+      if (m.reasoning_content) {
+        inner += `<div class="body" style="color:#aaa;">[思考]\n${esc(m.reasoning_content)}</div>`;
+        head = '[思考] ' + m.reasoning_content;
+      }
+      if (m.content) {
+        inner += `<div class="body">${esc(typeof m.content === 'string' ? m.content : JSON.stringify(m.content))}</div>`;
+        head = (head || m.content);
+      }
+      if (m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          const fn = tc.function || {};
+          inner += `<div class="toolcall">工具调用 ${esc(fn.name || '')}（id=${esc(tc.id || '')}）：\n${esc(fmtArgs(fn.arguments || ''))}</div>`;
+          head = head || `[工具调用 ${fn.name}]`;
+        }
+      }
+      if (m.tool_call_id) {
+        inner = `<div class="body">${esc(m.content || '')}</div>`;
+        head = m.content || '';
+      }
+      if (!inner) {
+        inner = `<div class="body">${esc(JSON.stringify(m, null, 2))}</div>`;
+      }
     } else {
       inner = `<div class="body">${esc(JSON.stringify(m, null, 2))}</div>`;
     }
-    head = head.replace(/\s+/g, ' ').slice(0, 60);
-    // 默认折叠，只显示类型/role 和开头内容
+    head = (head || '').toString().replace(/\s+/g, ' ').slice(0, 60);
     html += `<details class="msg"><summary><span class="role ${role}">${role}</span>${esc(head)}…</summary>${inner}</details>`;
   }
   document.getElementById('list').innerHTML = html;
