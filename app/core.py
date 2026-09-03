@@ -25,7 +25,7 @@ AIRP_PROMPT = """\
 3. 在正文写完后，调用 respond 提交的剧情推进选项（options）同时结束本轮。没有合适的选项时传空数组。
 
 world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
-state只记当前状态，不记录长期日志，防止无效信息堆积。
+state只记当前状态，避免无限增长的日志，防止无效信息堆积。上下文本身就是日志。
 
 再次提醒：正文写完后不要忘respond提交选项。
 """
@@ -208,12 +208,15 @@ def load_presets() -> dict:
 
 def load_cards() -> dict:
     cards = {}
-    for p in sorted(GAMES_DIR.rglob("*.md")):
+    # id 用相对路径（去 .md），天然唯一
+    paths = sorted(GAMES_DIR.glob("*.md")) + sorted(GAMES_DIR.glob("*/*.md"))
+    for p in paths:
         meta, body = _split_frontmatter(p.read_text(encoding="utf-8"))
         m = SETTING_RE.search(body)
         um = USER_SETTING_RE.search(body)
-        cards[p.stem] = {
-            "id": p.stem,
+        cid = p.relative_to(GAMES_DIR).with_suffix("").as_posix()
+        cards[cid] = {
+            "id": cid,
             "name": meta.get("name") or p.stem,
             "description": meta.get("description") or "",
             "path": str(p),
@@ -250,20 +253,22 @@ def create_session(name: str, preset: str, card: str, beginning_index):
         raise ValueError(f"预设不存在: {preset}")
     if card not in cards:
         raise ValueError(f"角色卡不存在: {card}")
+    card_obj = cards[card]
     d = _session_dir(name)
     if d.exists():
         raise ValueError(f"session 已存在: {name}")
     if beginning_index is None:
         text = ""
     else:
-        text = cards[card]["beginnings"][beginning_index]
+        text = card_obj["beginnings"][beginning_index]
     d.mkdir(parents=True)
     (d / "history.jsonl").touch()
     state = {
         "id": d.name,
         "name": name,
         "preset": preset,
-        "card": card,
+        "card": card_obj["id"],
+        "card_name": card_obj["name"],
         "beginning_index": beginning_index,
         "beginning_text": text,
         "created_at": time.time(),

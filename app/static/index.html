@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AIRP</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
 <style>
   :root {
     --bg: #141519;
@@ -70,6 +72,25 @@
   .block:hover .ops { opacity: 1; }
   .block .ops button { font-size: 12px; padding: 2px 9px; background: rgba(35,38,46,.9); }
   .block .content { white-space: pre-wrap; line-height: 1.85; word-break: break-word; font-size: 15px; }
+  .block .content.markdown { white-space: normal; }
+  .block .content.markdown p { margin-bottom: 0.75em; }
+  .block .content.markdown p:last-child { margin-bottom: 0; }
+  .block .content.markdown h1, .block .content.markdown h2, .block .content.markdown h3, .block .content.markdown h4, .block .content.markdown h5, .block .content.markdown h6 { margin: 0.8em 0 0.4em; font-weight: 600; line-height: 1.4; }
+  .block .content.markdown h1 { font-size: 1.45em; }
+  .block .content.markdown h2 { font-size: 1.3em; }
+  .block .content.markdown h3 { font-size: 1.15em; }
+  .block .content.markdown ul, .block .content.markdown ol { margin: 0.6em 0; padding-left: 1.5em; }
+  .block .content.markdown li { margin: 0.25em 0; }
+  .block .content.markdown blockquote { margin: 0.6em 0; padding: 0.4em 0.8em; border-left: 3px solid #4a5568; color: #a9adb8; background: rgba(255,255,255,.03); border-radius: 0 6px 6px 0; }
+  .block .content.markdown code { background: rgba(255,255,255,.08); padding: 0.15em 0.35em; border-radius: 4px; font-family: "JetBrains Mono", "Fira Code", Consolas, monospace; font-size: 0.9em; }
+  .block .content.markdown pre { background: #17191e; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 0.6em 0; overflow-x: auto; }
+  .block .content.markdown pre code { background: transparent; padding: 0; font-size: 0.85em; white-space: pre-wrap; word-break: break-word; }
+  .block .content.markdown a { color: var(--accent); text-decoration: none; }
+  .block .content.markdown a:hover { text-decoration: underline; }
+  .block .content.markdown table { border-collapse: collapse; margin: 0.6em 0; width: 100%; }
+  .block .content.markdown th, .block .content.markdown td { border: 1px solid var(--border); padding: 6px 10px; }
+  .block .content.markdown th { background: rgba(255,255,255,.05); }
+  .block .content.markdown hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
   .errnote { color: #e07a5f; font-size: 13px; line-height: 1.6; margin-bottom: 8px; padding: 6px 10px; background: rgba(224,122,95,.08); border-left: 3px solid #e07a5f; border-radius: 0 6px 6px 0; }
   .options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
   .options button { background: #253047; border-color: #35466b; color: #a9c4f5; font-size: 12px; border-radius: 20px; padding: 4px 14px; max-width: 100%; white-space: normal; text-align: left; }
@@ -240,6 +261,17 @@ async function api(path, opts) {
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+function renderMarkdown(text) {
+  if (!text) return '';
+  if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return esc(text);
+  try {
+    const html = marked.parse(text, { async: false });
+    return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  } catch (e) {
+    return esc(text);
+  }
+}
+
 // ---------- 会话列表 ----------
 async function loadSessions() {
   const list = await api('/api/sessions');
@@ -280,7 +312,7 @@ function render() {
   $('emptyHint')?.remove();
   $('toolbar').style.display = 'flex';
   $('composer').style.display = 'block';
-  $('sessName').textContent = cur.name + '（角色卡：' + cur.card + '）';
+  $('sessName').textContent = cur.name + '（角色卡：' + (cur.card_name || cur.card) + '）';
   renderPresetSelect();
   const chat = $('chat');
   chat.innerHTML = '';
@@ -326,7 +358,7 @@ function makeOpsBtn(text, fn) {
 function makeBeginningBlock() {
   const div = document.createElement('div');
   div.className = 'block beginning';
-  div.innerHTML = `<div class="tag">开局</div><div class="content">${esc(cur.beginning_text || '（空开局）')}</div>`;
+  div.innerHTML = `<div class="tag">开局</div><div class="content markdown">${renderMarkdown(cur.beginning_text || '（空开局）')}</div>`;
   const ops = document.createElement('div');
   ops.className = 'ops';
   ops.appendChild(makeOpsBtn('修改', () => editBlock(div, cur.beginning_text, async text => {
@@ -367,7 +399,7 @@ function makeAIBlock(e, i) {
   div.innerHTML = `<div class="tag">${e.error ? '出错' : 'AI'}</div>` +
     aiMiddleHTML(e) +
     (e.error ? `<div class="errnote">〔生成出错〕${esc(e.error)}</div>` : '') +
-    `<div class="content">${esc(e.content)}</div>`;
+    `<div class="content markdown">${renderMarkdown(e.content)}</div>`;
   if (e.options && e.options.length) {
     const opts = document.createElement('div');
     opts.className = 'options';
@@ -450,8 +482,23 @@ async function streamInto(url, opts, userText) {
   chat.appendChild(div);
   scrollBottom();
   const contentDiv = div.querySelector('.content');
+  contentDiv.classList.add('markdown');
   // 当前思考块:工具调用会切分思考,下一段思考另起新块(思考→工具→思考→…→正文)
   let thinkDiv = null;
+  let partialContent = '';
+  let renderScheduled = false;
+  function flushContent() {
+    contentDiv.innerHTML = renderMarkdown(partialContent);
+    renderScheduled = false;
+    scrollBottom();
+  }
+  function appendContent(delta) {
+    partialContent += delta;
+    if (!renderScheduled) {
+      renderScheduled = true;
+      requestAnimationFrame(flushContent);
+    }
+  }
   try {
     const resp = await fetch(url, opts);
     activeReader = resp.body.getReader();
@@ -475,7 +522,7 @@ async function streamInto(url, opts, userText) {
           }
           thinkDiv.textContent += ev.delta; scrollBottom();
         }
-        else if (ev.type === 'content') { contentDiv.textContent += ev.delta; scrollBottom(); }
+        else if (ev.type === 'content') { appendContent(ev.delta); }
         // 工具调用块随流逐个出现（事件在工具执行完后到达，参数与结果一起拼入）
         else if (ev.type === 'tool') {
           contentDiv.insertAdjacentHTML('beforebegin', toolDetailsHTML(ev));
