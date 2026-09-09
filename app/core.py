@@ -5,6 +5,7 @@ import math
 import random
 import re
 import time
+import uuid
 from pathlib import Path
 
 import yaml
@@ -272,6 +273,8 @@ def create_session(name: str, preset: str, card: str, beginning_index):
         "beginning_index": beginning_index,
         "beginning_text": text,
         "created_at": time.time(),
+        # 每会话固定的 UUID v4,作为 X-Opencode-Session 请求头发送(opencode-go 风控)
+        "chat_id": str(uuid.uuid4()),
     }
     save_state(state)
     return state
@@ -296,6 +299,8 @@ def fork_session(name: str, index: int) -> dict:
         "id": safe_dir_name(new_name),
         "name": new_name,
         "created_at": time.time(),
+        # fork 是新对话,重新生成 chat_id,不与原会话共用
+        "chat_id": str(uuid.uuid4()),
     }
     _session_dir(new_name).mkdir(parents=True)
     save_state(new_state)
@@ -307,6 +312,10 @@ def load_state(name: str) -> dict:
     state = json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
     # 旧版 state.json 没有 id 字段，按目录名规则补上
     state.setdefault("id", safe_dir_name(state["name"]))
+    # 旧会话补发 chat_id 并落盘（之后保持不变）
+    if "chat_id" not in state:
+        state["chat_id"] = str(uuid.uuid4())
+        save_state(state)
     return state
 
 

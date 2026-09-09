@@ -15,6 +15,26 @@ from app.core import get_tools
 MAX_ROUNDS = 25
 
 
+def _make_client(config: dict) -> AsyncOpenAI:
+    """构造 OpenAI 客户端，按需附加风控要求的请求头。
+
+    - user_agent：覆盖 SDK 默认的 "OpenAI/Python ..." UA（部分端点风控拒绝语言默认 UA）
+    - x_opencode_session + chat_id：opencode-go 要求每个对话带固定的 UUID v4 会话头
+      （同一对话所有请求同一个值，用于 GPU KV 缓存亲和调度）
+    """
+    headers = {}
+    if config.get("user_agent"):
+        headers["User-Agent"] = config["user_agent"]
+    if config.get("x_opencode_session") and config.get("chat_id"):
+        headers["X-Opencode-Session"] = config["chat_id"]
+    return AsyncOpenAI(
+        api_key=config["api_key"],
+        base_url=config["api_base"].rstrip("/"),
+        timeout=600.0,
+        default_headers=headers or None,
+    )
+
+
 def build_request(input_items: list, config: dict) -> dict:
     """构造实际发送给模型的请求参数（/api/preview 也用它展示上下文）。"""
     api_type = config.get("api_type", "responses")
@@ -74,11 +94,7 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
     # (已实测合法,空字符串不合法)。
     last_reasoning = ""
     PLACEHOLDER = " "
-    async with AsyncOpenAI(
-        api_key=config["api_key"],
-        base_url=config["api_base"].rstrip("/"),
-        timeout=600.0,
-    ) as client:
+    async with _make_client(config) as client:
         content = ""  # 整个回合累积的正文(跨轮次,全部对用户可见)
         respond_repairs = 0  # respond 契约校验失败的自动修复次数(把调用作为工具错误回传)
         options_confirmed = False  # 空选项已提示过一次:再传空数组视为模型有意为之
@@ -228,11 +244,7 @@ async def _stream_respond_chat_completions(messages: list, config: dict, run_too
     """Chat Completions API 流式调用实现（内含工具循环）。"""
     last_reasoning = ""
     PLACEHOLDER = " "
-    async with AsyncOpenAI(
-        api_key=config["api_key"],
-        base_url=config["api_base"].rstrip("/"),
-        timeout=600.0,
-    ) as client:
+    async with _make_client(config) as client:
         content = ""  # 整个回合累积的正文（跨轮次）
         respond_repairs = 0
         options_confirmed = False

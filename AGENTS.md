@@ -13,6 +13,8 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 - `api_base` / `api_key` / `model`：常规模型连接参数。
 - `api_type`：`"responses"`（默认，OpenAI Responses API）或 `"chat_completions"`（OpenAI 风格 Chat Completions API）。
 - `temperature` / `max_tokens` / `reasoning_effort`：生成参数（`reasoning_effort` 仅在 `responses` 模式下生效）。
+- `user_agent`：覆盖 SDK 默认的 `OpenAI/Python ...` UA。
+- `x_opencode_session`：`true` 时每个会话的请求带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控要求，用于 GPU KV 缓存亲和调度）。UUID 存于会话 state.json 的 `chat_id` 字段，创建会话时生成，旧会话首次加载时补发，fork 出的新会话换新值。
 
 切换 `api_type` 时，上下文拼装、工具 schema、流式调用实现会自动切换；落盘的 `history.jsonl` 格式不变。
 

@@ -261,6 +261,8 @@ async def _generate(name: str, mode: str, user_input: str | None):
         world.sync(name, len(history))
         input_items = core.build_input(state, history, draft=draft)
         config = core.load_config()
+        # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
+        config["chat_id"] = state.get("chat_id", "")
         done = None
         streaming_started = True
         run_tool = lambda tool_name, arguments: tools.execute_tool(name, tool_name, arguments)
