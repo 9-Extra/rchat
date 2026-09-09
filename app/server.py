@@ -88,9 +88,15 @@ def get_session(name: str):
     try:
         state = core.load_state(name)
         state["history"] = core.load_history(name)
+        # 返回实际生效的思考强度（会话值非法/缺失时回退 config 默认），供前端选中当前档
+        state["reasoning_effort"] = core.resolve_reasoning_effort(
+            state.get("reasoning_effort"), core.load_config()
+        )
         return state
     except FileNotFoundError:
         raise HTTPException(404, "session 不存在")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.delete("/api/sessions/{name}")
@@ -115,6 +121,22 @@ def switch_preset(name: str, req: SwitchPreset):
         raise HTTPException(400, "预设不存在")
     state = core.load_state(name)
     state["preset"] = req.preset
+    core.save_state(state)
+    return state
+
+
+class SetReasoningEffort(BaseModel):
+    effort: str
+
+
+@app.post("/api/sessions/{name}/reasoning_effort")
+def set_reasoning_effort(name: str, req: SetReasoningEffort):
+    if req.effort not in core.EFFORT_LEVELS:
+        raise HTTPException(
+            400, f"非法的思考强度: {req.effort}（可选值: {', '.join(core.EFFORT_LEVELS)}）"
+        )
+    state = core.load_state(name)
+    state["reasoning_effort"] = req.effort
     core.save_state(state)
     return state
 
@@ -193,11 +215,16 @@ def preview(req: Preview):
     history = core.load_history(req.session)
     try:
         input_items = core.build_input(state, history, draft=req.input or None)
+        config = core.load_config()
+        # 预览展示的是实际生效的请求参数，思考强度同样按会话覆盖
+        config["reasoning_effort"] = core.resolve_reasoning_effort(
+            state.get("reasoning_effort"), config
+        )
     except ValueError as e:
         # 预设宏执行失败：用户侧错误，返回 400 而非 500
         raise HTTPException(400, str(e))
     # 展示实际发送给 Responses API 的请求参数
-    return build_request(input_items, core.load_config())
+    return build_request(input_items, config)
 
 
 # ---------- 流式对话 ----------
@@ -263,6 +290,10 @@ async def _generate(name: str, mode: str, user_input: str | None):
         config = core.load_config()
         # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
         config["chat_id"] = state.get("chat_id", "")
+        # 思考强度按会话覆盖（会话值非法/缺失时回退 config 默认；非法默认在此报错）
+        config["reasoning_effort"] = core.resolve_reasoning_effort(
+            state.get("reasoning_effort"), config
+        )
         done = None
         streaming_started = True
         run_tool = lambda tool_name, arguments: tools.execute_tool(name, tool_name, arguments)

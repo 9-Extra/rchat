@@ -189,6 +189,13 @@
     <div id="toolbar" style="display:none">
       <span class="sessname" id="sessName"></span>
       <label>预设 <select id="presetSelect"></select></label>
+      <label>思考 <select id="effortSelect">
+        <option value="none">关闭</option>
+        <option value="low">低</option>
+        <option value="medium">中</option>
+        <option value="high">高</option>
+        <option value="max">最高</option>
+      </select></label>
       <button id="previewBtn">预览上下文</button>
     </div>
     <div id="chat"><div id="emptyHint">请选择或新建一个会话</div></div>
@@ -314,6 +321,8 @@ function render() {
   $('composer').style.display = 'block';
   $('sessName').textContent = cur.name + '（角色卡：' + (cur.card_name || cur.card) + '）';
   renderPresetSelect();
+  // 后端在 GET 会话时已解析出实际生效的思考强度
+  $('effortSelect').value = cur.reasoning_effort || 'low';
   const chat = $('chat');
   chat.innerHTML = '';
   // 开局块：永远是对话界面第一个块
@@ -599,6 +608,10 @@ $('previewBtn').onclick = () => {
 $('presetSelect').onchange = async e => {
   await api(`/api/sessions/${enc()}/preset`, post({ preset: e.target.value }));
   cur.preset = e.target.value;
+};
+$('effortSelect').onchange = async e => {
+  await api(`/api/sessions/${enc()}/reasoning_effort`, post({ effort: e.target.value }));
+  cur.reasoning_effort = e.target.value;
 };
 
 // ---------- 新建会话 ----------

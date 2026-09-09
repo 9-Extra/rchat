@@ -4,6 +4,6 @@ api_key: "YOUR_API_KEY_HERE"
 api_type: "responses"  # "responses" 或 "chat_completions"
 temperature: 0.7
 max_tokens: 100000
-reasoning_effort: "medium"
+reasoning_effort: "medium"  # 思考强度默认值：none/low/medium/high/max（none=禁用思考），前端可按会话覆盖；不设置时按 low 处理
 # user_agent: "rchat/0.1"        # 覆盖 SDK 默认 UA（opencode-go 等端点风控拒绝语言默认 UA）
 # x_opencode_session: true       # 发送每会话固定的 X-Opencode-Session 请求头（opencode-go 风控要求）

@@ -232,6 +232,28 @@ def load_config() -> dict:
     return yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 
 
+# 思考强度五档；none = 禁用思考（请求带 "thinking": {"type": "disabled"}，见 llm.build_request）
+EFFORT_LEVELS = ("none", "low", "medium", "high", "max")
+
+
+def resolve_reasoning_effort(state_value, config: dict) -> str:
+    """解析实际生效的思考强度。
+
+    会话值合法直接用；非法或缺失时回退 config 默认值；config 未设置时用 low；
+    config 值非法直接报错（不静默兜底，避免发出与预期不符的请求）。
+    """
+    if state_value in EFFORT_LEVELS:
+        return state_value
+    default = config.get("reasoning_effort")
+    if default is None:
+        return "low"
+    if default not in EFFORT_LEVELS:
+        raise ValueError(
+            f"config.yaml 的 reasoning_effort 非法: {default!r}（可选值: {', '.join(EFFORT_LEVELS)}）"
+        )
+    return default
+
+
 # ---------- session 存储 ----------
 
 def _session_dir(name: str) -> Path:
@@ -275,6 +297,8 @@ def create_session(name: str, preset: str, card: str, beginning_index):
         "created_at": time.time(),
         # 每会话固定的 UUID v4,作为 X-Opencode-Session 请求头发送(opencode-go 风控)
         "chat_id": str(uuid.uuid4()),
+        # 创建时快照 config 默认思考强度,之后前端可按会话覆盖(config 非法时此处直接报错)
+        "reasoning_effort": resolve_reasoning_effort(None, load_config()),
     }
     save_state(state)
     return state

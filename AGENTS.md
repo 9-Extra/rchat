@@ -12,7 +12,7 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 `config.yaml` 控制模型连接：
 - `api_base` / `api_key` / `model`：常规模型连接参数。
 - `api_type`：`"responses"`（默认，OpenAI Responses API）或 `"chat_completions"`（OpenAI 风格 Chat Completions API）。
-- `temperature` / `max_tokens` / `reasoning_effort`：生成参数（`reasoning_effort` 仅在 `responses` 模式下生效）。
+- `temperature` / `max_tokens` / `reasoning_effort`：生成参数。`reasoning_effort` 是思考强度默认值，五档 `none`/`low`/`medium`/`high`/`max`，不设置时按 `low`，非法值直接报错；`none` 表示禁用思考（请求带 `"thinking": {"type": "disabled"}`）。前端可按会话覆盖（`POST /api/sessions/{name}/reasoning_effort`），会话值存 state.json 的 `reasoning_effort` 字段：创建会话时快照 config 默认值，会话值非法/缺失时回退 config 默认，fork 自动继承。
 - `user_agent`：覆盖 SDK 默认的 `OpenAI/Python ...` UA。
 - `x_opencode_session`：`true` 时每个会话的请求带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控要求，用于 GPU KV 缓存亲和调度）。UUID 存于会话 state.json 的 `chat_id` 字段，创建会话时生成，旧会话首次加载时补发，fork 出的新会话换新值。
 
@@ -47,9 +47,7 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 - `responses` 模式 build_input 回放：assistant 块 -> 工具循环的 function_call/output 对 + 正文 message + respond 调用（options JSON）+ "ok" 输出；user 块 -> 普通 user message，本次输入也拼成 user message，**请求以 user message 结尾**（不再是未闭合的工具循环）。
 - `chat_completions` 模式 build_input 回放：assistant 块拆分为标准 messages：每个 tool_call 对应一条 assistant(tool_calls) + 一条 tool 消息；正文对应一条 assistant(content)；respond 对应一条 assistant(tool_calls) + 一条 tool("ok") 消息；user 块和本次 draft 对应 user 消息。
 
-respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；上下文中的完整示范轮（正文 + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 developer 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。预设侧配合：梦鲸的思考仪式里已把「输出正文 + 调用 respond」写成仪式的收尾步骤（模型对仪式遵循度很高）。
-
-思维链回传（DeepSeek 思考模式）：`responses` 模式下**触发条件是请求以未闭合的工具循环结尾**，该循环内每个 function_call 前以及每个 assistant 正文 message 前都必须紧跟产生它的那一轮非空思维链；`chat_completions` 模式下则在每条 assistant message 中回传 `reasoning_content`。模型个别轮（甚至整个回合）可能不输出思维链：先用前轮兜底，全都没有时用单空格占位（实测合法）。旧格式历史（tool_calls 无 reasoning）用整轮合并的 entry.reasoning 兜底。
+respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；上下文中的完整示范轮（正文 + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 developer 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。
 
 # 会话 fork
 用户块上的「分支」按钮：POST /api/sessions/{name}/fork {index} 在用户块断点处复制出一个新会话（core.fork_session：state 复制 + history[:index]，新名为 原名-fork-时间戳，原会话不动），world.fork 按同一 index 复制世界状态。新会话末尾是 assistant 块（或空历史），可直接继续输入。

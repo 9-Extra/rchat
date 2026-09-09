@@ -50,7 +50,12 @@ def build_request(input_items: list, config: dict) -> dict:
             payload["temperature"] = config["temperature"]
         if config.get("max_tokens") is not None:
             payload["max_tokens"] = config["max_tokens"]
-        # Chat Completions 通常不支持 reasoning_effort，保留 temperature/max_tokens 即可
+        effort = config.get("reasoning_effort")
+        if effort == "none":
+            # 禁用思考：部分厂商要求显式的 thinking.disabled
+            payload["thinking"] = {"type": "disabled"}
+        elif effort is not None:
+            payload["reasoning_effort"] = effort
         return payload
 
     payload = {
@@ -63,8 +68,12 @@ def build_request(input_items: list, config: dict) -> dict:
         payload["temperature"] = config["temperature"]
     if config.get("max_tokens") is not None:
         payload["max_output_tokens"] = config["max_tokens"]
-    if config.get("reasoning_effort") is not None:
-        payload["reasoning"] = {"effort": config["reasoning_effort"]}
+    effort = config.get("reasoning_effort")
+    if effort == "none":
+        # 禁用思考：部分厂商要求显式的 thinking.disabled
+        payload["thinking"] = {"type": "disabled"}
+    elif effort is not None:
+        payload["reasoning"] = {"effort": effort}
     return payload
 
 
