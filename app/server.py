@@ -61,6 +61,19 @@ def get_sessions():
     return core.list_sessions()
 
 
+@app.get("/api/endpoints")
+def get_endpoints():
+    """前端模型下拉用：config.yaml 里定义的端点列表（不含 api_key）。"""
+    try:
+        eps = core.endpoints(core.load_config())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return [
+        {"index": i, "display_name": ep["display_name"], "model": ep["model"]}
+        for i, ep in enumerate(eps)
+    ]
+
+
 # ---------- 会话管理 ----------
 
 
@@ -88,10 +101,14 @@ def get_session(name: str):
     try:
         state = core.load_state(name)
         state["history"] = core.load_history(name)
-        # 返回实际生效的思考强度（会话值非法/缺失时回退 config 默认），供前端选中当前档
+        config = core.load_config()
+        # 返回实际生效值（会话值非法/缺失时回退默认），供前端选中/填显当前配置
         state["reasoning_effort"] = core.resolve_reasoning_effort(
-            state.get("reasoning_effort"), core.load_config()
+            state.get("reasoning_effort"), config
         )
+        state["endpoint"] = core.resolve_endpoint_index(state.get("endpoint"), config)
+        state["temperature"] = core.resolve_temperature(state.get("temperature"), config)
+        state["max_tokens"] = core.resolve_max_tokens(state.get("max_tokens"), config)
         return state
     except FileNotFoundError:
         raise HTTPException(404, "session 不存在")
@@ -137,6 +154,51 @@ def set_reasoning_effort(name: str, req: SetReasoningEffort):
         )
     state = core.load_state(name)
     state["reasoning_effort"] = req.effort
+    core.save_state(state)
+    return state
+
+
+class SetEndpoint(BaseModel):
+    index: int
+
+
+@app.post("/api/sessions/{name}/endpoint")
+def set_endpoint(name: str, req: SetEndpoint):
+    try:
+        eps = core.endpoints(core.load_config())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not (0 <= req.index < len(eps)):
+        raise HTTPException(400, f"端点下标越界: {req.index}（共 {len(eps)} 个端点）")
+    state = core.load_state(name)
+    state["endpoint"] = req.index
+    core.save_state(state)
+    return state
+
+
+class SetParams(BaseModel):
+    # 传 null 清除覆盖（回退全局默认）；未传的键不动
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
+@app.post("/api/sessions/{name}/params")
+def set_params(name: str, req: SetParams):
+    state = core.load_state(name)
+    if "temperature" in req.model_fields_set:
+        if req.temperature is None:
+            state.pop("temperature", None)
+        elif 0 <= req.temperature <= 2:
+            state["temperature"] = req.temperature
+        else:
+            raise HTTPException(400, f"temperature 必须在 0-2 之间: {req.temperature}")
+    if "max_tokens" in req.model_fields_set:
+        if req.max_tokens is None:
+            state.pop("max_tokens", None)
+        elif req.max_tokens >= 1:
+            state["max_tokens"] = req.max_tokens
+        else:
+            raise HTTPException(400, f"max_tokens 必须是正整数: {req.max_tokens}")
     core.save_state(state)
     return state
 
@@ -215,8 +277,8 @@ def preview(req: Preview):
     history = core.load_history(req.session)
     try:
         input_items = core.build_input(state, history, draft=req.input or None)
-        config = core.load_config()
-        # 预览展示的是实际生效的请求参数，思考强度与 PTC 模式同样按会话生效
+        # 合并选中端点与会话生成参数覆盖，预览展示实际生效的请求参数
+        config = core.effective_config(state, core.load_config())
         config["ptc"] = core.load_presets()[state["preset"]].get("ptc", False)
         config["reasoning_effort"] = core.resolve_reasoning_effort(
             state.get("reasoning_effort"), config
@@ -288,7 +350,8 @@ async def _generate(name: str, mode: str, user_input: str | None):
         # 上一轮被打断时丢弃未提交的内存改动）
         world.sync(name, len(history))
         input_items = core.build_input(state, history, draft=draft)
-        config = core.load_config()
+        # 合并选中端点与会话生成参数覆盖，得到 llm 使用的扁平 config
+        config = core.effective_config(state, core.load_config())
         # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
         config["chat_id"] = state.get("chat_id", "")
         # PTC 实验模式由预设 frontmatter 的 ptc: true 开启

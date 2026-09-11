@@ -165,16 +165,6 @@ def _to_chat_completions_format(tool: dict) -> dict:
     return {"type": "function", "function": tool}
 
 
-# Responses API 风格的工具定义
-RESPOND_TOOL = _to_responses_format(_RESPOND_TOOL_DEF)
-WORLD_RUN_TOOL = _to_responses_format(_WORLD_RUN_TOOL_DEF)
-READ_FILE_TOOL = _to_responses_format(_READ_FILE_TOOL_DEF)
-TOOLS = [_to_responses_format(t) for t in _BASE_TOOLS]
-
-# Chat Completions API 风格的工具定义
-CHAT_COMPLETIONS_TOOLS = [_to_chat_completions_format(t) for t in _BASE_TOOLS]
-
-
 def get_tools(api_type: str, ptc: bool = False) -> list:
     """根据 api_type 返回对应格式的工具定义。ptc 模式下 schema 只含 world_run。"""
     if ptc:
@@ -291,6 +281,76 @@ def load_config() -> dict:
     return yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 
 
+# ---------- 多端点与生成参数 ----------
+
+# 端点的合法键（来自 config.yaml 的 endpoints 列表）
+_ENDPOINT_KEYS = ("display_name", "api_base", "model", "api_key", "api_type", "x_opencode_session")
+
+
+def endpoints(config: dict) -> list:
+    """返回校验后的端点列表。端点为空、缺 api_key/model/api_base 时直接报错（启动校验也走这里）。"""
+    out = []
+    for i, raw in enumerate(config.get("endpoints") or []):
+        if not isinstance(raw, dict):
+            raise ValueError(f"config.yaml 的 endpoints[{i}] 不是映射: {raw!r}")
+        ep = {k: raw[k] for k in _ENDPOINT_KEYS if k in raw}
+        for k in ("api_base", "model", "api_key"):
+            if not ep.get(k):
+                raise ValueError(f"config.yaml 的 endpoints[{i}] 缺少必填项 {k}")
+        ep.setdefault("display_name", ep["model"])
+        out.append(ep)
+    if not out:
+        raise ValueError("config.yaml 没有配置任何端点（endpoints 为空）")
+    return out
+
+
+def resolve_endpoint_index(state_value, config: dict) -> int:
+    """解析会话实际使用的端点下标：会话值合法直接用，非法/缺失回退 0。"""
+    eps = endpoints(config)
+    if isinstance(state_value, int) and not isinstance(state_value, bool) and 0 <= state_value < len(eps):
+        return state_value
+    return 0
+
+
+def _resolve_num(state_value, config: dict, key: str, integer: bool):
+    """数值型按会话覆盖：会话值合法直接用，否则回退全局；全局未设置返回 None（请求不带），非法直接报错。"""
+    if integer:
+        ok = lambda x: isinstance(x, int) and not isinstance(x, bool) and x >= 1
+    else:
+        ok = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+    v = state_value if ok(state_value) else config.get(key)
+    if v is None:
+        return None
+    if not ok(v):
+        raise ValueError(f"config.yaml 的 {key} 非法: {v!r}")
+    return v
+
+
+def resolve_temperature(state_value, config: dict):
+    return _resolve_num(state_value, config, "temperature", integer=False)
+
+
+def resolve_max_tokens(state_value, config: dict):
+    return _resolve_num(state_value, config, "max_tokens", integer=True)
+
+
+def effective_config(state: dict, config: dict) -> dict:
+    """合并出 llm 使用的扁平 config：全局键 + 选中端点键 + 会话生成参数覆盖。"""
+    merged = {k: v for k, v in config.items() if k != "endpoints" and k not in _ENDPOINT_KEYS}
+    merged.update(endpoints(config)[resolve_endpoint_index(state.get("endpoint"), config)])
+    merged["temperature"] = resolve_temperature(state.get("temperature"), config)
+    merged["max_tokens"] = resolve_max_tokens(state.get("max_tokens"), config)
+    return merged
+
+
+def _latest_session_state() -> dict | None:
+    """created_at 最大的会话 state（新会话继承其模型与生成参数配置）；无会话返回 None。"""
+    states = list_sessions()
+    if not states:
+        return None
+    return max(states, key=lambda s: s.get("created_at") or 0)
+
+
 # 思考强度五档；none = 禁用思考（请求带 "thinking": {"type": "disabled"}，见 llm.build_request）
 EFFORT_LEVELS = ("none", "low", "medium", "high", "max")
 
@@ -345,6 +405,9 @@ def create_session(name: str, preset: str, card: str, beginning_index):
         text = card_obj["beginnings"][beginning_index]
     d.mkdir(parents=True)
     (d / "history.jsonl").touch()
+    config = load_config()
+    # 模型端点与生成参数继承上一个会话（最近创建者）；没有会话时回退端点 0 + config 默认值
+    prev = _latest_session_state() or {}
     state = {
         "id": d.name,
         "name": name,
@@ -356,8 +419,11 @@ def create_session(name: str, preset: str, card: str, beginning_index):
         "created_at": time.time(),
         # 每会话固定的 UUID v4,作为 X-Opencode-Session 请求头发送(opencode-go 风控)
         "chat_id": str(uuid.uuid4()),
-        # 创建时快照 config 默认思考强度,之后前端可按会话覆盖(config 非法时此处直接报错)
-        "reasoning_effort": resolve_reasoning_effort(None, load_config()),
+        "endpoint": resolve_endpoint_index(prev.get("endpoint"), config),
+        "temperature": resolve_temperature(prev.get("temperature"), config),
+        "max_tokens": resolve_max_tokens(prev.get("max_tokens"), config),
+        # 创建时快照思考强度,之后前端可按会话覆盖(config 非法时此处直接报错)
+        "reasoning_effort": resolve_reasoning_effort(prev.get("reasoning_effort"), config),
     }
     save_state(state)
     return state
@@ -392,14 +458,7 @@ def fork_session(name: str, index: int) -> dict:
 
 
 def load_state(name: str) -> dict:
-    state = json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
-    # 旧版 state.json 没有 id 字段，按目录名规则补上
-    state.setdefault("id", safe_dir_name(state["name"]))
-    # 旧会话补发 chat_id 并落盘（之后保持不变）
-    if "chat_id" not in state:
-        state["chat_id"] = str(uuid.uuid4())
-        save_state(state)
-    return state
+    return json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
 
 
 def save_state(state: dict) -> None:
@@ -430,6 +489,37 @@ def _message_item(role: str, content: str) -> dict:
     return {"type": "message", "role": role, "content": [{"type": part_type, "text": content}]}
 
 
+def _split_tool_calls(entry: dict, ptc: bool):
+    """把一轮 assistant 的工具调用拆成（辅助调用列表, 收尾调用四元组）。
+
+    收尾调用 (name, arguments, result, reasoning) 回放在正文后：PTC 用带 terminal
+    标记的终结 world_run，没有（打断/出错轮）则合成 respond 绑定调用兜底；
+    非 PTC 合成 respond 工具调用。无论有无选项都固定回放，保持示范轮一致
+    （DeepSeek 会模仿旧轮次的行为，固定模式反而强化选项的稳定生成）。
+    """
+    tool_calls = entry.get("tool_calls", [])
+    terminal_tc = next((tc for tc in tool_calls if tc.get("terminal")), None) if ptc else None
+    normal = [tc for tc in tool_calls if tc is not terminal_tc]
+    if terminal_tc is not None:
+        end = (terminal_tc["name"], terminal_tc["arguments"], terminal_tc["result"],
+               terminal_tc.get("reasoning") or " ")
+    elif ptc:
+        end = ("world_run",
+               json.dumps({"program": "respond(options="
+                           + json.dumps(entry.get("options") or [], ensure_ascii=False) + ")"},
+                          ensure_ascii=False),
+               "选项已提交，本轮回复结束。", " ")
+    else:
+        end = ("respond",
+               json.dumps({"options": entry.get("options") or []}, ensure_ascii=False),
+               "ok", " ")
+    if end[3] == " ":
+        # 终结调用自身没存思维链：用整轮或最后一个辅助调用的思维链兜底
+        end = end[:3] + (entry.get("reasoning") or next(
+            (tc["reasoning"] for tc in reversed(tool_calls) if tc.get("reasoning")), " "),)
+    return normal, end
+
+
 def _build_input_responses(state, history, draft, preset, env):
     """拼装 Responses API 的 input_items。"""
     items = [_message_item(sec["role"], render_template(sec["content"], env)) for sec in preset["sections"]]
@@ -437,17 +527,11 @@ def _build_input_responses(state, history, draft, preset, env):
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
-            tool_calls = entry.get("tool_calls", [])
-            # PTC：含 respond 的终结 world_run 回放在正文后，其余辅助调用在正文前
-            terminal_tc = next((tc for tc in tool_calls if tc.get("terminal")), None) if ptc else None
-            for tc in tool_calls:
-                if tc is terminal_tc:
-                    continue
-                # 新格式逐项带 reasoning;旧格式没有,用整轮合并的 entry["reasoning"] 兜底
-                reasoning = tc.get("reasoning") or entry.get("reasoning") or " "
+            normal_tcs, (end_name, end_args, end_result, end_reasoning) = _split_tool_calls(entry, ptc)
+            for tc in normal_tcs:
                 items.append({
                     "type": "reasoning",
-                    "content": [{"type": "reasoning_text", "text": reasoning}],
+                    "content": [{"type": "reasoning_text", "text": tc.get("reasoning") or " "}],
                 })
                 call_n += 1
                 items.append({
@@ -457,33 +541,9 @@ def _build_input_responses(state, history, draft, preset, env):
                     "arguments": tc["arguments"],
                 })
                 items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": tc["result"]})
-            # 正文:普通 assistant message(新旧格式都存在 entry["content"] 上)
+            # 正文:普通 assistant message
             if entry.get("content"):
                 items.append(_message_item("assistant", entry["content"]))
-            # 无论有无选项都回放收尾调用,让模型每轮看到一致的收尾模式
-            # (DeepSeek 会模仿旧轮次的行为,固定模式反而强化选项的稳定生成)
-            if ptc:
-                if terminal_tc is not None:
-                    end_name, end_args = terminal_tc["name"], terminal_tc["arguments"]
-                    end_result = terminal_tc["result"]
-                    end_reasoning = terminal_tc.get("reasoning") or entry.get("reasoning") or " "
-                else:
-                    # 没有终结调用(打断/出错轮):合成兜底,保持示范形态一致
-                    end_name = "world_run"
-                    end_args = json.dumps(
-                        {"program": "respond(options="
-                         + json.dumps(entry.get("options") or [], ensure_ascii=False) + ")"},
-                        ensure_ascii=False,
-                    )
-                    end_result = "选项已提交，本轮回复结束。"
-                    end_reasoning = entry.get("reasoning") or next(
-                        (tc["reasoning"] for tc in reversed(tool_calls) if tc.get("reasoning")), " ")
-            else:
-                end_name = "respond"
-                end_args = json.dumps({"options": entry.get("options") or []}, ensure_ascii=False)
-                end_result = "ok"
-                end_reasoning = entry.get("reasoning") or next(
-                    (tc["reasoning"] for tc in reversed(tool_calls) if tc.get("reasoning")), " ")
             items.append({
                 "type": "reasoning",
                 "content": [{"type": "reasoning_text", "text": end_reasoning}],
@@ -518,18 +578,14 @@ def _build_input_chat_completions(state, history, draft, preset, env):
     for entry in history:
         if entry["role"] == "assistant":
             entry_reasoning = entry.get("reasoning") or " "
-            tool_calls = entry.get("tool_calls", [])
-            terminal_tc = next((tc for tc in tool_calls if tc.get("terminal")), None) if ptc else None
+            normal_tcs, (end_name, end_args, end_result, end_reasoning) = _split_tool_calls(entry, ptc)
             # 辅助工具调用：每个 tool_call 独立成 assistant(tool_calls) + tool 消息
-            for tc in tool_calls:
-                if tc is terminal_tc:
-                    continue
+            for tc in normal_tcs:
                 call_n += 1
-                reasoning = tc.get("reasoning") or entry_reasoning
                 messages.append({
                     "role": "assistant",
                     "content": "",
-                    "reasoning_content": reasoning,
+                    "reasoning_content": tc.get("reasoning") or entry_reasoning,
                     "tool_calls": [{
                         "id": f"call_{call_n}",
                         "type": "function",
@@ -548,25 +604,7 @@ def _build_input_chat_completions(state, history, draft, preset, env):
                     "content": entry["content"],
                     "reasoning_content": entry_reasoning,
                 })
-            # 收尾调用：PTC 回放含 respond 的终结 world_run(或合成兜底)，否则合成 respond
-            if ptc and terminal_tc is not None:
-                end_name, end_args = terminal_tc["name"], terminal_tc["arguments"]
-                end_result = terminal_tc["result"]
-                end_reasoning = terminal_tc.get("reasoning") or entry_reasoning
-            elif ptc:
-                end_name = "world_run"
-                end_args = json.dumps(
-                    {"program": "respond(options="
-                     + json.dumps(entry.get("options") or [], ensure_ascii=False) + ")"},
-                    ensure_ascii=False,
-                )
-                end_result = "选项已提交，本轮回复结束。"
-                end_reasoning = entry_reasoning
-            else:
-                end_name = "respond"
-                end_args = json.dumps({"options": entry.get("options") or []}, ensure_ascii=False)
-                end_result = "ok"
-                end_reasoning = entry_reasoning
+            # 收尾调用（见 _split_tool_calls）
             call_n += 1
             messages.append({
                 "role": "assistant",
@@ -595,8 +633,8 @@ def _build_input_chat_completions(state, history, draft, preset, env):
 
 
 def build_input(state: dict, history: list, draft=None) -> list:
-    """拼装发送给模型的完整输入。根据 config['api_type'] 返回 Responses input_items 或 Chat Completions messages。"""
-    config = load_config()
+    """拼装发送给模型的完整输入。根据会话生效的 api_type 返回 Responses input_items 或 Chat Completions messages。"""
+    config = effective_config(state, load_config())
     api_type = config.get("api_type", "responses")
     preset = load_presets()[state["preset"]]
     card = load_cards()[state["card"]]

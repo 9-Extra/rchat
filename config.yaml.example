@@ -1,9 +1,19 @@
-api_base: "https://api.deepseek.com" 
-model: "deepseek-v4-flash"
-api_key: "YOUR_API_KEY_HERE"
-api_type: "responses"  # "responses" 或 "chat_completions"
-temperature: 0.7
-max_tokens: 100000
-reasoning_effort: "medium"  # 思考强度默认值：none/low/medium/high/max（none=禁用思考），前端可按会话覆盖；不设置时按 low 处理
-# user_agent: "rchat/0.1"        # 覆盖 SDK 默认 UA（opencode-go 等端点风控拒绝语言默认 UA）
-# x_opencode_session: true       # 发送每会话固定的 X-Opencode-Session 请求头（opencode-go 风控要求）
+# 模型端点列表：可定义多个，前端按会话切换；程序启动时使用第一个作为默认。
+# 每个端点必填 api_base / model / api_key，其余有缺省。
+endpoints:
+  - display_name: "DeepSeek 官方"     # 前端显示名称，缺省用 model
+    api_base: "https://api.deepseek.com"
+    model: "deepseek-v4-flash"
+    api_key: "YOUR_API_KEY_HERE"
+    api_type: "responses"             # "responses" 或 "chat_completions"，缺省 responses
+    x_opencode_session: true          # 发送每会话固定的 X-Opencode-Session 请求头（opencode-go 风控要求），缺省 false
+  # - display_name: "另一个端点"
+  #   api_base: "..."
+  #   model: "..."
+  #   api_key: "..."
+
+# 以下为全局配置；temperature / max_tokens / reasoning_effort 前端可按会话覆盖
+temperature: 0.7         # 缺省不设置时请求不带该参数
+max_tokens: 100000       # 缺省不设置时请求不带该参数
+reasoning_effort: "medium"  # 思考强度默认值：none/low/medium/high/max（none=禁用思考）；不设置时按 low 处理
+# user_agent: "rchat/0.1"  # 覆盖 SDK 默认 UA（opencode-go 等端点风控拒绝语言默认 UA）

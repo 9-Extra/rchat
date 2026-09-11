@@ -18,6 +18,15 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+    # 启动即校验模型端点配置：没有可用端点时直接报错退出，而不是等首轮生成才失败
+    from app import core
+
+    try:
+        eps = core.endpoints(core.load_config())
+    except ValueError as e:
+        raise SystemExit(f"配置错误: {e}")
+    logging.info("已加载 %d 个模型端点，默认: %s", len(eps), eps[0]["display_name"])
+
     # 手动创建 IPV6_V6ONLY=0 的监听 socket，实现单 socket 双栈（IPv4 + IPv6）
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)

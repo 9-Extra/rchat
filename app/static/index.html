@@ -25,6 +25,7 @@
   button:hover { background: #2e323c; border-color: #3d414c; }
   button:disabled { opacity: .35; cursor: default; }
   select, input[type=text] { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+  input[type=number] { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 4px; width: 72px; }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-thumb { background: #33363f; border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: #444854; }
@@ -189,6 +190,7 @@
     <div id="toolbar" style="display:none">
       <span class="sessname" id="sessName"></span>
       <label>预设 <select id="presetSelect"></select></label>
+      <label>模型 <select id="endpointSelect"></select></label>
       <label>思考 <select id="effortSelect">
         <option value="none">关闭</option>
         <option value="low">低</option>
@@ -196,6 +198,8 @@
         <option value="high">高</option>
         <option value="max">最高</option>
       </select></label>
+      <label>温度 <input type="number" id="tempInput" min="0" max="2" step="0.1"></label>
+      <label>上限 <input type="number" id="maxTokensInput" min="1" step="1000"></label>
       <button id="previewBtn">预览上下文</button>
     </div>
     <div id="chat"><div id="emptyHint">请选择或新建一个会话</div></div>
@@ -321,8 +325,11 @@ function render() {
   $('composer').style.display = 'block';
   $('sessName').textContent = cur.name + '（角色卡：' + (cur.card_name || cur.card) + '）';
   renderPresetSelect();
-  // 后端在 GET 会话时已解析出实际生效的思考强度
+  renderEndpointSelect();
+  // 后端在 GET 会话时已解析出实际生效值
   $('effortSelect').value = cur.reasoning_effort || 'low';
+  $('tempInput').value = cur.temperature ?? '';
+  $('maxTokensInput').value = cur.max_tokens ?? '';
   const chat = $('chat');
   chat.innerHTML = '';
   // 开局块：永远是对话界面第一个块
@@ -338,6 +345,13 @@ function renderPresetSelect() {
   api('/api/presets').then(list => {
     $('presetSelect').innerHTML = list.map(p =>
       `<option value="${esc(p.id)}" ${p.id === cur.preset ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+  });
+}
+
+function renderEndpointSelect() {
+  api('/api/endpoints').then(list => {
+    $('endpointSelect').innerHTML = list.map(e =>
+      `<option value="${e.index}" ${e.index === cur.endpoint ? 'selected' : ''}>${esc(e.display_name)}</option>`).join('');
   });
 }
 
@@ -613,6 +627,22 @@ $('effortSelect').onchange = async e => {
   await api(`/api/sessions/${enc()}/reasoning_effort`, post({ effort: e.target.value }));
   cur.reasoning_effort = e.target.value;
 };
+$('endpointSelect').onchange = async e => {
+  await api(`/api/sessions/${enc()}/endpoint`, post({ index: +e.target.value }));
+  cur.endpoint = +e.target.value;
+};
+// 温度/上限：失焦或回车提交；清空则回退全局默认
+async function pushParams() {
+  const body = {
+    temperature: $('tempInput').value === '' ? null : +$('tempInput').value,
+    max_tokens: $('maxTokensInput').value === '' ? null : Math.round(+$('maxTokensInput').value),
+  };
+  const s = await api(`/api/sessions/${enc()}/params`, post(body));
+  cur.temperature = s.temperature;
+  cur.max_tokens = s.max_tokens;
+}
+$('tempInput').onchange = pushParams;
+$('maxTokensInput').onchange = pushParams;
 
 // ---------- 新建会话 ----------
 $('newSessionBtn').onclick = async () => {

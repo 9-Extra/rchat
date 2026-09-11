@@ -9,14 +9,14 @@ uv run -m main
 AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户冲突
 
 # 配置
-`config.yaml` 控制模型连接：
-- `api_base` / `api_key` / `model`：常规模型连接参数。
-- `api_type`：`"responses"`（默认，OpenAI Responses API）或 `"chat_completions"`（OpenAI 风格 Chat Completions API）。
-- `temperature` / `max_tokens` / `reasoning_effort`：生成参数。`reasoning_effort` 是思考强度默认值，五档 `none`/`low`/`medium`/`high`/`max`，不设置时按 `low`，非法值直接报错；`none` 表示禁用思考（请求带 `"thinking": {"type": "disabled"}`）。前端可按会话覆盖（`POST /api/sessions/{name}/reasoning_effort`），会话值存 state.json 的 `reasoning_effort` 字段：创建会话时快照 config 默认值，会话值非法/缺失时回退 config 默认，fork 自动继承。
-- `user_agent`：覆盖 SDK 默认的 `OpenAI/Python ...` UA。
-- `x_opencode_session`：`true` 时每个会话的请求带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控要求，用于 GPU KV 缓存亲和调度）。UUID 存于会话 state.json 的 `chat_id` 字段，创建会话时生成，旧会话首次加载时补发，fork 出的新会话换新值。
+`config.yaml` 控制模型连接与生成参数：
 
-切换 `api_type` 时，上下文拼装、工具 schema、流式调用实现会自动切换；落盘的 `history.jsonl` 格式不变。
+- `endpoints`：模型端点列表，可定义多个，前端按会话切换；程序启动时校验，为空直接报错退出。每个端点必填 `api_base` / `model` / `api_key`，可选 `display_name`（前端显示名，缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`（缺省 false）。端点身份 = 列表下标，重排列表会改变旧会话的指向。
+- 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `user_agent`（覆盖 SDK 默认 UA）。
+- 按会话覆盖：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` 都存 state.json，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`）。创建会话时继承上一个会话（created_at 最大者）的这四项；无会话时回退端点 0 + config 默认值。会话值非法/缺失时回退 config 默认；config 值非法直接报错。fork 自动继承。`reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置时按 `low`；`none` 表示禁用思考（请求带 `"thinking": {"type": "disabled"}`）。
+- `x_opencode_session`：`true` 时每个会话的请求带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控要求，用于 GPU KV 缓存亲和调度）。UUID 存于会话 state.json 的 `chat_id` 字段，创建会话时生成，fork 出的新会话换新值。
+
+server 在生成/预览时用 `core.effective_config(state, config)` 把选中端点与会话覆盖合并成扁平 config 传给 llm（llm 本身不感知多端点）。切换 `api_type` 时，上下文拼装、工具 schema、流式调用实现会自动切换；落盘的 `history.jsonl` 格式不变。
 
 # 预设和角色卡
 这两个概念来自SillyTavern，但本项目将它们大幅度简化
@@ -47,10 +47,10 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 - `responses` 模式 build_input 回放：assistant 块 -> 工具循环的 function_call/output 对 + 正文 message + respond 调用（options JSON）+ "ok" 输出；user 块 -> 普通 user message，本次输入也拼成 user message，**请求以 user message 结尾**（不再是未闭合的工具循环）。
 - `chat_completions` 模式 build_input 回放：assistant 块拆分为标准 messages：每个 tool_call 对应一条 assistant(tool_calls) + 一条 tool 消息；正文对应一条 assistant(content)；respond 对应一条 assistant(tool_calls) + 一条 tool("ok") 消息；user 块和本次 draft 对应 user 消息。
 
-respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；上下文中的完整示范轮（正文 + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 developer 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。
+respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；上下文中的完整示范轮（正文 + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 user 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。契约校验与修复文案在两种模式间共用（`_contract_problems`/`_repair_text`/`_missing_respond_hint`）。
 
-## PTC 实验模式（ptc-experiment 分支）
-预设 frontmatter 加 `ptc: true`（如 preset/GM-ptc.md）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），respond(options) 与 read_file(...) 降级为 world_run 持久命名空间内的 Python 绑定函数（app/world.py 的 _respond_binding/_read_file_binding，签名写在 {{respond_tool}} 渲染出的 AIRP_PROMPT_PTC 里）。叙事仍是普通文本；收尾 = 输出正文后调一次 world_run，程序末尾 respond(options=[...])——respond 抛 _TurnEnd(BaseException) 终止程序，world.run 返回 (结果文本, respond_info)，llm 检测到 respond_info 即校验契约（正文非空、选项非空提示一次）并结束回合，修复路径与 respond 工具版同构。终结调用在 history 的 tool_calls 里带 terminal: true 标记，回放时放在正文后（无终结调用的轮次合成 world_run(respond(options=...)) 兜底）。保留名 state/print/respond/read_file 不允许模型的顶层 def/常量覆盖。旧预设路径零改动。
+## PTC 模式
+预设 frontmatter 加 `ptc: true`（如 preset/GM-ptc.md）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），respond(options) 与 read_file(...) 降级为 world_run 持久命名空间内的 Python 绑定函数（app/world.py 的 _respond_binding/_read_file_binding，签名写在 {{respond_tool}} 渲染出的 AIRP_PROMPT_PTC 里）。叙事仍是普通文本；收尾 = 输出正文后调一次 world_run，程序末尾 respond(options=[...])——respond 抛 _TurnEnd(BaseException) 终止程序，world.run 返回 (结果文本, respond_info)，llm 检测到 respond_info 即校验契约（正文非空、选项非空提示一次）并结束回合，修复路径与 respond 工具版同构。终结调用在 history 的 tool_calls 里带 terminal: true 标记，回放时放在正文后（无终结调用的轮次合成 world_run(respond(options=...)) 兜底；回放拆分逻辑共用 `_split_tool_calls`）。保留名 state/print/respond/read_file 不允许模型的顶层 def/常量覆盖。
 
 # 会话 fork
 用户块上的「分支」按钮：POST /api/sessions/{name}/fork {index} 在用户块断点处复制出一个新会话（core.fork_session：state 复制 + history[:index]，新名为 原名-fork-时间戳，原会话不动），world.fork 按同一 index 复制世界状态。新会话末尾是 assistant 块（或空历史），可直接继续输入。
