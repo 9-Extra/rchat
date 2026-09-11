@@ -347,6 +347,14 @@ def run(name: str, program: str, dry: bool = False):
         pass  # respond() 主动终止程序，视为正常完成
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
+        if isinstance(e, SyntaxError) and any(
+            k in str(e)
+            for k in ("unterminated string", "line continuation character", "part of the string")
+        ):
+            error += (
+                "（疑似引号转义层级错误：含引号的文本请改用单引号或三引号的 Python 字符串包裹，"
+                "让双引号原样出现在字符串里，避免在双引号字符串内再转义双引号。）"
+            )
     if error is None:
         # 用户代码成功:收集顶层 def 与全大写常量进 lib(保留名除外,防止遮蔽内置绑定)
         defs = _extract_defs(program)
