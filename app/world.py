@@ -1,6 +1,8 @@
 """world_run 的持久 Python 执行环境（移植自 AIRP 预设的 node:vm 版）。
 
-每个会话一个 exec 命名空间：预置全局对象 state（dict）与 print。
+每个会话一个 exec 命名空间：预置全局对象 state（dict）与 print，以及绑定函数
+respond(options)（提交选项并结束本轮，PTC 模式的收尾契约）和 read_file(...)（读文件，
+内容进日志）。绑定是命名空间内的普通函数，不是工具。
 持久化到 sessions/<name>/world/：
 - state.json   当前 state（JSON）
 - lib.py       模型定义的顶层函数与全大写常量源码（重放恢复）
@@ -20,6 +22,7 @@ import copy
 import json
 import logging
 import re
+from pathlib import Path
 
 from app.core import SESSIONS_DIR, load_history
 
@@ -28,6 +31,15 @@ logger = logging.getLogger("airp.world")
 DIFF_ENTRY_CAP = 60
 LOG_LINE_CAP = 2000
 LOG_COUNT_CAP = 100
+
+# respond() 被调用时抛出以终止程序。继承 BaseException，模型程序里的
+# except Exception 吞不掉它（try/finally 的 finally 仍照常执行）。
+class _TurnEnd(BaseException):
+    pass
+
+
+# 命名空间内置名：不允许模型的顶层 def/常量覆盖（否则 lib 重放会遮蔽内置绑定）
+RESERVED_NAMES = {"state", "print", "respond", "read_file"}
 
 # session 目录名 -> runtime: {"ns": dict, "lib": {name: source},
 #   "committed": {"state": ..., "lib": ...}, "turn_len": int, "logs": list|None}
@@ -116,7 +128,7 @@ def _extract_defs(program: str) -> dict:
     return out
 
 
-def _push_log(rt, text):
+def _push_log(rt, text, line_cap=LOG_LINE_CAP):
     logs = rt["logs"]
     if logs is None:
         return
@@ -124,20 +136,54 @@ def _push_log(rt, text):
         if len(logs) == LOG_COUNT_CAP:
             logs.append("（日志过多，后续输出已省略）")
         return
-    logs.append(text if len(text) <= LOG_LINE_CAP else text[:LOG_LINE_CAP] + "…（截断）")
+    if line_cap is not None and len(text) > line_cap:
+        text = text[:line_cap] + "…（截断）"
+    logs.append(text)
 
 
 def _print_part(p):
     return p if isinstance(p, str) else repr(p)
 
 
-def _fresh_ns(rt):
-    """重建命名空间：重放 lib 函数与常量源码，恢复 committed state。"""
+def _read_file_binding(rt, file_path, offset=1, limit=2000):
+    """命名空间内的 read_file 绑定：读取结果进日志（内容本身已由 tools 限长，不再截断）。"""
+    from app import core, tools  # 惰性 import：tools 依赖本模块，避免循环
+    try:
+        state = core.load_state(rt["name"])
+        card = core.load_cards().get(state.get("card", ""))
+        base_dir = str(Path(card["path"]).parent) if card and card.get("path") else None
+        result = tools.read_file(str(file_path), offset, limit, base_dir=base_dir)
+    except Exception as e:
+        result = f"错误：read_file 调用失败：{type(e).__name__}: {e}"
+    _push_log(rt, result, line_cap=None)
+    return result
+
+
+def _respond_binding(rt, options=None):
+    """命名空间内的 respond 绑定：记录选项并抛 _TurnEnd 终止程序，结束本轮回复。"""
+    if not rt.get("dry"):
+        if isinstance(options, list):
+            rt["respond"] = {"options": [str(o) for o in options]}
+        else:
+            rt["respond"] = {
+                "error": f"respond 的 options 必须是数组，收到 {type(options).__name__}"
+            }
+    raise _TurnEnd()
+
+
+def _fresh_ns(rt, name):
+    """重建命名空间：预置绑定，重放 lib 函数与常量源码，恢复 committed state。"""
     ns = {
         "state": copy.deepcopy(rt["committed"]["state"]),
         "print": lambda *parts: _push_log(rt, " ".join(_print_part(p) for p in parts)),
+        "respond": lambda options=None: _respond_binding(rt, options),
+        "read_file": lambda file_path, offset=1, limit=2000: _read_file_binding(
+            rt, file_path, offset, limit
+        ),
     }
     for fname, src in rt["committed"]["lib"].items():
+        if fname in RESERVED_NAMES:
+            continue  # 保留名不进 lib（收集时已拦截，这里防旧会话遗留）
         try:
             exec(src, ns)
         except Exception:
@@ -169,9 +215,9 @@ def _load_committed(name: str):
 def runtime_for(name: str):
     rt = _runtimes.get(name)
     if rt is None:
-        rt = {"committed": _load_committed(name), "turn_len": None, "logs": None}
+        rt = {"name": name, "committed": _load_committed(name), "turn_len": None, "logs": None}
         rt["turn_len"] = _current_len(name)
-        rt["ns"] = _fresh_ns(rt)
+        rt["ns"] = _fresh_ns(rt, name)
         _runtimes[name] = rt
     return rt
 
@@ -210,7 +256,7 @@ def sync(name: str, turn_len: int):
     """
     rt = _runtimes.get(name)
     if rt is not None and turn_len == rt["turn_len"]:
-        rt["ns"] = _fresh_ns(rt)
+        rt["ns"] = _fresh_ns(rt, name)
         return
     snap = _snapshots(name).get(str(turn_len))
     if snap is not None:
@@ -221,19 +267,19 @@ def sync(name: str, turn_len: int):
     else:
         return  # 运行时与快照都不存在,首次 world_run 时按磁盘现状加载
     if rt is None:
-        rt = {"committed": committed, "turn_len": turn_len, "logs": None}
+        rt = {"name": name, "committed": committed, "turn_len": turn_len, "logs": None}
         _runtimes[name] = rt
     else:
         rt["committed"] = committed
         rt["turn_len"] = turn_len
-    rt["ns"] = _fresh_ns(rt)
+    rt["ns"] = _fresh_ns(rt, name)
 
 
 def abort_turn(name: str):
     """本轮生成被打断/失败：丢弃内存中未提交的改动,回到 committed。"""
     rt = _runtimes.get(name)
     if rt is not None:
-        rt["ns"] = _fresh_ns(rt)
+        rt["ns"] = _fresh_ns(rt, name)
 
 
 def commit_turn(name: str, turn_len: int):
@@ -276,10 +322,16 @@ def drop(name: str):
     _runtimes.pop(name, None)
 
 
-def run(name: str, program: str, dry: bool = False) -> str:
-    """在指定会话的持久环境中执行 program,返回模型可见的结果文本。"""
+def run(name: str, program: str, dry: bool = False):
+    """在指定会话的持久环境中执行 program。
+
+    返回 (模型可见的结果文本, respond_info)：respond_info 为 None（程序未调用
+    respond）或 {"options": [...]} / {"error": ...}（PTC 模式的回合收尾信号）。
+    """
     rt = runtime_for(name)
     ns = rt["ns"]
+    rt["respond"] = None
+    rt["dry"] = dry
     # 快照:浅拷贝命名空间(函数等)+ state 深拷贝 + lib 副本,供回滚
     ns_backup = dict(ns)
     state_backup = _json_copy(ns["state"]) if _json_safe(ns["state"]) else None
@@ -288,21 +340,27 @@ def run(name: str, program: str, dry: bool = False) -> str:
     rt["logs"] = logs
     error = None
     hook_errors = []
+    skipped_defs = []
     try:
         exec(program, ns)
+    except _TurnEnd:
+        pass  # respond() 主动终止程序，视为正常完成
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
     if error is None:
-        # 用户代码成功:收集顶层 def 与全大写常量进 lib
+        # 用户代码成功:收集顶层 def 与全大写常量进 lib(保留名除外,防止遮蔽内置绑定)
         defs = _extract_defs(program)
         if defs:
-            rt["lib"].update(defs)
+            skipped_defs = [n for n in defs if n in RESERVED_NAMES]
+            rt["lib"].update({n: s for n, s in defs.items() if n not in RESERVED_NAMES})
     if error is None and callable(ns.get("normalize")):
         # 约定式整理:normalize 出错只回滚它自己的改动
         hook_ns = dict(ns)
         hook_state = _json_copy(ns["state"]) if _json_safe(ns["state"]) else None
         try:
             ns["normalize"]()
+        except _TurnEnd:
+            pass  # normalize 里调用 respond 同样只终止执行
         except Exception as e:
             hook_errors.append(f"{type(e).__name__}: {e}（normalize 的改动已回滚）")
             kept_state = ns["state"]
@@ -310,6 +368,7 @@ def run(name: str, program: str, dry: bool = False) -> str:
             ns.update(hook_ns)
             ns["state"] = hook_state if hook_state is not None else kept_state
     rt["logs"] = None
+    rt["dry"] = False
     if error is not None or dry:
         # 出错回滚 / 试运行不提交:还原命名空间、state、lib
         ns.clear()
@@ -322,6 +381,7 @@ def run(name: str, program: str, dry: bool = False) -> str:
     if error is None and not dry:
         after = _json_copy(ns["state"]) if _json_safe(ns["state"]) else None
     diff = _diff(state_backup, after) if state_backup is not None and after is not None else []
+    respond_info = rt["respond"] if error is None else None
     parts = []
     if error:
         parts.append(f"执行出错：{error}")
@@ -344,10 +404,19 @@ def run(name: str, program: str, dry: bool = False) -> str:
         parts.append("state 无变化。")
     if hook_errors:
         parts.append("normalize 错误：\n" + "\n".join(f"  - {e}" for e in hook_errors))
+    if skipped_defs:
+        parts.append(
+            "保留名不会被持久化（它们是内置绑定）：" + "、".join(skipped_defs)
+        )
+    if respond_info is not None:
+        if "error" in respond_info:
+            parts.append(f"respond 调用无效：{respond_info['error']}")
+        else:
+            parts.append("选项已提交，本轮回复结束。")
     if error and state_backup is not None:
         parts.append("已回滚：执行出错，state 与函数定义均已恢复到执行前，未留下半更新。")
     if state_backup is None:
         parts.append("（注意：执行前 state 含不可 JSON 序列化的内容，变化无法追踪，出错也无法回滚。）")
     if dry:
         parts.append("（试运行：以上变化与函数定义均未生效。）")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), respond_info

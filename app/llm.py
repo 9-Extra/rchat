@@ -1,8 +1,11 @@
 """大模型 API 流式调用封装，支持 Responses API 与 Chat Completions API。
 
-正文是模型的普通文本输出，选项通过 respond 工具提交：
+正文是模型的普通文本输出，选项通过 respond 提交：
 一轮回复 = 可选的多次 world_run/read_file（执行结果追加进输入继续请求），
-最后一轮输出正文并调用 respond 提交选项收尾。
+最后一轮输出正文并提交选项收尾。
+普通模式：respond 是独立工具；PTC 模式（预设 frontmatter ptc: true）：schema 只含
+world_run，respond/read_file 是其持久命名空间内的绑定函数，收尾 = 正文 + 一次程序
+末尾调用 respond(options=[...]) 的 world_run（终结调用，检测到即结束回合）。
 """
 import json
 
@@ -38,11 +41,12 @@ def _make_client(config: dict) -> AsyncOpenAI:
 def build_request(input_items: list, config: dict) -> dict:
     """构造实际发送给模型的请求参数（/api/preview 也用它展示上下文）。"""
     api_type = config.get("api_type", "responses")
+    ptc = bool(config.get("ptc"))
     if api_type == "chat_completions":
         payload = {
             "model": config["model"],
             "messages": input_items,
-            "tools": get_tools("chat_completions"),
+            "tools": get_tools("chat_completions", ptc),
             "tool_choice": "auto",
             "stream": True,
         }
@@ -61,7 +65,7 @@ def build_request(input_items: list, config: dict) -> dict:
     payload = {
         "model": config["model"],
         "input": input_items,
-        "tools": get_tools("responses"),
+        "tools": get_tools("responses", ptc),
         "tool_choice": "auto",
     }
     if config.get("temperature") is not None:
@@ -103,6 +107,7 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
     # (已实测合法,空字符串不合法)。
     last_reasoning = ""
     PLACEHOLDER = " "
+    api_type_ptc = bool(config.get("ptc"))
     async with _make_client(config) as client:
         content = ""  # 整个回合累积的正文(跨轮次,全部对用户可见)
         respond_repairs = 0  # respond 契约校验失败的自动修复次数(把调用作为工具错误回传)
@@ -149,7 +154,10 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
                     error = getattr(event.response, "error", None)
                     raise RuntimeError(f"Responses API 失败: {error}")
 
-            respond_call = next((c for c in calls if c["name"] == "respond"), None)
+            # PTC:respond 不是工具,终结信号来自 world_run 程序内调用 respond 绑定
+            respond_call = None if api_type_ptc else next(
+                (c for c in calls if c["name"] == "respond"), None)
+            terminal = None  # PTC 终结调用: (call, result, respond_info, problems)
             for out in round_output:
                 if out["kind"] == "text":
                     text = texts.get(out["ref"], "")
@@ -169,10 +177,25 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
                     c = out["call"]
                     if c is respond_call:
                         break
-                    result = run_tool(c["name"], c["arguments"])
+                    result, respond_info = run_tool(c["name"], c["arguments"])
                     call_reasoning = round_reasoning or last_reasoning or PLACEHOLDER
+                    if respond_info is not None:
+                        # 终结调用:本轮流式已结束,正文已确定,当场做契约校验
+                        problems = []
+                        if "error" in respond_info:
+                            problems.append(respond_info["error"])
+                        if not content:
+                            problems.append("正文为空，用户什么都看不到（思考内容用户不可见，正文必须作为普通文本输出）")
+                        if not respond_info.get("options") and not options_confirmed:
+                            problems.append("选项为空，请提供剧情推进选项；若确实没有合适的选项，再次传入空数组即可")
+                        repair = bool(problems) and respond_repairs < 2
+                        terminal = (c, result, respond_info, problems)
+                    else:
+                        repair = False
+                    # 修复中的失败尝试不带 terminal 标记(回放为正文前的普通调用)
                     yield {"type": "tool", "name": c["name"], "arguments": c["arguments"],
-                           "result": result, "reasoning": call_reasoning}
+                           "result": result, "reasoning": call_reasoning,
+                           **({"terminal": True} if terminal and not repair else {})}
                     if call_reasoning:
                         input_items.append({
                             "type": "reasoning",
@@ -184,9 +207,33 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
                         "name": c["name"],
                         "arguments": c["arguments"],
                     })
+                    if terminal is not None:
+                        # 终结调用的 output 在契约校验后按需追加;其后的调用不再执行
+                        break
                     input_items.append({"type": "function_call_output", "call_id": c["call_id"], "output": result})
             if round_reasoning:
                 last_reasoning = round_reasoning
+            if terminal is not None:
+                c, result, respond_info, problems = terminal
+                options = respond_info.get("options") or []
+                if not problems or respond_repairs >= 2:
+                    if problems and not content:
+                        raise RuntimeError("模型多次未能完成「正文+选项」的完整回复，已中止")
+                    # 修复用尽后宽容接受现状(正文已在,选项可能为空)
+                    yield {"type": "done", "content": content, "options": options,
+                           "reasoning": round_reasoning or last_reasoning or PLACEHOLDER}
+                    return
+                # 契约修复:错误作为这次 world_run 的工具结果回传,模型补齐后重新收尾
+                respond_repairs += 1
+                if not options:
+                    options_confirmed = True
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": c["call_id"],
+                    "output": result + "\n\n错误：" + "；".join(problems)
+                              + "。请修正后重新通过 world_run 调用 respond(options=[...]) 收尾。",
+                })
+                continue
             if respond_call is not None:
                 try:
                     args = json.loads(respond_call["arguments"]) if respond_call["arguments"].strip() else {}
@@ -239,11 +286,16 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
                            "reasoning": round_reasoning or last_reasoning or PLACEHOLDER}
                     return
                 respond_repairs += 1
+                if api_type_ptc:
+                    hint = ("（系统提示：正文已收到。你还没有提交选项——请立即调用 world_run，"
+                            "在程序末尾用 respond(options=[...]) 提交剧情推进选项以完成本轮，不要再输出更多正文。）")
+                else:
+                    hint = ("（系统提示：正文已收到。你还没有调用 respond——请立即调用 respond "
+                            "提交剧情推进选项以完成本轮，不要再输出更多正文。）")
                 input_items.append({
                     "type": "message",
-                    "role": "developer",
-                    "content": [{"type": "input_text",
-                                 "text": "（系统提示：正文已收到。你还没有调用 respond——请立即调用 respond 提交剧情推进选项以完成本轮，不要再输出更多正文。）"}],
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": hint}],
                 })
                 continue
         raise RuntimeError(f"工具循环超过 {MAX_ROUNDS} 轮仍未结束回复,已中止")
@@ -253,6 +305,7 @@ async def _stream_respond_chat_completions(messages: list, config: dict, run_too
     """Chat Completions API 流式调用实现（内含工具循环）。"""
     last_reasoning = ""
     PLACEHOLDER = " "
+    ptc = bool(config.get("ptc"))
     async with _make_client(config) as client:
         content = ""  # 整个回合累积的正文（跨轮次）
         respond_repairs = 0
@@ -306,16 +359,61 @@ async def _stream_respond_chat_completions(messages: list, config: dict, run_too
                 ]
             messages.append(assistant_msg)
 
-            # 执行非 respond 工具调用
+            # 执行工具调用。PTC:respond 不是工具,终结信号来自 world_run 程序内的 respond 绑定
             respond_call = None
-            for call in calls:
-                if call["name"] == "respond":
+            terminal = None  # (call, result, respond_info, problems)
+            for i, call in enumerate(calls):
+                if not ptc and call["name"] == "respond":
                     respond_call = call
                     continue
-                result = run_tool(call["name"], call["arguments"])
+                result, respond_info = run_tool(call["name"], call["arguments"])
+                if respond_info is not None:
+                    # 终结调用:本轮流式已结束,正文已确定,当场做契约校验
+                    problems = []
+                    if "error" in respond_info:
+                        problems.append(respond_info["error"])
+                    if not content:
+                        problems.append("正文为空，用户什么都看不到（思考内容用户不可见，正文必须作为普通文本输出）")
+                    if not respond_info.get("options") and not options_confirmed:
+                        problems.append("选项为空，请提供剧情推进选项；若确实没有合适的选项，再次传入空数组即可")
+                    repair = bool(problems) and respond_repairs < 2
+                    terminal = (call, result, respond_info, problems)
+                else:
+                    repair = False
+                # 修复中的失败尝试不带 terminal 标记(回放为正文前的普通调用)
                 yield {"type": "tool", "name": call["name"], "arguments": call["arguments"],
-                       "result": result, "reasoning": reasoning_for_items}
+                       "result": result, "reasoning": reasoning_for_items,
+                       **({"terminal": True} if terminal and not repair else {})}
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                if terminal is not None:
+                    # 其后的调用不再执行;补占位 tool 消息,保持 assistant tool_calls 闭合
+                    for rest in calls[i + 1:]:
+                        if rest["id"]:
+                            messages.append({
+                                "role": "tool", "tool_call_id": rest["id"],
+                                "content": "（本轮已由 respond 收尾，此调用未执行）",
+                            })
+                    break
+
+            if terminal is not None:
+                call, result, respond_info, problems = terminal
+                options = respond_info.get("options") or []
+                if not problems or respond_repairs >= 2:
+                    if problems and not content:
+                        raise RuntimeError("模型多次未能完成「正文+选项」的完整回复，已中止")
+                    # 修复用尽后宽容接受现状(正文已在,选项可能为空)
+                    yield {"type": "done", "content": content, "options": options, "reasoning": reasoning_for_items}
+                    return
+                # 契约修复:以开发者消息回传错误,模型补齐后重新收尾
+                respond_repairs += 1
+                if not options:
+                    options_confirmed = True
+                messages.append({
+                    "role": "user",
+                    "content": "（系统提示：respond 收尾存在问题：" + "；".join(problems)
+                               + "。请修正后重新通过 world_run 调用 respond(options=[...]) 收尾。）",
+                })
+                continue
 
             if respond_call is not None:
                 try:
@@ -353,9 +451,15 @@ async def _stream_respond_chat_completions(messages: list, config: dict, run_too
                     yield {"type": "done", "content": content, "options": [], "reasoning": reasoning_for_items}
                     return
                 respond_repairs += 1
+                if ptc:
+                    hint = ("（系统提示：正文已收到。你还没有提交选项——请立即调用 world_run，"
+                            "在程序末尾用 respond(options=[...]) 提交剧情推进选项以完成本轮，不要再输出更多正文。）")
+                else:
+                    hint = ("（系统提示：正文已收到。你还没有调用 respond——请立即调用 respond "
+                            "提交剧情推进选项以完成本轮，不要再输出更多正文。）")
                 messages.append({
-                    "role": "developer",
-                    "content": "（系统提示：正文已收到。你还没有调用 respond——请立即调用 respond 提交剧情推进选项以完成本轮，不要再输出更多正文。）",
+                    "role": "user",
+                    "content": hint,
                 })
                 continue
 

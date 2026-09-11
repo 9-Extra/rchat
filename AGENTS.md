@@ -49,5 +49,8 @@ AI在测试时应使用uv run -m main --port 25531 --no-browser避免和用户�
 
 respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；上下文中的完整示范轮（正文 + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 developer 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。
 
+## PTC 实验模式（ptc-experiment 分支）
+预设 frontmatter 加 `ptc: true`（如 preset/GM-ptc.md）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），respond(options) 与 read_file(...) 降级为 world_run 持久命名空间内的 Python 绑定函数（app/world.py 的 _respond_binding/_read_file_binding，签名写在 {{respond_tool}} 渲染出的 AIRP_PROMPT_PTC 里）。叙事仍是普通文本；收尾 = 输出正文后调一次 world_run，程序末尾 respond(options=[...])——respond 抛 _TurnEnd(BaseException) 终止程序，world.run 返回 (结果文本, respond_info)，llm 检测到 respond_info 即校验契约（正文非空、选项非空提示一次）并结束回合，修复路径与 respond 工具版同构。终结调用在 history 的 tool_calls 里带 terminal: true 标记，回放时放在正文后（无终结调用的轮次合成 world_run(respond(options=...)) 兜底）。保留名 state/print/respond/read_file 不允许模型的顶层 def/常量覆盖。旧预设路径零改动。
+
 # 会话 fork
 用户块上的「分支」按钮：POST /api/sessions/{name}/fork {index} 在用户块断点处复制出一个新会话（core.fork_session：state 复制 + history[:index]，新名为 原名-fork-时间戳，原会话不动），world.fork 按同一 index 复制世界状态。新会话末尾是 assistant 块（或空历史），可直接继续输入。

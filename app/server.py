@@ -216,7 +216,8 @@ def preview(req: Preview):
     try:
         input_items = core.build_input(state, history, draft=req.input or None)
         config = core.load_config()
-        # 预览展示的是实际生效的请求参数，思考强度同样按会话覆盖
+        # 预览展示的是实际生效的请求参数，思考强度与 PTC 模式同样按会话生效
+        config["ptc"] = core.load_presets()[state["preset"]].get("ptc", False)
         config["reasoning_effort"] = core.resolve_reasoning_effort(
             state.get("reasoning_effort"), config
         )
@@ -290,6 +291,8 @@ async def _generate(name: str, mode: str, user_input: str | None):
         config = core.load_config()
         # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
         config["chat_id"] = state.get("chat_id", "")
+        # PTC 实验模式由预设 frontmatter 的 ptc: true 开启
+        config["ptc"] = core.load_presets()[state["preset"]].get("ptc", False)
         # 思考强度按会话覆盖（会话值非法/缺失时回退 config 默认；非法默认在此报错）
         config["reasoning_effort"] = core.resolve_reasoning_effort(
             state.get("reasoning_effort"), config
@@ -305,13 +308,17 @@ async def _generate(name: str, mode: str, user_input: str | None):
             elif event["type"] == "reasoning":
                 tail_reasoning += event["delta"]
             elif event["type"] == "tool":
-                tool_calls.append({
+                tc = {
                     "name": event["name"],
                     "arguments": event["arguments"],
                     "result": event["result"],
                     # 产生该调用的那一轮思维链,重放时放在它的 function_call 前
                     "reasoning": event.get("reasoning", ""),
-                })
+                }
+                # PTC 终结调用（程序内调用了 respond 的 world_run），回放时放在正文后
+                if event.get("terminal"):
+                    tc["terminal"] = True
+                tool_calls.append(tc)
                 tail_reasoning = ""
             yield _sse(event)
         if done is None:

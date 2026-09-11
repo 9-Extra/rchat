@@ -31,6 +31,25 @@ state只记当前状态，避免无限增长的日志，防止无效信息堆积
 再次提醒：正文写完后不要忘respond提交选项。
 """
 
+# PTC 模式的任务提示词：world_run 是唯一直接工具，respond/read_file 是代码内绑定。
+# 形态对齐 DeepSeek Harness 的 PTC 训练分布（单一代码执行工具 + 程序内绑定调用），
+# 叙事仍是普通文本输出。由 ptc: true 的预设通过 {{respond_tool}} 宏注入。
+AIRP_PROMPT_PTC = """\
+每轮回复的固定流程：
+1.（可选）调用 world_run 收集信息、执行计算、完成判定。world_run 是唯一能直接调用的工具，调用任何其它工具名都会失败；respond 和 read_file 不是工具，是 world_run 代码内的绑定函数。
+2. 输出正文。正文直接作为普通文本输出；print 的内容只有你自己能看到（用户看不到），绝不能用来输出正文。
+3. 正文写完后，再调用一次 world_run，在程序末尾用 respond(options=[...]) 提交剧情推进选项并结束本轮。respond 会立即终止程序，它之后的代码不会执行。没有合适的选项时传空数组。
+
+world_run 代码内的绑定函数（直接调用，不是工具）：
+- respond(options: list)：提交剧情推进选项并结束本轮回复。
+- read_file(file_path: str, offset: int = 1, limit: int = 2000)：读取 UTF-8 文本文件（玩家提供的设定文档、笔记等），内容返回到当次日志；大文件用 offset/limit 分页。
+
+world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
+state只记当前状态，避免无限增长的日志，防止无效信息堆积。上下文本身就是日志。
+
+再次提醒：正文写完后不要忘了调用 world_run 用 respond 提交选项。
+"""
+
 # api_type 无关的基础工具定义（只含 name/description/parameters）
 _RESPOND_TOOL_DEF = {
     "name": "respond",
@@ -99,6 +118,40 @@ _READ_FILE_TOOL_DEF = {
     },
 }
 
+# PTC 模式的 world_run：schema 中唯一的工具，描述对齐 DSH PTC 的契约句式
+_WORLD_RUN_PTC_TOOL_DEF = {
+    "name": "world_run",
+    "description": (
+        "唯一能直接调用的工具：在持久的 Python 环境中执行一段代码。调用任何其它工具名都会失败；"
+        "respond(options) 与 read_file(file_path, ...) 是代码内的绑定函数，直接在程序里调用。"
+        "只有你 print 的内容会作为执行结果返回给你（用户看不到 print 输出），正文必须作为普通文本输出。"
+        "跨调用保留：全局对象 state、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失"
+        "（state、print、respond、read_file 是内置绑定名，同名定义不会被保留）。"
+        "原子执行：代码出错时自动回滚到执行前（state、函数、常量全部还原），不会留下半更新的状态。"
+        "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
+        "normalize 出错只回滚它自己的改动并记录，不影响本次代码的成果。"
+        "每次执行返回：日志、state 的变化 diff、normalize 错误（如有）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "program": {
+                "type": "string",
+                "description": "要执行的 Python 代码。读取/修改 state，或在顶层定义函数供后续调用使用",
+            },
+            "description": {
+                "type": "string",
+                "description": "这段程序在做什么的简短摘要（5-10 词，展示在界面上）",
+            },
+            "dry": {
+                "type": "boolean",
+                "description": "试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。",
+            },
+        },
+        "required": ["program"],
+    },
+}
+
 _BASE_TOOLS = [_RESPOND_TOOL_DEF, _WORLD_RUN_TOOL_DEF, _READ_FILE_TOOL_DEF]
 
 
@@ -122,11 +175,15 @@ TOOLS = [_to_responses_format(t) for t in _BASE_TOOLS]
 CHAT_COMPLETIONS_TOOLS = [_to_chat_completions_format(t) for t in _BASE_TOOLS]
 
 
-def get_tools(api_type: str) -> list:
-    """根据 api_type 返回对应格式的工具定义。"""
+def get_tools(api_type: str, ptc: bool = False) -> list:
+    """根据 api_type 返回对应格式的工具定义。ptc 模式下 schema 只含 world_run。"""
+    if ptc:
+        base = [_WORLD_RUN_PTC_TOOL_DEF]
+    else:
+        base = _BASE_TOOLS
     if api_type == "chat_completions":
-        return CHAT_COMPLETIONS_TOOLS
-    return TOOLS
+        return [_to_chat_completions_format(t) for t in base]
+    return [_to_responses_format(t) for t in base]
 
 
 SECTION_RE = re.compile(
@@ -201,6 +258,8 @@ def load_presets() -> dict:
             "name": meta.get("name") or p.stem,
             "description": meta.get("description") or "",
             "sections": sections,
+            # PTC 实验模式：schema 只含 world_run，respond/read_file 是代码内绑定
+            "ptc": bool(meta.get("ptc")),
             # 用户输入后处理模板,渲染时提供 user_input 变量;缺省 None 表示原样透传
             "user_input_template": uim.group(1).strip() if uim else None,
         }
@@ -374,10 +433,16 @@ def _message_item(role: str, content: str) -> dict:
 def _build_input_responses(state, history, draft, preset, env):
     """拼装 Responses API 的 input_items。"""
     items = [_message_item(sec["role"], render_template(sec["content"], env)) for sec in preset["sections"]]
+    ptc = bool(preset.get("ptc"))
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
-            for tc in entry.get("tool_calls", []):
+            tool_calls = entry.get("tool_calls", [])
+            # PTC：含 respond 的终结 world_run 回放在正文后，其余辅助调用在正文前
+            terminal_tc = next((tc for tc in tool_calls if tc.get("terminal")), None) if ptc else None
+            for tc in tool_calls:
+                if tc is terminal_tc:
+                    continue
                 # 新格式逐项带 reasoning;旧格式没有,用整轮合并的 entry["reasoning"] 兜底
                 reasoning = tc.get("reasoning") or entry.get("reasoning") or " "
                 items.append({
@@ -395,22 +460,42 @@ def _build_input_responses(state, history, draft, preset, env):
             # 正文:普通 assistant message(新旧格式都存在 entry["content"] 上)
             if entry.get("content"):
                 items.append(_message_item("assistant", entry["content"]))
-            # respond 只提交选项。无论有无选项都回放这次调用,让模型每轮看到一致的收尾模式
+            # 无论有无选项都回放收尾调用,让模型每轮看到一致的收尾模式
             # (DeepSeek 会模仿旧轮次的行为,固定模式反而强化选项的稳定生成)
-            respond_reasoning = entry.get("reasoning") or next(
-                (tc["reasoning"] for tc in reversed(entry.get("tool_calls", [])) if tc.get("reasoning")), " ")
+            if ptc:
+                if terminal_tc is not None:
+                    end_name, end_args = terminal_tc["name"], terminal_tc["arguments"]
+                    end_result = terminal_tc["result"]
+                    end_reasoning = terminal_tc.get("reasoning") or entry.get("reasoning") or " "
+                else:
+                    # 没有终结调用(打断/出错轮):合成兜底,保持示范形态一致
+                    end_name = "world_run"
+                    end_args = json.dumps(
+                        {"program": "respond(options="
+                         + json.dumps(entry.get("options") or [], ensure_ascii=False) + ")"},
+                        ensure_ascii=False,
+                    )
+                    end_result = "选项已提交，本轮回复结束。"
+                    end_reasoning = entry.get("reasoning") or next(
+                        (tc["reasoning"] for tc in reversed(tool_calls) if tc.get("reasoning")), " ")
+            else:
+                end_name = "respond"
+                end_args = json.dumps({"options": entry.get("options") or []}, ensure_ascii=False)
+                end_result = "ok"
+                end_reasoning = entry.get("reasoning") or next(
+                    (tc["reasoning"] for tc in reversed(tool_calls) if tc.get("reasoning")), " ")
             items.append({
                 "type": "reasoning",
-                "content": [{"type": "reasoning_text", "text": respond_reasoning}],
+                "content": [{"type": "reasoning_text", "text": end_reasoning}],
             })
             call_n += 1
             items.append({
                 "type": "function_call",
                 "call_id": f"call_{call_n}",
-                "name": "respond",
-                "arguments": json.dumps({"options": entry.get("options") or []}, ensure_ascii=False),
+                "name": end_name,
+                "arguments": end_args,
             })
-            items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": "ok"})
+            items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": end_result})
         else:
             # 用户输入:普通 user message(不再伪装成 respond 的工具结果)
             items.append(_message_item("user", entry["content"]))
@@ -428,12 +513,17 @@ def _build_input_responses(state, history, draft, preset, env):
 def _build_input_chat_completions(state, history, draft, preset, env):
     """拼装 Chat Completions API 的 messages 列表。"""
     messages = [{"role": sec["role"], "content": render_template(sec["content"], env)} for sec in preset["sections"]]
+    ptc = bool(preset.get("ptc"))
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
             entry_reasoning = entry.get("reasoning") or " "
+            tool_calls = entry.get("tool_calls", [])
+            terminal_tc = next((tc for tc in tool_calls if tc.get("terminal")), None) if ptc else None
             # 辅助工具调用：每个 tool_call 独立成 assistant(tool_calls) + tool 消息
-            for tc in entry.get("tool_calls", []):
+            for tc in tool_calls:
+                if tc is terminal_tc:
+                    continue
                 call_n += 1
                 reasoning = tc.get("reasoning") or entry_reasoning
                 messages.append({
@@ -458,25 +548,40 @@ def _build_input_chat_completions(state, history, draft, preset, env):
                     "content": entry["content"],
                     "reasoning_content": entry_reasoning,
                 })
-            # respond 调用
+            # 收尾调用：PTC 回放含 respond 的终结 world_run(或合成兜底)，否则合成 respond
+            if ptc and terminal_tc is not None:
+                end_name, end_args = terminal_tc["name"], terminal_tc["arguments"]
+                end_result = terminal_tc["result"]
+                end_reasoning = terminal_tc.get("reasoning") or entry_reasoning
+            elif ptc:
+                end_name = "world_run"
+                end_args = json.dumps(
+                    {"program": "respond(options="
+                     + json.dumps(entry.get("options") or [], ensure_ascii=False) + ")"},
+                    ensure_ascii=False,
+                )
+                end_result = "选项已提交，本轮回复结束。"
+                end_reasoning = entry_reasoning
+            else:
+                end_name = "respond"
+                end_args = json.dumps({"options": entry.get("options") or []}, ensure_ascii=False)
+                end_result = "ok"
+                end_reasoning = entry_reasoning
             call_n += 1
             messages.append({
                 "role": "assistant",
                 "content": "",
-                "reasoning_content": entry_reasoning,
+                "reasoning_content": end_reasoning,
                 "tool_calls": [{
                     "id": f"call_{call_n}",
                     "type": "function",
-                    "function": {
-                        "name": "respond",
-                        "arguments": json.dumps({"options": entry.get("options") or []}, ensure_ascii=False),
-                    },
+                    "function": {"name": end_name, "arguments": end_args},
                 }],
             })
             messages.append({
                 "role": "tool",
                 "tool_call_id": f"call_{call_n}",
-                "content": "ok",
+                "content": end_result,
             })
         else:
             messages.append({"role": "user", "content": entry["content"]})
@@ -500,7 +605,7 @@ def build_input(state: dict, history: list, draft=None) -> list:
         "game_setting": card["setting"],
         "game_beginning": state["beginning_text"],
         "user_setting": card["user_setting"],
-        "respond_tool": AIRP_PROMPT,
+        "respond_tool": AIRP_PROMPT_PTC if preset.get("ptc") else AIRP_PROMPT,
     }
     if api_type == "chat_completions":
         return _build_input_chat_completions(state, history, draft, preset, env)

@@ -82,15 +82,18 @@ def read_file(
     return f"<path>{absolute}</path>\n<content>\n{body + chr(10) + chr(10) if body else ''}</content>\n{footer}"
 
 
-def execute_tool(session: str, name: str, arguments: str) -> str:
-    """执行一个非 respond 的工具调用,返回作为 function_call_output 的文本。
+def execute_tool(session: str, name: str, arguments: str):
+    """执行一个非 respond 的工具调用。
 
+    返回 (function_call_output 文本, respond_info)；respond_info 仅当 world_run
+    程序内调用了 respond 绑定时非 None（{"options": [...]} 或 {"error": ...}），
+    是 PTC 模式的回合收尾信号。
     arguments 是模型给出的 JSON 字符串;解析失败/未知工具同样以文本返回。
     """
     try:
         args = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError as e:
-        return f"错误：工具参数不是合法 JSON：{e}"
+        return f"错误：工具参数不是合法 JSON：{e}", None
     try:
         if name == "world_run":
             return world.run(session, str(args.get("program", "")), dry=args.get("dry") is True)
@@ -100,14 +103,14 @@ def execute_tool(session: str, name: str, arguments: str) -> str:
                 card = core.load_cards().get(state.get("card", ""))
                 base_dir = Path(card["path"]).parent if card and card.get("path") else None
             except Exception as e:
-                return f"错误：无法确定角色卡目录：{type(e).__name__}: {e}"
+                return f"错误：无法确定角色卡目录：{type(e).__name__}: {e}", None
             return read_file(
                 args.get("file_path", ""),
                 args.get("offset", 1),
                 args.get("limit", READ_LIMIT),
                 base_dir=str(base_dir) if base_dir else None,
-            )
-        return f"错误：未知工具 {name}"
+            ), None
+        return f"错误：未知工具 {name}（只有 schema 中声明的工具可以直接调用；绑定函数请在 world_run 代码内使用）", None
     except Exception as e:
         logger.exception("工具 %s 执行失败", name)
-        return f"错误：{type(e).__name__}: {e}"
+        return f"错误：{type(e).__name__}: {e}", None
