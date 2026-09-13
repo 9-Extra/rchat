@@ -35,7 +35,7 @@ server 在生成/预览时用 `core.effective_config(state, config)` 把选中�
 # 工具
 模型有三个工具（schema 在 app/core.py）：
 - respond：提交剧情推进选项并结束本轮回复（只含 options，无选项传空数组）；必须是一轮回复的最后一次调用。正文不经过工具，是模型的普通文本输出，直接流式给用户。
-- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state、顶层 def 函数、全大写全局变量（常量，识别规则 `^[A-Z][A-Z0-9_]*$`）三者持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json，函数与常量都存源码进 lib.py，重放时按 tree.body 顺序 exec）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致；fork 时由 world.fork 把断点处的快照（及更早快照）复制到新会话，无快照则兜底复制当前 committed。无超时保护
+- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state、顶层 def 函数、全大写全局变量（常量，识别规则 `^[A-Z][A-Z0-9_]*$`）三者持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json，函数与常量都存源码进 lib.py，重放时按 tree.body 顺序 exec）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致；快照只在改动过 world 的轮次结束时记一条，所以取某长度的状态时用 world._snapshot_at 回退到不晚于它的最近快照（两轮之间没改过状态），早于所有快照（那时世界状态还没建立）视为空状态——直接 `snapshots.get(str(len))` 会在开局前/未碰 world 的长度上静默保持最新状态，回滚失效；fork 时由 world.fork 用同一规则取断点处状态（及更早快照）复制到新会话。无超时保护
 - read_file：只读分页读文件（app/tools.py），相对路径以项目根为基准，允许绝对路径
 
 两种 `api_type` 都支持这三个工具的多轮调用。`responses` 模式下使用 Responses API 的 `function_call`/`function_call_output` 格式；`chat_completions` 模式下使用标准 OpenAI function-calling 的 `tool_calls`/`tool` 消息格式。落盘历史格式不变。

@@ -7,7 +7,9 @@ respond(options)（提交选项并结束本轮，PTC 模式的收尾契约）和
 - state.json   当前 state（JSON）
 - lib.py       模型定义的顶层函数与全大写常量源码（重放恢复）
 - snapshots.json  按历史长度存档的 {state, lib} 快照，会话回滚/重生成时
-  状态跟着回到对应位置（server 在截断 history 后调用 sync）。
+  状态跟着回到对应位置（server 在截断 history 后调用 sync）。只有改动过
+  world 的轮次结束时会记一条，所以取状态时按 _snapshot_at 回退到不晚于
+  目标长度的最近快照，早于所有快照（世界状态还没建立）则是空状态。
 
 语义（与原 JS 版对齐）：
 - 原子执行：代码出错自动回滚（state、本次新增/覆盖的函数与常量），不留半更新；
@@ -236,6 +238,21 @@ def _snapshots(name: str) -> dict:
         return {}
 
 
+def _snapshot_at(snaps: dict, turn_len: int):
+    """取历史长度 turn_len 处的世界状态快照。
+
+    恰好有该长度的快照就用它；没有时取不晚于它的最近快照——改动世界状态必须
+    经过 world_run，成功的一轮结束时都会按落盘长度记一条快照，所以两条快照
+    之间状态不变，可以这样回退。早于所有快照（含一条都没有）说明那时世界状态
+    还没建立，为空。
+    """
+    exact = snaps.get(str(turn_len))
+    if exact is not None:
+        return exact
+    earlier = [int(k) for k in snaps if int(k) < turn_len]
+    return snaps[str(max(earlier))] if earlier else {"state": {}, "lib": {}}
+
+
 def _write_disk(name: str, committed: dict, turn_len: int):
     d = _world_dir(name)
     d.mkdir(parents=True, exist_ok=True)
@@ -251,21 +268,19 @@ def _write_disk(name: str, committed: dict, turn_len: int):
 def sync(name: str, turn_len: int):
     """把运行时对齐到指定历史长度（回滚/重生成/打断后调用）。
 
-    历史被截断时从快照恢复对应状态并剪掉更晚的快照;长度未变但内存中有
-    未提交改动(上一轮被打断/失败)时回到 committed。
+    历史被截断时按 _snapshot_at 取该长度处的状态并剪掉更晚的快照;长度未变但
+    内存中有未提交改动(上一轮被打断/失败)时回到 committed;没用过 world_run
+    的会话没有世界状态要对齐。
     """
     rt = _runtimes.get(name)
     if rt is not None and turn_len == rt["turn_len"]:
         rt["ns"] = _fresh_ns(rt, name)
         return
-    snap = _snapshots(name).get(str(turn_len))
-    if snap is not None:
-        committed = snap
-        _write_disk(name, committed, turn_len)
-    elif rt is not None:
-        committed = rt["committed"]  # 无快照(功能上线前的旧会话):保持当前状态
-    else:
-        return  # 运行时与快照都不存在,首次 world_run 时按磁盘现状加载
+    snaps = _snapshots(name)
+    if rt is None and not snaps:
+        return  # 会话还没用过 world_run,首次调用时按磁盘现状加载
+    committed = _snapshot_at(snaps, turn_len)
+    _write_disk(name, committed, turn_len)
     if rt is None:
         rt = {"name": name, "committed": committed, "turn_len": turn_len, "logs": None}
         _runtimes[name] = rt
@@ -298,14 +313,14 @@ def commit_turn(name: str, turn_len: int):
 def fork(src: str, dst: str, turn_len: int):
     """fork：把 src 在 turn_len 处的世界状态（及更早的快照）复制到新会话 dst。
 
-    优先取该历史长度的快照；没有快照（功能上线前的旧会话）时与 sync 一样
-    退化为复制当前 committed 状态。只读 src，不影响其运行时。
+    状态与 sync 用同一规则取（没有完全对应的快照就取不晚于它的最近一个，早于
+    所有快照则为空）。只读 src，不影响其运行时。
     """
     src_dir = _world_dir(src)
     if not src_dir.exists():
         return  # 源会话从未使用过 world_run，没有世界状态可复制
     snaps = _snapshots(src)
-    committed = snaps.get(str(turn_len)) or _load_committed(src)
+    committed = _snapshot_at(snaps, turn_len)
     d = _world_dir(dst)
     d.mkdir(parents=True, exist_ok=True)
     (d / "state.json").write_text(
