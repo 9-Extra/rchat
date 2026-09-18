@@ -58,7 +58,12 @@ def get_cards():
 
 @app.get("/api/sessions")
 def get_sessions():
-    return core.list_sessions()
+    """侧栏列表：除会话名外，附上角色卡显示名与已运行轮数供前端直接展示。"""
+    sessions = core.list_sessions()
+    for s in sessions:
+        s["card_name"] = s.get("card_name") or s.get("card") or ""
+        s["turns"] = core.count_turns(s["name"])
+    return sessions
 
 
 @app.get("/api/endpoints")

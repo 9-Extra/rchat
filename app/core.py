@@ -489,6 +489,11 @@ def save_history(name: str, history: list) -> None:
     )
 
 
+def count_turns(name: str) -> int:
+    """已运行的轮数 = history 里模型回复（assistant 块）的条数。"""
+    return sum(1 for e in load_history(name) if e.get("role") == "assistant")
+
+
 # ---------- 上下文拼装 ----------
 
 def _message_item(role: str, content: str) -> dict:
