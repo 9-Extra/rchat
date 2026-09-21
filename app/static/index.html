@@ -365,6 +365,8 @@ async function selectSession(id) {
   stickBottom = true;
   render();
   loadSessions();
+  // 后端这一轮还在跑（刷新/换设备后回到同一会话）：接上它继续看
+  if (cur.generating) attachTurn();
   // 在手机上选好会话后自动收起抽屉
   if (window.innerWidth <= 640) {
     $('sidebar').classList.add('collapsed');
@@ -415,7 +417,9 @@ function updateComposer() {
   const started = cur.history.length > 0;
   const waiting = !started || cur.history[cur.history.length - 1].role === 'assistant';
   const btn = $('send');
-  if (streaming) {
+  // cur.generating：后端这一轮还在跑（本页刷新回来、或别的页面/设备发起的）
+  const busy = streaming || !!cur.generating;
+  if (busy) {
     btn.textContent = '打断';
     btn.disabled = false;
     btn.classList.add('interrupting');
@@ -424,7 +428,7 @@ function updateComposer() {
     btn.textContent = started ? '发送' : '开始';
     btn.disabled = !waiting;
   }
-  $('input').disabled = streaming || !started || !waiting;
+  $('input').disabled = busy || !started || !waiting;
 }
 
 function makeOpsBtn(text, fn) {
@@ -543,18 +547,21 @@ function editBlock(div, text, onSave) {
 const enc = () => encodeURIComponent(cur.id);
 const post = obj => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) });
 
+// 连续重连次数：接上（或正常收尾）后归零，用来在长时间断网时放弃等待
+let reconnectTries = 0;
+
 async function streamInto(url, opts, userText) {
   streaming = true; updateComposer();
   const chat = $('chat');
-  // 用户输入块立即显示
+  // 用户输入块立即显示；断线重连会丢掉本次尝试画出的块重画，用户块由调用方每轮重新传入
   if (userText != null) {
     const u = document.createElement('div');
-    u.className = 'block user';
+    u.className = 'block user live';
     u.innerHTML = `<div class="tag">你</div><div class="content">${esc(userText)}</div>`;
     chat.appendChild(u);
   }
   const div = document.createElement('div');
-  div.className = 'block ai';
+  div.className = 'block ai live';
   div.innerHTML = `<div class="tag">AI（生成中…）</div>
     <div class="content"></div>`;
   chat.appendChild(div);
@@ -620,13 +627,50 @@ async function streamInto(url, opts, userText) {
       }
     }
   } catch (err) {
-    if (!streaming) { /* 被打断，属于正常路径 */ }
-    else { div.querySelector('.tag').textContent = '出错'; contentDiv.textContent = String(err); }
+    if (!streaming) { /* 用户打断，属于正常路径 */ }
+    else {
+      // 连接断了：生成是会话级后台任务，后端那一轮照跑，重连接上继续看
+      streaming = false;
+      await reconnectTurn(userText);
+      return;
+    }
   }
   activeReader = null;
   streaming = false;
+  reconnectTries = 0;
   cur = await api('/api/sessions/' + enc());
   render();
+}
+
+// 断线后重连续看：后端还在生成就重放整轮接上，这一轮已结束就按 history 收尾
+async function reconnectTurn(userText) {
+  let s = null;
+  try { s = await api('/api/sessions/' + enc()); } catch (e) {}
+  if (s && !s.generating) { cur = s; reconnectTries = 0; render(); return; }
+  if (++reconnectTries > 12) {
+    // 网络长时间不通：把半截内容留在屏幕上，刷新或切回前台会重新接上
+    const tag = $('chat').querySelector('.live.ai .tag');
+    if (tag) tag.textContent = '连接中断（刷新页面可接上）';
+    updateComposer();
+    return;
+  }
+  await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** reconnectTries, 5000)));
+  // 丢掉这次尝试画出的块，从 /stream 重放整轮
+  $('chat').querySelectorAll('.live').forEach(el => el.remove());
+  await streamInto(`/api/sessions/${enc()}/stream`, {}, userText);
+}
+
+// 页面加载/回到前台时接上后端正在进行的这一轮（刷新、锁屏、掉线都能续看）
+async function attachTurn() {
+  const g = cur.generating;
+  if (!g || streaming) return;
+  // regenerate 期间磁盘上还是被替换掉的旧 AI 块，先按点「重新输出」时那样删掉它
+  if (g.mode === 'regenerate') {
+    const blocks = $('chat').querySelectorAll('.block.ai');
+    if (blocks.length) blocks[blocks.length - 1].remove();
+  }
+  reconnectTries = 0;
+  await streamInto(`/api/sessions/${enc()}/stream`, {}, g.mode === 'chat' ? g.user_input : null);
 }
 
 async function interrupt() {
@@ -638,7 +682,7 @@ async function interrupt() {
 
 function send() {
   const text = $('input').value.trim();
-  if (!text || streaming) return;
+  if (!text || streaming || cur.generating) return;
   $('input').value = '';
   autoGrow();
   if (!cur.history.length) return; // 首轮用「开始」
@@ -646,7 +690,7 @@ function send() {
 }
 
 function regenerate() {
-  if (streaming) return;
+  if (streaming || cur.generating) return;
   // 立即移除旧的最后一个 AI 块，避免新旧两块同时显示
   const blocks = $('chat').querySelectorAll('.block.ai');
   if (blocks.length) blocks[blocks.length - 1].remove();
@@ -654,7 +698,7 @@ function regenerate() {
 }
 
 $('send').onclick = () => {
-  if (streaming) { interrupt(); return; }
+  if (streaming || cur.generating) { interrupt(); return; }
   if (!cur.history.length)
     streamInto(`/api/sessions/${enc()}/start`, { method: 'POST' });
   else send();
@@ -729,6 +773,16 @@ $('mCreate').onclick = async () => {
     await selectSession(s.id);
   } catch (e) { alert(e.message); }
 };
+
+// 手机上锁屏/切走再回来：这一轮可能还在跑，没接上就重新接（长断网放弃后也靠它恢复）
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible' || streaming || !cur) return;
+  try {
+    const s = await api('/api/sessions/' + enc());
+    if (s.generating) { cur = s; render(); attachTurn(); }
+    else if (cur.generating) { cur = s; render(); }
+  } catch (e) {}
+});
 
 // 启动：加载会话列表，并把上次选中的会话恢复回来（已删除则清除记录，退回主界面）
 (async () => {

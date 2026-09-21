@@ -78,14 +78,24 @@ def _make_client(config: dict) -> AsyncOpenAI:
 
 
 def build_request(input_items: list, config: dict) -> dict:
-    """构造实际发送给模型的请求参数（/api/preview 也用它展示上下文）。"""
+    """构造实际发送给模型的请求参数（/api/preview 也用它展示上下文）。
+
+    工具 schema 来自 config 里的预设工具配置（core.apply_preset_tools 写入的
+    ptc/tools/bindings）：ptc 模式只含 world_run，普通模式是 respond + 白名单里的直接工具。
+    """
     api_type = config.get("api_type", "responses")
     ptc = bool(config.get("ptc"))
+    direct = config.get("tools")
+    if not isinstance(direct, list):
+        raise ValueError(
+            f"config 缺少启用的工具名单 tools: {direct!r}（应由 core.apply_preset_tools 写入）"
+        )
+    schemas = get_tools(api_type, ptc, direct, config.get("bindings") or [])
     if api_type == "chat_completions":
         payload = {
             "model": config["model"],
             "messages": input_items,
-            "tools": get_tools("chat_completions", ptc),
+            "tools": schemas,
             "tool_choice": "auto",
             "stream": True,
         }
@@ -104,7 +114,7 @@ def build_request(input_items: list, config: dict) -> dict:
     payload = {
         "model": config["model"],
         "input": input_items,
-        "tools": get_tools("responses", ptc),
+        "tools": schemas,
         "tool_choice": "auto",
     }
     if config.get("temperature") is not None:
@@ -216,7 +226,7 @@ async def _stream_respond_responses(input_items: list, config: dict, run_tool):
                     c = out["call"]
                     if c is respond_call:
                         break
-                    result, respond_info = run_tool(c["name"], c["arguments"])
+                    result, respond_info = await run_tool(c["name"], c["arguments"])
                     call_reasoning = round_reasoning or last_reasoning or PLACEHOLDER
                     if respond_info is not None:
                         # 终结调用:本轮流式已结束,正文已确定,当场做契约校验
@@ -383,7 +393,7 @@ async def _stream_respond_chat_completions(messages: list, config: dict, run_too
                 if not ptc and call["name"] == "respond":
                     respond_call = call
                     continue
-                result, respond_info = run_tool(call["name"], call["arguments"])
+                result, respond_info = await run_tool(call["name"], call["arguments"])
                 if respond_info is not None:
                     # 终结调用:本轮流式已结束,正文已确定,当场做契约校验
                     problems = _contract_problems(

@@ -1,8 +1,10 @@
 """world_run 的持久 Python 执行环境（移植自 AIRP 预设的 node:vm 版）。
 
 每个会话一个 exec 命名空间：预置全局对象 state（dict）与 print，以及绑定函数
-respond(options)（提交选项并结束本轮，PTC 模式的收尾契约）和 read_file(...)（读文件，
-内容进日志）。绑定是命名空间内的普通函数，不是工具。
+respond(options)（提交选项并结束本轮，PTC 模式的收尾契约）与工具绑定
+（read_file/write_file/edit_file/bash，启用哪些由会话预设 frontmatter 的 tools 白名单
+决定，见 core.preset_tools，工具结果进当次日志）。绑定是命名空间内的普通函数，不是工具；
+预设可在会话中途切换，启用的工具集变化时按 _reconcile_bindings 原地重建命名空间。
 持久化到 sessions/<name>/world/：
 - state.json   当前 state（JSON）
 - lib.py       模型定义的顶层函数与全大写常量源码（重放恢复）
@@ -40,11 +42,13 @@ class _TurnEnd(BaseException):
     pass
 
 
-# 命名空间内置名：不允许模型的顶层 def/常量覆盖（否则 lib 重放会遮蔽内置绑定）
-RESERVED_NAMES = {"state", "print", "respond", "read_file"}
+# 命名空间恒定内置名：不允许模型的顶层 def/常量覆盖（否则 lib 重放会遮蔽内置绑定）。
+# 启用的工具绑定名另由会话预设动态加入（见 _refresh_bindings）。
+BASE_RESERVED_NAMES = {"state", "print", "respond"}
 
 # session 目录名 -> runtime: {"ns": dict, "lib": {name: source},
-#   "committed": {"state": ..., "lib": ...}, "turn_len": int, "logs": list|None}
+#   "committed": {"state": ..., "lib": ...}, "turn_len": int, "logs": list|None,
+#   "bindings": set[str]（命名空间里已挂的工具绑定名）, "reserved": set[str]（含绑定的保留名）}
 _runtimes: dict = {}
 
 
@@ -147,18 +151,60 @@ def _print_part(p):
     return p if isinstance(p, str) else repr(p)
 
 
-def _read_file_binding(rt, file_path, offset=1, limit=2000):
-    """命名空间内的 read_file 绑定：读取结果进日志（内容本身已由 tools 限长，不再截断）。"""
-    from app import core, tools  # 惰性 import：tools 依赖本模块，避免循环
-    try:
-        state = core.load_state(rt["name"])
-        card = core.load_cards().get(state.get("card", ""))
-        base_dir = str(Path(card["path"]).parent) if card and card.get("path") else None
-        result = tools.read_file(str(file_path), offset, limit, base_dir=base_dir)
-    except Exception as e:
-        result = f"错误：read_file 调用失败：{type(e).__name__}: {e}"
+def _card_dir(rt):
+    """会话角色卡所在目录：工具绑定里相对路径的基准与工作目录（取不到时为 None）。"""
+    from app import core
+    state = core.load_state(rt["name"])
+    card = core.load_cards().get(state.get("card", ""))
+    return str(Path(card["path"]).parent) if card and card.get("path") else None
+
+
+def _log_binding_call(rt, result):
+    """工具绑定的返回值：写进当次日志（内容本身已由 tools 限长，不再截断）。"""
     _push_log(rt, result, line_cap=None)
     return result
+
+
+def _read_file_binding(rt, file_path, offset=1, limit=2000):
+    """命名空间内的 read_file 绑定。"""
+    from app import tools  # 惰性 import：tools 依赖本模块，避免循环
+    try:
+        result = tools.read_file(str(file_path), offset, limit, base_dir=_card_dir(rt))
+    except Exception as e:
+        result = f"错误：read_file 调用失败：{type(e).__name__}: {e}"
+    return _log_binding_call(rt, result)
+
+
+def _write_file_binding(rt, file_path, content="", mode="overwrite"):
+    """命名空间内的 write_file 绑定：相对路径以角色卡所在目录为基准。"""
+    from app import tools
+    try:
+        result = tools.write_file(file_path, content, mode, base_dir=_card_dir(rt))
+    except Exception as e:
+        result = f"错误：write_file 调用失败：{type(e).__name__}: {e}"
+    return _log_binding_call(rt, result)
+
+
+def _edit_file_binding(rt, file_path, old_string, new_string, replace_all=False):
+    """命名空间内的 edit_file 绑定：相对路径以角色卡所在目录为基准。"""
+    from app import tools
+    try:
+        result = tools.edit_file(
+            file_path, old_string, new_string, replace_all is True, base_dir=_card_dir(rt)
+        )
+    except Exception as e:
+        result = f"错误：edit_file 调用失败：{type(e).__name__}: {e}"
+    return _log_binding_call(rt, result)
+
+
+def _bash_binding(rt, command, timeout=60):
+    """命名空间内的 bash 绑定：在事件循环里同步执行，长命令会卡住服务端。"""
+    from app import tools
+    try:
+        result = tools.bash(command, timeout, _card_dir(rt))
+    except Exception as e:
+        result = f"错误：bash 调用失败：{type(e).__name__}: {e}"
+    return _log_binding_call(rt, result)
 
 
 def _respond_binding(rt, options=None):
@@ -173,25 +219,67 @@ def _respond_binding(rt, options=None):
     raise _TurnEnd()
 
 
-def _fresh_ns(rt, name):
-    """重建命名空间：预置绑定，重放 lib 函数与常量源码，恢复 committed state。"""
+def _bindings_for(rt, name):
+    """按会话预设启用的工具构造绑定函数字典（含恒定的 respond）。
+
+    绑定是 world_run 程序内直接调用的普通函数，不是工具；启用哪些由预设 frontmatter
+    的 tools 白名单决定（core.preset_tools）。预设不存在或白名单非法时直接抛错，由
+    tools.execute_tool 以工具错误文本回传给模型。
+    """
+    from app import core
+    _direct, bindings = core.session_tools(core.load_state(name))
+    out = {"respond": lambda options=None: _respond_binding(rt, options)}
+    for tool_name in bindings:
+        if tool_name == "read_file":
+            out["read_file"] = lambda file_path, offset=1, limit=2000: _read_file_binding(
+                rt, file_path, offset, limit
+            )
+        elif tool_name == "write_file":
+            out["write_file"] = lambda file_path, content="", mode="overwrite": _write_file_binding(
+                rt, file_path, content, mode
+            )
+        elif tool_name == "edit_file":
+            out["edit_file"] = lambda file_path, old_string, new_string, replace_all=False: (
+                _edit_file_binding(rt, file_path, old_string, new_string, replace_all)
+            )
+        elif tool_name == "bash":
+            out["bash"] = lambda command, timeout=60: _bash_binding(rt, command, timeout)
+    return out
+
+
+def _refresh_bindings(rt, name, state, lib, bindings=None):
+    """重建命名空间：可按调用方给的绑定集构造（否则按当前预设解析），并重放 lib 源码。"""
+    bindings = _bindings_for(rt, name) if bindings is None else bindings
+    rt["bindings"] = set(bindings)
+    rt["reserved"] = BASE_RESERVED_NAMES | set(bindings)
     ns = {
-        "state": copy.deepcopy(rt["committed"]["state"]),
+        "state": state,
         "print": lambda *parts: _push_log(rt, " ".join(_print_part(p) for p in parts)),
-        "respond": lambda options=None: _respond_binding(rt, options),
-        "read_file": lambda file_path, offset=1, limit=2000: _read_file_binding(
-            rt, file_path, offset, limit
-        ),
     }
-    for fname, src in rt["committed"]["lib"].items():
-        if fname in RESERVED_NAMES:
+    ns.update(bindings)
+    for fname, src in lib.items():
+        if fname in rt["reserved"]:
             continue  # 保留名不进 lib（收集时已拦截，这里防旧会话遗留）
         try:
             exec(src, ns)
         except Exception:
             logger.warning("world lib 重放失败 %s: %s", fname, src[:80])
-    rt["lib"] = dict(rt["committed"]["lib"])
     return ns
+
+
+def _fresh_ns(rt, name):
+    """回到 committed 重建命名空间：预置绑定，重放 lib 函数与常量源码，恢复 state。"""
+    rt["lib"] = dict(rt["committed"]["lib"])
+    return _refresh_bindings(rt, name, copy.deepcopy(rt["committed"]["state"]), rt["lib"])
+
+
+def _reconcile_bindings(rt, name):
+    """会话中途切换预设时对齐命名空间：启用的工具集变化则原地重建（保留当前 state 与 lib）。"""
+    bindings = _bindings_for(rt, name)
+    if rt.get("bindings") == set(bindings):
+        return
+    logger.info("会话 %s 启用的工具集变化，重建 world 命名空间: %s", name, "、".join(bindings))
+    rt["ns"] = _refresh_bindings(rt, name, rt["ns"]["state"], rt["lib"], bindings)
 
 
 def _load_committed(name: str):
@@ -221,6 +309,9 @@ def runtime_for(name: str):
         rt["turn_len"] = _current_len(name)
         rt["ns"] = _fresh_ns(rt, name)
         _runtimes[name] = rt
+    else:
+        # 预设可在会话中途切换：启用的工具集变了就换掉命名空间里的绑定
+        _reconcile_bindings(rt, name)
     return rt
 
 
@@ -374,8 +465,8 @@ def run(name: str, program: str, dry: bool = False):
         # 用户代码成功:收集顶层 def 与全大写常量进 lib(保留名除外,防止遮蔽内置绑定)
         defs = _extract_defs(program)
         if defs:
-            skipped_defs = [n for n in defs if n in RESERVED_NAMES]
-            rt["lib"].update({n: s for n, s in defs.items() if n not in RESERVED_NAMES})
+            skipped_defs = [n for n in defs if n in rt["reserved"]]
+            rt["lib"].update({n: s for n, s in defs.items() if n not in rt["reserved"]})
     if error is None and callable(ns.get("normalize")):
         # 约定式整理:normalize 出错只回滚它自己的改动
         hook_ns = dict(ns)

@@ -15,48 +15,85 @@ PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
-# AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，选项走 respond 工具，world_run/read_file 辅助）。
+# AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，选项走 respond 工具，其它工具辅助）。
 # 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
+# 文本由 respond_tool_text 按预设 frontmatter 的 tools 白名单组装：没启用的工具不出现在
+# 提示词里；默认白名单（world_run + read_file）下与旧版固定文本逐字一致。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
 # 实际上用户可以看到思考内容，但不需要告诉模型
-AIRP_PROMPT = """\
-每轮回复的固定流程：
-1.（可选）任意时刻调用 world_run / read_file 收集信息、执行计算、完成判定，执行结果作为工具结果返回给你；
-2. 输出正文。需要的话中间可以插入world_run / read_file。
-3. 在正文写完后，调用 respond 提交的剧情推进选项（options）同时结束本轮。没有合适的选项时传空数组。
 
+# world_run 的说明段（它被启用时才出现）
+_WORLD_RUN_PARA = """\
 world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
-state只记当前状态，避免无限增长的日志，防止无效信息堆积。上下文本身就是日志。
+state只记当前状态，避免无限增长的日志，防止无效信息堆积。上下文本身就是日志。"""
 
+_WORLD_RUN_NOTES = """\
 书写 world_run 代码的注意事项：
 - state 是 dict：读写一律用下标（state['hp']），不支持点访问（state.hp 会报错）。
-- 双引号嵌套需要多层转义、极易出错。含引号的文本（对话、选项）一律用单引号或三引号的 Python 字符串包裹，让双引号原样出现在字符串里。
+- 双引号嵌套需要多层转义、极易出错。含引号的文本（对话、选项）一律用单引号或三引号的 Python 字符串包裹，让双引号原样出现在字符串里。"""
 
-再次提醒：正文写完后不要忘respond提交选项。
-"""
+# 附加工具的说明段（read_file 只在流程里点名，没有专段）
+_TOOL_PARAS = {
+    "write_file": """\
+write_file 用来写文件：默认整篇覆盖（文件不存在就新建，父目录自动创建），mode='append' 时追加到末尾；换行统一为 LF。相对路径以本会话角色卡所在目录为基准，也接受绝对路径。改文件里的局部内容请用 edit_file，不要整篇重写。""",
+    "edit_file": """\
+edit_file 用来把文件里的一段文字精确替换成另一段：old_string 必须与文件内容逐字一致（含缩进与空行），默认要求它在文件里唯一，否则报错要你给出更长的上下文；replace_all=True 时全部替换。不确定文件当前内容时先用 read_file 看一眼。""",
+    "bash": """\
+bash 在角色卡所在目录执行一段 shell 命令（Git Bash），返回退出码与合并后的输出（stdout 在前、stderr 在后）：适合批量处理文件、跑脚本、查环境这类事情。命令有超时上限（默认 60 秒，最多 600 秒），超时会被终止；不要用它跑需要交互输入的命令。""",
+}
 
-# PTC 模式的任务提示词：world_run 是唯一直接工具，respond/read_file 是代码内绑定。
+
+def _airp_prompt(direct: list) -> str:
+    """非 PTC 模式的任务提示词：按启用的直接工具裁剪。"""
+    flow = ["每轮回复的固定流程："]
+    step = 1
+    if direct:
+        names = " / ".join(direct)
+        flow.append(
+            f"{step}.（可选）任意时刻调用 {names} 收集信息、执行计算、完成判定，执行结果作为工具结果返回给你；"
+        )
+        step += 1
+        flow.append(f"{step}. 输出正文。需要的话中间可以插入{names}。")
+    else:
+        flow.append(f"{step}. 输出正文。")
+    step += 1
+    flow.append(
+        f"{step}. 在正文写完后，调用 respond 提交的剧情推进选项（options）同时结束本轮。没有合适的选项时传空数组。"
+    )
+    parts = ["\n".join(flow)]
+    if "world_run" in direct:
+        parts += [_WORLD_RUN_PARA, _WORLD_RUN_NOTES]
+    parts += [_TOOL_PARAS[n] for n in direct if n in _TOOL_PARAS]
+    parts.append("再次提醒：正文写完后不要忘respond提交选项。")
+    return "\n\n".join(parts)
+
+# PTC 模式的任务提示词：world_run 是唯一直接工具，respond/read_file 等是代码内绑定。
 # 形态对齐 DeepSeek Harness 的 PTC 训练分布（单一代码执行工具 + 程序内绑定调用），
-# 叙事仍是普通文本输出。由 ptc: true 的预设通过 {{respond_tool}} 宏注入。
-AIRP_PROMPT_PTC = """\
-每轮回复的固定流程：
-1.（可选）调用 world_run 收集信息、执行计算、完成判定。world_run 是唯一能直接调用的工具，调用任何其它工具名都会失败。
-2. 输出正文。正文直接作为普通文本输出。
-3. 正文写完后，再调用一次 world_run，在程序末尾用 respond(options=[...]) 提交剧情推进选项并结束本轮。respond 会立即终止程序，它之后的代码不会执行。没有合适的选项时传空数组。
+# 叙事仍是普通文本输出。由 ptc: true 的预设通过 {{respond_tool}} 宏注入；
+# 绑定清单按预设的 tools 白名单裁剪（respond 恒定列出，其余启用什么列什么）。
+_PTC_BINDING_DOCS = {
+    "read_file": "- read_file(file_path: str, offset: int = 1, limit: int = 2000)：读取 UTF-8 文本文件（玩家提供的设定文档、笔记等），内容返回到当次日志；大文件用 offset/limit 分页。",
+    "write_file": "- write_file(file_path: str, content: str = '', mode: str = 'overwrite')：写 UTF-8 文本文件（overwrite 整篇覆盖/新建，append 追加到末尾，父目录自动创建），相对路径以角色卡所在目录为基准。",
+    "edit_file": "- edit_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False)：把文件里的一段文字精确替换成另一段，old_string 必须与文件内容逐字一致且默认唯一。",
+    "bash": "- bash(command: str, timeout: int = 60)：执行一段 shell 命令（Git Bash），返回退出码与合并后的输出，timeout 最多 600 秒。",
+}
 
-world_run 代码内的绑定函数（直接调用，不是工具）：
-- respond(options: list)：提交剧情推进选项并结束本轮回复，只在正文写完之后调用。
-- read_file(file_path: str, offset: int = 1, limit: int = 2000)：读取 UTF-8 文本文件（玩家提供的设定文档、笔记等），内容返回到当次日志；大文件用 offset/limit 分页。
 
-world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
-state只记当前状态，避免无限增长的日志，防止无效信息堆积。上下文本身就是日志。
-
-书写 world_run 代码的注意事项：
-- state 是 dict：读写一律用下标（state['hp']），不支持点访问（state.hp 会报错）。
-- 双引号嵌套需要多层转义、极易出错。含引号的文本（对话、选项）一律用单引号或三引号的 Python 字符串包裹，让双引号原样出现在字符串里。
-
-再次提醒：正文写完后不要忘了调用 world_run 用 respond 提交选项。
-"""
+def _airp_prompt_ptc(bindings: list) -> str:
+    """PTC 模式的任务提示词：绑定函数清单按启用的工具生成。"""
+    docs = ["- respond(options: list)：提交剧情推进选项并结束本轮回复，只在正文写完之后调用。"]
+    docs += [_PTC_BINDING_DOCS[b] for b in bindings if b in _PTC_BINDING_DOCS]
+    return "\n\n".join([
+        "每轮回复的固定流程：\n"
+        "1.（可选）调用 world_run 收集信息、执行计算、完成判定。world_run 是唯一能直接调用的工具，调用任何其它工具名都会失败。\n"
+        "2. 输出正文。正文直接作为普通文本输出。\n"
+        "3. 正文写完后，再调用一次 world_run，在程序末尾用 respond(options=[...]) 提交剧情推进选项并结束本轮。"
+        "respond 会立即终止程序，它之后的代码不会执行。没有合适的选项时传空数组。",
+        "world_run 代码内的绑定函数（直接调用，不是工具）：\n" + "\n".join(docs),
+        _WORLD_RUN_PARA,
+        _WORLD_RUN_NOTES,
+        "再次提醒：正文写完后不要忘了调用 world_run 用 respond 提交选项。",
+    ])
 
 # api_type 无关的基础工具定义（只含 name/description/parameters）
 _RESPOND_TOOL_DEF = {
@@ -126,41 +163,180 @@ _READ_FILE_TOOL_DEF = {
     },
 }
 
-# PTC 模式的 world_run：schema 中唯一的工具，描述对齐 DSH PTC 的契约句式
-_WORLD_RUN_PTC_TOOL_DEF = {
-    "name": "world_run",
+_WRITE_FILE_TOOL_DEF = {
+    "name": "write_file",
     "description": (
-        "唯一能直接调用的工具：在持久的 Python 环境中执行一段代码。调用任何其它工具名都会失败；"
-        "respond(options) 与 read_file(file_path, ...) 是代码内的绑定函数，直接在程序里调用。"
-        "只有你 print 的内容会作为执行结果返回给你（用户看不到 print 输出），正文必须作为普通文本输出。"
-        "跨调用保留：全局对象 state、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失"
-        "（state、print、respond、read_file 是内置绑定名，同名定义不会被保留）。"
-        "原子执行：代码出错时自动回滚到执行前（state、函数、常量全部还原），不会留下半更新的状态。"
-        "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
-        "normalize 出错只回滚它自己的改动并记录，不影响本次代码的成果。"
-        "每次执行返回：日志、state 的变化 diff、normalize 错误（如有）。"
+        "写一个 UTF-8 文本文件并返回写入结果。"
+        "默认整篇覆盖（文件不存在就新建，父目录自动创建），mode=\"append\" 时追加到末尾（换行统一为 LF）。"
+        "相对路径以当前会话角色卡所在目录为基准，也支持绝对路径。"
+        "只改文件里的局部内容请用 edit_file，不要整篇重写。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "program": {
+            "file_path": {"type": "string", "description": "要写的文件路径（相对角色卡所在目录，或绝对路径）。"},
+            "content": {"type": "string", "description": "文件内容（整篇，或 mode=append 时要追加的部分）。"},
+            "mode": {
                 "type": "string",
-                "description": "要执行的 Python 代码。读取/修改 state，或在顶层定义函数供后续调用使用",
-            },
-            "description": {
-                "type": "string",
-                "description": "这段程序在做什么的简短摘要（5-10 词，展示在界面上）",
-            },
-            "dry": {
-                "type": "boolean",
-                "description": "试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。",
+                "enum": ["overwrite", "append"],
+                "description": "overwrite=整篇覆盖（默认），append=追加到末尾。",
             },
         },
-        "required": ["program"],
+        "required": ["file_path", "content"],
     },
 }
 
-_BASE_TOOLS = [_RESPOND_TOOL_DEF, _WORLD_RUN_TOOL_DEF, _READ_FILE_TOOL_DEF]
+_EDIT_FILE_TOOL_DEF = {
+    "name": "edit_file",
+    "description": (
+        "把文件里的一段文本精确替换成另一段（比整篇重写安全，不会动到其它部分）。"
+        "old_string 必须与文件内容逐字一致（含缩进与空行），且默认必须唯一，"
+        "不唯一时报错并要求给出更长的上下文；replace_all=true 时替换全部匹配。"
+        "不确定文件当前内容时先用 read_file 看一眼。"
+        "相对路径以当前会话角色卡所在目录为基准，也支持绝对路径。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "要修改的文件路径（相对角色卡所在目录，或绝对路径）。"},
+            "old_string": {"type": "string", "description": "要被替换掉的原文，必须与文件内容逐字一致。"},
+            "new_string": {"type": "string", "description": "替换成的新文本。"},
+            "replace_all": {
+                "type": "boolean",
+                "description": "old_string 出现多次时是否全部替换（默认 false，此时要求唯一）。",
+            },
+        },
+        "required": ["file_path", "old_string", "new_string"],
+    },
+}
+
+_BASH_TOOL_DEF = {
+    "name": "bash",
+    "description": (
+        "执行一段 shell 命令（Git Bash），返回退出码与合并后的输出（stdout 在前、stderr 在后）。"
+        "工作目录是当前会话角色卡所在目录。适合批量处理文件、跑脚本、查看环境这类事情；"
+        "命令有超时上限（默认 60 秒，最多 600 秒），超时会被终止。不要用它跑需要交互输入的命令。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "要执行的 shell 命令。"},
+            "timeout": {"type": "number", "description": "超时秒数，默认 60，最大 600。"},
+        },
+        "required": ["command"],
+    },
+}
+
+# 可以直接调用的工具（respond 是收尾契约，始终可用，不写进白名单）
+TOOL_NAMES = ("world_run", "read_file", "write_file", "edit_file", "bash")
+# 预设未声明 tools 字段时的默认工具集
+DEFAULT_TOOLS = ("world_run", "read_file")
+_TOOL_DEFS = {
+    "world_run": _WORLD_RUN_TOOL_DEF,
+    "read_file": _READ_FILE_TOOL_DEF,
+    "write_file": _WRITE_FILE_TOOL_DEF,
+    "edit_file": _EDIT_FILE_TOOL_DEF,
+    "bash": _BASH_TOOL_DEF,
+}
+
+
+def preset_tools(preset: dict) -> tuple:
+    """解析预设启用的工具，返回 (直接工具名单, world_run 内的绑定名)。
+
+    白名单语义：tools 列什么就只有什么（顺序即 schema 顺序），未声明时用 DEFAULT_TOOLS；
+    respond 是收尾契约、始终可用，不必写进列表（写了也忽略）。PTC 模式的 schema 只能有
+    world_run（它是该模式的唯一直接工具），tools 列表决定它程序内可用的绑定函数。
+    """
+    raw = preset.get("tools")
+    if raw is None:
+        names = list(DEFAULT_TOOLS)
+    else:
+        if not isinstance(raw, list):
+            raise ValueError(f"预设 {preset.get('id')} 的 tools 必须是工具名列表: {raw!r}")
+        names = []
+        for n in raw:
+            if n == "respond":
+                continue
+            if n not in TOOL_NAMES:
+                raise ValueError(
+                    f"预设 {preset.get('id')} 的 tools 含未知工具 {n!r}（可选: {', '.join(TOOL_NAMES)}）"
+                )
+            if n not in names:
+                names.append(n)
+    bindings = [n for n in names if n != "world_run"]
+    if preset.get("ptc"):
+        return ["world_run"], bindings
+    return names, bindings
+
+
+def session_tools(state: dict) -> tuple:
+    """按会话预设解析 (直接工具名单, 绑定名)。预设不存在时 KeyError（交由调用方处理）。"""
+    return preset_tools(load_presets()[state["preset"]])
+
+
+def apply_preset_tools(config: dict, state: dict) -> None:
+    """把预设决定的生成模式与工具白名单写进扁平 config（server 在生成/预览前调用）。"""
+    preset = load_presets()[state["preset"]]
+    direct, bindings = preset_tools(preset)
+    config["ptc"] = bool(preset.get("ptc"))
+    config["tools"] = direct
+    config["bindings"] = bindings
+
+
+def respond_tool_text(preset: dict) -> str:
+    """{{respond_tool}} 宏的内容：按预设模式与启用的工具组装任务提示词。
+
+    末尾保留一个换行，与旧版固定提示词逐字一致（否则老会话的缓存前缀整体失配）。
+    """
+    direct, bindings = preset_tools(preset)
+    text = _airp_prompt_ptc(bindings) if preset.get("ptc") else _airp_prompt(direct)
+    return text + "\n"
+
+
+def _world_run_ptc_def(bindings: list) -> dict:
+    """PTC 模式 world_run 的 schema（唯一直接工具）：描述里的绑定清单按启用情况生成。"""
+    sigs = {
+        "respond": "respond(options)",
+        "read_file": "read_file(file_path, ...)",
+        "write_file": "write_file(file_path, content, ...)",
+        "edit_file": "edit_file(file_path, old_string, new_string, ...)",
+        "bash": "bash(command, timeout, ...)",
+    }
+    named = [sigs[n] for n in ["respond", *bindings] if n in sigs]
+    joined = ("、".join(named[:-1]) + " 与 " + named[-1]) if len(named) > 1 else named[0]
+    reserved = "、".join(["state", "print", "respond", *bindings])
+    return {
+        "name": "world_run",
+        "description": (
+            "唯一能直接调用的工具：在持久的 Python 环境中执行一段代码。调用任何其它工具名都会失败；"
+            f"{joined} 是代码内的绑定函数，直接在程序里调用。"
+            "只有你 print 的内容会作为执行结果返回给你（用户看不到 print 输出），正文必须作为普通文本输出。"
+            "跨调用保留：全局对象 state、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失"
+            f"（{reserved} 是内置绑定名，同名定义不会被保留）。"
+            "原子执行：代码出错时自动回滚到执行前（state、函数、常量全部还原），不会留下半更新的状态。"
+            "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
+            "normalize 出错只回滚它自己的改动并记录，不影响本次代码的成果。"
+            "每次执行返回：日志、state 的变化 diff、normalize 错误（如有）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "program": {
+                    "type": "string",
+                    "description": "要执行的 Python 代码。读取/修改 state，或在顶层定义函数供后续调用使用",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "这段程序在做什么的简短摘要（5-10 词，展示在界面上）",
+                },
+                "dry": {
+                    "type": "boolean",
+                    "description": "试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。",
+                },
+            },
+            "required": ["program"],
+        },
+    }
 
 
 def _to_responses_format(tool: dict) -> dict:
@@ -173,12 +349,16 @@ def _to_chat_completions_format(tool: dict) -> dict:
     return {"type": "function", "function": tool}
 
 
-def get_tools(api_type: str, ptc: bool = False) -> list:
-    """根据 api_type 返回对应格式的工具定义。ptc 模式下 schema 只含 world_run。"""
+def get_tools(api_type: str, ptc: bool, direct: list, bindings: list) -> list:
+    """按 api_type 返回工具 schema（顺序同预设白名单）。
+
+    ptc 模式的 schema 只含 world_run（该模式的唯一直接工具，bindings 决定它程序内的绑定）；
+    普通模式是 respond + 白名单里的直接工具。
+    """
     if ptc:
-        base = [_WORLD_RUN_PTC_TOOL_DEF]
+        base = [_world_run_ptc_def(bindings)]
     else:
-        base = _BASE_TOOLS
+        base = [_RESPOND_TOOL_DEF] + [_TOOL_DEFS[n] for n in direct]
     if api_type == "chat_completions":
         return [_to_chat_completions_format(t) for t in base]
     return [_to_responses_format(t) for t in base]
@@ -256,8 +436,11 @@ def load_presets() -> dict:
             "name": meta.get("name") or p.stem,
             "description": meta.get("description") or "",
             "sections": sections,
-            # PTC 实验模式：schema 只含 world_run，respond/read_file 是代码内绑定
+            # PTC 实验模式：schema 只含 world_run，其它工具是代码内绑定
             "ptc": bool(meta.get("ptc")),
+            # 启用的工具白名单（frontmatter 的 tools 列表）；缺省/None = world_run + read_file。
+            # 合法性在 preset_tools 里校验，非法直接报错（不静默兜底）
+            "tools": meta.get("tools"),
             # 用户输入后处理模板,渲染时提供 user_input 变量;缺省 None 表示原样透传
             "user_input_template": uim.group(1).strip() if uim else None,
         }
@@ -656,7 +839,7 @@ def build_input(state: dict, history: list, draft=None) -> list:
         "game_setting": card["setting"],
         "game_beginning": state["beginning_text"],
         "user_setting": card["user_setting"],
-        "respond_tool": AIRP_PROMPT_PTC if preset.get("ptc") else AIRP_PROMPT,
+        "respond_tool": respond_tool_text(preset),
     }
     if api_type == "chat_completions":
         return _build_input_chat_completions(state, history, draft, preset, env)

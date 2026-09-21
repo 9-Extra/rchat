@@ -114,6 +114,12 @@ def get_session(name: str):
         state["endpoint"] = core.resolve_endpoint_index(state.get("endpoint"), config)
         state["temperature"] = core.resolve_temperature(state.get("temperature"), config)
         state["max_tokens"] = core.resolve_max_tokens(state.get("max_tokens"), config)
+        # 正在进行的一轮生成：本轮还没落盘（用户输入、被替换的旧 AI 块），
+        # 前端靠这两个字段把界面还原出来，再接 /stream 续看
+        gen = _gen_of(name)
+        state["generating"] = (
+            {"mode": gen["mode"], "user_input": gen["user_input"]} if gen else None
+        )
         return state
     except FileNotFoundError:
         raise HTTPException(404, "session 不存在")
@@ -284,7 +290,8 @@ def preview(req: Preview):
         input_items = core.build_input(state, history, draft=req.input or None)
         # 合并选中端点与会话生成参数覆盖，预览展示实际生效的请求参数
         config = core.effective_config(state, core.load_config())
-        config["ptc"] = core.load_presets()[state["preset"]].get("ptc", False)
+        # 预设决定的生成模式与工具白名单（ptc / tools / bindings）
+        core.apply_preset_tools(config, state)
         config["reasoning_effort"] = core.resolve_reasoning_effort(
             state.get("reasoning_effort"), config
         )
@@ -297,12 +304,45 @@ def preview(req: Preview):
 
 # ---------- 流式对话 ----------
 
-# 每个 session 当前正在进行的生成任务，用于打断
+# 每个 session 本轮生成的状态：转发（events/wake）、重连续看（重放 events）、打断（task）
 _active: dict = {}
 
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _gen_of(name: str) -> dict | None:
+    """该会话当前正在进行的生成；没在跑（或刚结束）时为 None。"""
+    gen = _active.get(name)
+    return None if gen is None or gen["finished"] else gen
+
+
+def _emit(gen: dict, event: dict) -> None:
+    """向本轮事件缓冲追加一个事件，并唤醒正在转发的请求。"""
+    gen["events"].append(_sse(event))
+    gen["wake"].set()
+
+
+async def _tail(gen: dict):
+    """把本轮已产出的事件转发给这个客户端。
+
+    客户端断开只打断本请求(Starlette 取消的是请求任务),生成任务不受影响;
+    重连时从头重放即可,所以不需要偏移量。
+    """
+    i = 0
+    while True:
+        gen["wake"].clear()  # 先清后查，避免漏掉刚好追加的事件
+        while i < len(gen["events"]):
+            yield gen["events"][i]
+            i += 1
+        if gen["finished"]:
+            return
+        try:
+            await asyncio.wait_for(gen["wake"].wait(), timeout=15)
+        except asyncio.TimeoutError:
+            # 心跳：长思考/慢接口期间别让手机 NAT 掐掉空闲连接
+            yield ": ping\n\n"
 
 
 def _persist(name, history, mode, user_input, draft, content, options, reasoning, tool_calls, error=None):
@@ -326,49 +366,66 @@ def _persist(name, history, mode, user_input, draft, content, options, reasoning
     core.save_history(name, history)
 
 
-async def _generate(name: str, mode: str, user_input: str | None):
-    """mode: start（首轮）/ chat（带用户输入）/ regenerate（重发最后一轮）。"""
-    _active[name] = asyncio.current_task()
-    history = []
+def _prepare(name: str, mode: str, user_input: str | None) -> dict:
+    """流式开始前的全部准备与校验；用户侧错误以 ValueError 抛出。"""
+    state = core.load_state(name)
+    history = core.load_history(name)
     draft = None
+    if mode == "start":
+        if history:
+            raise ValueError("会话已开始，不能再次开局")
+    elif mode == "chat":
+        if not history or history[-1]["role"] != "assistant":
+            raise ValueError("当前不能发送：没有待回复的 AI 块")
+        draft = user_input
+    else:  # regenerate：丢弃最后一个 AI 块，用它回复的用户输入重新生成
+        if history and history[-1]["role"] == "assistant":
+            history.pop()
+        if history and history[-1]["role"] == "user":
+            draft = history.pop()["content"]
+    # 世界状态对齐到当前历史长度（重生成/回滚后状态跟着回退；
+    # 上一轮被打断时丢弃未提交的内存改动）
+    world.sync(name, len(history))
+    input_items = core.build_input(state, history, draft=draft)
+    # 合并选中端点与会话生成参数覆盖，得到 llm 使用的扁平 config
+    config = core.effective_config(state, core.load_config())
+    # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
+    config["chat_id"] = state.get("chat_id", "")
+    # PTC 实验模式与工具白名单由预设 frontmatter 决定（ptc / tools）
+    core.apply_preset_tools(config, state)
+    # 思考强度按会话覆盖（会话值非法/缺失时回退 config 默认；非法默认在此报错）
+    config["reasoning_effort"] = core.resolve_reasoning_effort(
+        state.get("reasoning_effort"), config
+    )
+    return {
+        "name": name,
+        "mode": mode,
+        "user_input": user_input,
+        "history": history,
+        "draft": draft,
+        "input_items": input_items,
+        "config": config,
+    }
+
+
+async def _run(gen: dict, prep: dict) -> None:
+    """本轮生成的生产者：事件写进 gen["events"]，结束时（被打断/出错时亦然）落盘。"""
+    name = prep["name"]
+    mode = prep["mode"]
+    user_input = prep["user_input"]
+    draft = prep["draft"]
+    history = prep["history"]
     tool_calls = []
     partial_content = ""
     # 当前未完成轮(自上次工具事件后)累积的思维链;打断落盘时作为 respond 前的 reasoning
     tail_reasoning = ""
     streaming_started = False
     try:
-        state = core.load_state(name)
-        history = core.load_history(name)
-        if mode == "start":
-            if history:
-                raise ValueError("会话已开始，不能再次开局")
-        elif mode == "chat":
-            if not history or history[-1]["role"] != "assistant":
-                raise ValueError("当前不能发送：没有待回复的 AI 块")
-            draft = user_input
-        else:  # regenerate：丢弃最后一个 AI 块，用它回复的用户输入重新生成
-            if history and history[-1]["role"] == "assistant":
-                history.pop()
-            if history and history[-1]["role"] == "user":
-                draft = history.pop()["content"]
-        # 世界状态对齐到当前历史长度（重生成/回滚后状态跟着回退；
-        # 上一轮被打断时丢弃未提交的内存改动）
-        world.sync(name, len(history))
-        input_items = core.build_input(state, history, draft=draft)
-        # 合并选中端点与会话生成参数覆盖，得到 llm 使用的扁平 config
-        config = core.effective_config(state, core.load_config())
-        # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
-        config["chat_id"] = state.get("chat_id", "")
-        # PTC 实验模式由预设 frontmatter 的 ptc: true 开启
-        config["ptc"] = core.load_presets()[state["preset"]].get("ptc", False)
-        # 思考强度按会话覆盖（会话值非法/缺失时回退 config 默认；非法默认在此报错）
-        config["reasoning_effort"] = core.resolve_reasoning_effort(
-            state.get("reasoning_effort"), config
-        )
         done = None
         streaming_started = True
-        run_tool = lambda tool_name, arguments: tools.execute_tool(name, tool_name, arguments)
-        async for event in stream_respond(input_items, config, run_tool):
+        async def run_tool(tool_name, arguments):
+            return await tools.execute_tool(name, tool_name, arguments)
+        async for event in stream_respond(prep["input_items"], prep["config"], run_tool):
             if event["type"] == "done":
                 done = event
             elif event["type"] == "content":
@@ -388,7 +445,7 @@ async def _generate(name: str, mode: str, user_input: str | None):
                     tc["terminal"] = True
                 tool_calls.append(tc)
                 tail_reasoning = ""
-            yield _sse(event)
+            _emit(gen, event)
         if done is None:
             raise RuntimeError("API 未返回完整结果")
         # 成功后一次性落盘
@@ -427,7 +484,7 @@ async def _generate(name: str, mode: str, user_input: str | None):
         # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
         world.abort_turn(name)
         logger.warning("会话 %s 用户侧错误: %s", name, e)
-        yield _sse({"type": "error", "message": str(e), "popup": True})
+        _emit(gen, {"type": "error", "message": str(e), "popup": True})
     except Exception as e:
         # 后端/API 错误：控制台保留完整堆栈。半截结果照打断的先例落盘（带 error
         # 标记），让用户看到到底发生了什么，可修改/回滚/重新输出；已执行的工具
@@ -450,21 +507,67 @@ async def _generate(name: str, mode: str, user_input: str | None):
             world.commit_turn(name, len(history))
         else:
             world.abort_turn(name)
-        yield _sse({"type": "error", "message": str(e), "persisted": streaming_started})
+        _emit(gen, {"type": "error", "message": str(e), "persisted": streaming_started})
     finally:
-        _active.pop(name, None)
+        gen["finished"] = True
+        gen["wake"].set()
+        if _active.get(name) is gen:
+            _active.pop(name, None)
+
+
+async def _generate(name: str, mode: str, user_input: str | None):
+    """mode: start（首轮）/ chat（带用户输入）/ regenerate（重发最后一轮）。
+
+    生成跑在会话级后台任务 _run 里，本请求只把事件转发给客户端：客户端断开
+    （刷新、掉线、锁屏）只停这一次转发，生成继续跑完并落盘，重连走 /stream 续看。
+    """
+    if _gen_of(name) is not None:
+        yield _sse({"type": "error", "message": "该会话已有生成在进行中", "popup": True})
+        return
+    try:
+        prep = _prepare(name, mode, user_input)
+    except ValueError as e:
+        # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
+        world.abort_turn(name)
+        logger.warning("会话 %s 用户侧错误: %s", name, e)
+        yield _sse({"type": "error", "message": str(e), "popup": True})
+        return
+    gen = {
+        "task": None,
+        "events": [],
+        "wake": asyncio.Event(),
+        "finished": False,
+        "mode": mode,
+        "user_input": user_input,
+    }
+    gen["task"] = asyncio.create_task(_run(gen, prep))
+    _active[name] = gen
+    async for chunk in _tail(gen):
+        yield chunk
 
 
 @app.post("/api/sessions/{name}/interrupt")
 async def interrupt(name: str):
-    task = _active.get(name)
-    if task is not None:
-        task.cancel()
+    gen = _gen_of(name)
+    if gen is not None:
+        gen["task"].cancel()
         try:
-            await task  # 等半截输出落盘后再返回
+            await gen["task"]  # 等半截输出落盘后再返回
         except BaseException:
             pass
     return {"ok": True}
+
+
+@app.get("/api/sessions/{name}/stream")
+async def stream(name: str):
+    """接上该会话正在进行的生成：从头重放本轮事件，直到本轮结束。幂等，可多个客户端同时接。
+
+    没有进行中的生成时返回立即结束的空流（前端据此回到按 history 渲染）。
+    """
+    gen = _gen_of(name)
+    if gen is None:
+        return StreamingResponse(iter(()), media_type="text/event-stream")
+    return StreamingResponse(_tail(gen), media_type="text/event-stream")
 
 
 class ChatInput(BaseModel):
