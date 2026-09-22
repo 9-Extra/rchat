@@ -386,6 +386,9 @@ def render_template(text: str, env: dict) -> str:
     """
     def repl(m: re.Match) -> str:
         expr = m.group(1).strip()
+        # 允许空表达式和"注释"
+        if len(expr) == 0 or expr[0] == "#":
+            return ""
         try:
             return str(eval(expr, dict(env)))
         except Exception as e:
