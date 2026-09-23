@@ -100,6 +100,8 @@
   .options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
   .options button { background: #253047; border-color: #35466b; color: #a9c4f5; font-size: 12px; border-radius: 20px; padding: 4px 14px; max-width: 100%; white-space: normal; text-align: left; }
   .options button:hover { background: #2c3a58; border-color: #4a5f8f; }
+  .options-pending, .options-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); color: var(--dim); font-size: 12px; }
+  .options-error button { font-size: 12px; padding: 2px 9px; background: rgba(35,38,46,.9); }
   details.thinking { margin-bottom: 10px; background: #191b20; border: 1px solid #26282f; border-radius: 8px; padding: 7px 12px; }
   details.thinking summary { color: #7a9b7a; font-size: 12px; cursor: pointer; }
   details.thinking div { white-space: pre-wrap; color: #9095a0; font-size: 13px; margin-top: 8px; line-height: 1.7; }
@@ -227,6 +229,7 @@
           <option value="high">高</option>
           <option value="max">最高</option>
         </select></label>
+        <label>选项 <input type="checkbox" id="optionsToggle"></label>
         <label>温度 <input type="number" id="tempInput" min="0" max="2" step="0.1"></label>
         <label>上限 <input type="number" id="maxTokensInput" min="1" step="1000"></label>
         <button id="previewBtn">预览上下文</button>
@@ -385,6 +388,7 @@ function render() {
   renderEndpointSelect();
   // 后端在 GET 会话时已解析出实际生效值
   $('effortSelect').value = cur.reasoning_effort || 'low';
+  $('optionsToggle').checked = !!cur.options_enabled;
   $('tempInput').value = cur.temperature ?? '';
   $('maxTokensInput').value = cur.max_tokens ?? '';
   const chat = $('chat');
@@ -437,6 +441,36 @@ function makeOpsBtn(text, fn) {
   return b;
 }
 
+// 剧情推进选项按钮：历史块与流式渲染共用
+function optionsDiv(options) {
+  const opts = document.createElement('div');
+  opts.className = 'options';
+  options.forEach(o => {
+    const b = document.createElement('button');
+    b.textContent = o;
+    b.onclick = () => { $('input').value = o; send(); };
+    opts.appendChild(b);
+  });
+  return opts;
+}
+
+// 选项生成失败：淡色一行说明 + 重试按钮（历史块与流式渲染共用）
+function optionsErrorDiv(message) {
+  const d = document.createElement('div');
+  d.className = 'options-error';
+  const span = document.createElement('span');
+  span.textContent = `〔选项生成失败〕${message}`;
+  d.appendChild(span);
+  d.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
+  return d;
+}
+
+// AI 块的选项区只留一份（占位/按钮/错误提示互斥），换形态前清掉旧的
+function setOptionsArea(div, node) {
+  div.querySelectorAll('.options, .options-pending, .options-error').forEach(el => el.remove());
+  if (node) div.appendChild(node);
+}
+
 function makeBeginningBlock() {
   const div = document.createElement('div');
   div.className = 'block beginning';
@@ -482,17 +516,8 @@ function makeAIBlock(e, i) {
     aiMiddleHTML(e) +
     (e.error ? `<div class="errnote">〔生成出错〕${esc(e.error)}</div>` : '') +
     `<div class="content markdown">${renderMarkdown(e.content)}</div>`;
-  if (e.options && e.options.length) {
-    const opts = document.createElement('div');
-    opts.className = 'options';
-    e.options.forEach(o => {
-      const b = document.createElement('button');
-      b.textContent = o;
-      b.onclick = () => { $('input').value = o; send(); };
-      opts.appendChild(b);
-    });
-    div.appendChild(opts);
-  }
+  if (e.options && e.options.length) div.appendChild(optionsDiv(e.options));
+  if (e.options_error) div.appendChild(optionsErrorDiv(e.options_error));
   const ops = document.createElement('div');
   ops.className = 'ops';
   ops.appendChild(makeOpsBtn('修改', () => editBlock(div, e.content, async text => {
@@ -500,8 +525,12 @@ function makeAIBlock(e, i) {
     cur.history[i].content = text; render();
   })));
   // 只允许最后一个 AI 块重新输出
-  if (i === cur.history.length - 1)
+  if (i === cur.history.length - 1) {
     ops.appendChild(makeOpsBtn('重新输出', regenerate));
+    // 开了选项开关时，最后一轮还能只重掷选项（正文不动）
+    if (cur.options_enabled)
+      ops.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
+  }
   div.appendChild(ops);
   return div;
 }
@@ -550,7 +579,7 @@ const post = obj => ({ method: 'POST', headers: { 'Content-Type': 'application/j
 // 连续重连次数：接上（或正常收尾）后归零，用来在长时间断网时放弃等待
 let reconnectTries = 0;
 
-async function streamInto(url, opts, userText) {
+async function streamInto(url, opts, userText, reuseAI) {
   streaming = true; updateComposer();
   const chat = $('chat');
   // 用户输入块立即显示；断线重连会丢掉本次尝试画出的块重画，用户块由调用方每轮重新传入
@@ -560,11 +589,20 @@ async function streamInto(url, opts, userText) {
     u.innerHTML = `<div class="tag">你</div><div class="content">${esc(userText)}</div>`;
     chat.appendChild(u);
   }
-  const div = document.createElement('div');
-  div.className = 'block ai live';
-  div.innerHTML = `<div class="tag">AI（生成中…）</div>
-    <div class="content"></div>`;
-  chat.appendChild(div);
+  let div;
+  if (reuseAI) {
+    // 只重生成选项：正文已落盘，复用最后一个 AI 块（流里只有选项事件，正文保持不动）
+    div = reuseAI;
+    div.classList.add('live');
+    div.querySelector('.tag').textContent = 'AI（生成选项中…）';
+    div.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  } else {
+    div = document.createElement('div');
+    div.className = 'block ai live';
+    div.innerHTML = `<div class="tag">AI（生成中…）</div>
+      <div class="content"></div>`;
+    chat.appendChild(div);
+  }
   scrollBottom();
   const contentDiv = div.querySelector('.content');
   contentDiv.classList.add('markdown');
@@ -614,15 +652,34 @@ async function streamInto(url, opts, userText) {
           thinkDiv = null;
           scrollBottom();
         }
+        // 正文之后的选项请求：先淡色占位，拿到后换成按钮；失败换成提示+重试
+        else if (ev.type === 'options_start') {
+          const p = document.createElement('div');
+          p.className = 'options-pending';
+          p.textContent = '生成选项中…';
+          setOptionsArea(div, p);
+          scrollBottom();
+        }
+        else if (ev.type === 'options') {
+          setOptionsArea(div, optionsDiv(ev.options));
+          scrollBottom();
+        }
+        else if (ev.type === 'options_error') {
+          setOptionsArea(div, optionsErrorDiv(ev.message));
+          scrollBottom();
+        }
         else if (ev.type === 'error') {
           // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块。
           // 半截输出已落盘时保留已流出的正文，错误说明另起一行（刷新后按 history 重渲染）
           if (ev.popup) alert(ev.message);
-          div.querySelector('.tag').textContent = '出错';
-          if (ev.persisted && contentDiv.textContent)
-            contentDiv.textContent += `\n\n〔生成出错〕${ev.message}`;
-          else
-            contentDiv.textContent = ev.message;
+          // 只重掷选项时正文不动，错误只弹窗提示
+          if (!reuseAI) {
+            div.querySelector('.tag').textContent = '出错';
+            if (ev.persisted && contentDiv.textContent)
+              contentDiv.textContent += `\n\n〔生成出错〕${ev.message}`;
+            else
+              contentDiv.textContent = ev.message;
+          }
         }
       }
     }
@@ -655,9 +712,16 @@ async function reconnectTurn(userText) {
     return;
   }
   await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** reconnectTries, 5000)));
+  // 只重掷选项的这一轮：正文已落盘，复用最后一个 AI 块（它带着 .live，先摘掉，
+  // 免得被下面那句当成"这次尝试画出的块"删掉、让正文闪空一下）
+  let reuseAI = null;
+  if (s && s.generating && s.generating.mode === 'options') {
+    const ai = $('chat').querySelectorAll('.block.ai');
+    if (ai.length) { reuseAI = ai[ai.length - 1]; reuseAI.classList.remove('live'); }
+  }
   // 丢掉这次尝试画出的块，从 /stream 重放整轮
   $('chat').querySelectorAll('.live').forEach(el => el.remove());
-  await streamInto(`/api/sessions/${enc()}/stream`, {}, userText);
+  await streamInto(`/api/sessions/${enc()}/stream`, {}, userText, reuseAI);
 }
 
 // 页面加载/回到前台时接上后端正在进行的这一轮（刷新、锁屏、掉线都能续看）
@@ -670,7 +734,13 @@ async function attachTurn() {
     if (blocks.length) blocks[blocks.length - 1].remove();
   }
   reconnectTries = 0;
-  await streamInto(`/api/sessions/${enc()}/stream`, {}, g.mode === 'chat' ? g.user_input : null);
+  // options（只重掷选项）：正文已落盘、与输入无关，别删最后一个 AI 块，复用它接选项事件
+  let reuseAI = null;
+  if (g.mode === 'options') {
+    const blocks = $('chat').querySelectorAll('.block.ai');
+    if (blocks.length) reuseAI = blocks[blocks.length - 1];
+  }
+  await streamInto(`/api/sessions/${enc()}/stream`, {}, g.mode === 'chat' ? g.user_input : null, reuseAI);
 }
 
 async function interrupt() {
@@ -695,6 +765,14 @@ function regenerate() {
   const blocks = $('chat').querySelectorAll('.block.ai');
   if (blocks.length) blocks[blocks.length - 1].remove();
   streamInto(`/api/sessions/${enc()}/regenerate`, { method: 'POST' });
+}
+
+// 只重掷最后一轮的选项（正文不动，不新增块）：复用最后一个 AI 块接选项阶段的流
+function regenerateOptions() {
+  if (streaming || cur.generating) return;
+  const blocks = $('chat').querySelectorAll('.block.ai');
+  if (!blocks.length) return;
+  streamInto(`/api/sessions/${enc()}/regenerate_options`, { method: 'POST' }, null, blocks[blocks.length - 1]);
 }
 
 $('send').onclick = () => {
@@ -725,6 +803,11 @@ $('presetSelect').onchange = async e => {
 $('effortSelect').onchange = async e => {
   await api(`/api/sessions/${enc()}/reasoning_effort`, post({ effort: e.target.value }));
   cur.reasoning_effort = e.target.value;
+};
+// 选项开关：关掉后正文照常生成、不再发选项请求；不影响进行中的流
+$('optionsToggle').onchange = async e => {
+  const s = await api(`/api/sessions/${enc()}/options`, post({ enabled: e.target.checked }));
+  cur.options_enabled = s.options_enabled;
 };
 $('endpointSelect').onchange = async e => {
   await api(`/api/sessions/${enc()}/endpoint`, post({ index: +e.target.value }));

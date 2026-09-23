@@ -1,66 +1,104 @@
-# 用于AIRP的后端
+# 用于 AIRP 的后端
 
-一个究极简化版的SillyTavern，运行后启动一个后端并打开网站，和AI对话
+一个究极简化版的 SillyTavern：启动后端并打开网页，和 AI 对话。
 
-# 用法
+## 用法
+
+```
 uv run -m main
-默认在端口25530上启动一个双栈访问的服务器，并自动打开浏览器
-`--keep-awake`（默认开）在服务运行期间调 Windows 的 `SetThreadExecutionState` 阻止系统空闲睡眠/休眠，`--no-keep-awake` 关闭；非 Windows 平台自动忽略。
+```
 
-AI在测试时应使用uv run -m main --port 25531 --no-browser --no-keep-awake避免和用户冲突
+默认 25530 端口、双栈、自动开浏览器。`--keep-awake`（默认开）在运行期间调 Windows 的 `SetThreadExecutionState` 阻止系统空闲睡眠/休眠，`--no-keep-awake` 关闭；非 Windows 平台自动忽略。
 
-# 配置
-`config.yaml` 控制模型连接与生成参数：
+**测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 
-- `endpoints`：模型端点列表，可定义多个，前端按会话切换；程序启动时校验，为空直接报错退出。每个端点必填 `api_base` / `model` / `api_key`，可选 `display_name`（前端显示名，缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`（缺省 false）。端点身份 = 列表下标，重排列表会改变旧会话的指向。
-- 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `user_agent`（覆盖 SDK 默认 UA）。
-- 按会话覆盖：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` 都存 state.json，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`）。创建会话时继承上一个会话（created_at 最大者）的这四项；无会话时回退端点 0 + config 默认值。会话值非法/缺失时回退 config 默认；config 值非法直接报错。fork 自动继承。`reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置时按 `low`；`none` 表示禁用思考（请求带 `"thinking": {"type": "disabled"}`）。
-- `x_opencode_session`：`true` 时每个会话的请求带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控要求，用于 GPU KV 缓存亲和调度）。UUID 存于会话 state.json 的 `chat_id` 字段，创建会话时生成，fork 出的新会话换新值。
+## 配置（config.yaml）
 
-server 在生成/预览时用 `core.effective_config(state, config)` 把选中端点与会话覆盖合并成扁平 config 传给 llm（llm 本身不感知多端点）。切换 `api_type` 时，上下文拼装、工具 schema、流式调用实现会自动切换；落盘的 `history.jsonl` 格式不变。
+- `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
+- 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `options_enabled` / `user_agent`（覆盖 SDK 默认 UA）。
+- 可按会话覆盖（存 state.json）：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` / `options_enabled`，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`、`/options`）。新会话继承 created_at 最大的那个会话的这几项，无会话时用端点 0 + config 默认；会话值非法/缺失回退 config 默认，config 值非法直接报错；fork 自动继承。
+- `reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置按 `low`；`none` = 禁用思考（请求带 `"thinking": {"type": "disabled"}`）。
+- `options_enabled`（缺省 true）：正文之后要不要再发一次选项请求，见「选项生成」。
+- `x_opencode_session`：`true` 时每个会话的请求都带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控 / GPU KV 缓存亲和）。UUID 存在 state.json 的 `chat_id`，创建时生成，fork 换新值。
 
-# 预设和角色卡
-这两个概念来自SillyTavern，但本项目将它们大幅度简化
+生成/预览前 server 用 `core.effective_config(state, config)` 合并出扁平 config 交给 llm（llm 不感知多端点）。`api_type` 只影响上下文拼装、工具 schema 与流式实现，落盘的 `history.jsonl` 格式不变。
 
-预设：功能上是在不同的世界观定义间通用的AI主持指南，定义的通用的文风，禁词表，防止全知等。逻辑上预设控制了如何基于对话历史和角色卡构造最开头的输入模型的上下文，包含系统提示词。
-角色卡：功能上它的作用已经远超“定义单个角色”，或者把它叫“规则书”更合适。但逻辑上来说就是几个大字符串，预设通过宏决定将它插到上下文的什么地方。
+## 预设与角色卡
 
-预设格式由 `./preset/GM.md` 示例定义：用 `<preset_section role="system|user|assistant">` 块组织内容，只有 `<preset_section>` 是代码处理的格式标记，其它 xml 标签是预设的**内部文本**，原样发给模型。预设中可用宏：`{{game_setting}}` 替换为角色卡世界设定，`{{game_beginning}}` 替换为选中的开局，`{{user_setting}}` 替换为用户人设，`{{respond_tool}}` 替换为工具相关提示词。
+预设 = 通用的 AI 主持指南（文风、禁词、防止全知），决定如何基于角色卡与历史拼出最开头的上下文，含系统提示词；角色卡 = 几个大字符串（世界设定、用户人设、开局），由预设通过宏决定插到哪。
 
-宏的实现：所有{{...}}统一按Python表达式eval求值（app/core.py的render_template），上述四个固定宏只是求值环境中的同名变量。环境中还预置了random、time、math、datetime模块，可写{{random.randint(1,20)}}之类的表达式。严格模式：未知变量或执行出错直接抛ValueError，不做静默兜底。
+预设格式（示例 `./preset/GM.md`）：`<preset_section role="system|user|assistant">` 块组织内容。只有 `<preset_section>` 是代码处理的格式标记，其它 xml 标签是预设的**内部文本**，原样发给模型。宏：`{{game_setting}}`（世界设定）、`{{game_beginning}}`（选中的开局）、`{{user_setting}}`（用户人设）、`{{respond_tool}}`（工具相关提示词）。
 
-预设还可以包含<preset_user_input>块（前后空白会被trim），作为用户输入的后处理模板，渲染时额外提供user_input变量。该渲染只作用于当前这一轮发送给模型的内容，落盘的history仍是渲染前的原文，因此这类附加提示只在最新一轮可见（回滚拿到原文，重生成会重新渲染）。无此块时用户输入原样透传。
+宏实现：所有 `{{...}}` 按 Python 表达式 eval（`core.render_template`），四个固定宏就是求值环境里的同名变量；环境里还预置 random / time / math / datetime。严格模式：未知变量或求值出错直接抛 ValueError，不静默兜底。
 
-预设 frontmatter 可用 `tools` 列表定义本预设启用哪些工具（YAML 写法 `tools: ["read_file", "bash"]`）：白名单语义，列什么就只有什么（顺序即 schema 顺序）；未定义时用默认的 `world_run` + `read_file`。可选名：`world_run` / `read_file` / `write_file` / `edit_file` / `bash`；`respond` 是收尾契约、始终可用，不必写进列表（写了忽略）。未知工具名、非列表、非字符串项都在生成/预览时报 ValueError（`core.preset_tools`，不静默兜底）。`{{respond_tool}}` 渲染出的任务提示词（`core.respond_tool_text`）跟着白名单裁剪：没启用的工具不出现在提示词里，启用了 write_file/edit_file/bash 会额外附上各自的用法段；默认白名单下的输出与旧版固定提示词逐字一致（保持老会话的缓存前缀）。PTC 模式下 schema 只能是 world_run，白名单决定它程序内可用的绑定函数（见下文 PTC 模式）。
+`<preset_user_input>` 块（前后空白 trim）是用户输入的后处理模板，渲染时额外提供 `user_input`。它只作用于当前这一轮发给模型的内容，落盘的 history 仍是原文（回滚拿到原文，重生成会重新渲染）；没有这个块时用户输入原样透传。
 
-角色卡格式由 `<game_setting>`、`<user_setting>`、`<game_beginning>` 等 XML 块组成，宏名与上述固定宏同名。仓库内示例可参看 `./games/龙娘x猫娘.md`。
+预设 frontmatter 的 `tools` 是工具白名单：列什么就只有什么（顺序即 schema 顺序），未定义时用 `world_run` + `read_file`。可选 `world_run` / `read_file` / `write_file` / `edit_file` / `bash`；未知名字（含历史上的 `respond`）在生成/预览时抛 ValueError。`core.respond_tool_text` 渲染的任务提示词按白名单裁剪：没启用的工具不出现，启用 write_file/edit_file/bash 会附上用法段。PTC 模式下 schema 只有 world_run，这个列表决定它程序内的绑定函数。
 
-# 工具
-模型可直接调用的工具（schema 在 app/core.py；除 respond 外都由预设 frontmatter 的 `tools` 白名单决定启用与否，见上文）：
-- respond：提交剧情推进选项并结束本轮回复（只含 options，无选项传空数组）；必须是一轮回复的最后一次调用。正文不经过工具，是模型的普通文本输出，直接流式给用户。
-- world_run：持久 Python 环境（app/world.py）。每会话一个 exec 命名空间，state、顶层 def 函数、全大写全局变量（常量，识别规则 `^[A-Z][A-Z0-9_]*$`）三者持久化到 sessions/<name>/world/（state.json / lib.py / snapshots.json，函数与常量都存源码进 lib.py，重放时按 tree.body 顺序 exec）。快照按历史长度存档，回滚/重生成/打断时由 server 调 world.sync/abort_turn/commit_turn 保持状态与历史一致；快照只在改动过 world 的轮次结束时记一条，所以取某长度的状态时用 world._snapshot_at 回退到不晚于它的最近快照（两轮之间没改过状态），早于所有快照（那时世界状态还没建立）视为空状态——直接 `snapshots.get(str(len))` 会在开局前/未碰 world 的长度上静默保持最新状态，回滚失效；fork 时由 world.fork 用同一规则取断点处状态（及更早快照）复制到新会话。无超时保护
-- read_file：只读分页读文件（app/tools.py），默认/上限 2000 行、单次约 50KB，超出用 offset/limit 分页
-- write_file：写 UTF-8 文件（`mode=overwrite` 整篇覆盖/新建、`append` 追加到末尾；父目录自动创建，换行统一成 LF）
-- edit_file：把文件里的一段文字精确替换（old_string 逐字匹配、默认要求唯一，`replace_all=true` 全部替换；原文件的 LF/CRLF 风格保持不变）
-- bash：在 Git Bash 里执行一段 shell 命令，返回 `<cwd>/<exit_code>/<output>`（stdout+stderr 合并）；bash.exe 由 `tools._shell()` 探测并缓存（PATH → `C:\Program Files\Git\bin` 等常见位置），找不到时以错误文本返回；默认超时 60s、上限 600s，超时终止（Windows 上可能留下孙进程），输出超过 20000 字符只保留开头
+角色卡格式：`<game_setting>` / `<user_setting>` / `<game_beginning>` 等 XML 块，宏名同名；示例见 `./games/龙娘x猫娘.md`。
 
-文件类工具（read_file/write_file/edit_file）的相对路径基准与 bash 的工作目录都是当前会话角色卡所在目录（`tools._session_card_dir`，即 `games/<世界包>/`），也接受绝对路径；取不到角色卡目录时报错。`tools.execute_tool` 先按会话预设解析白名单，未启用的工具名返回带「本会话启用的直接工具」清单的错误文本（PTC 下还提示它是 world_run 内的绑定函数）。直接调用 bash 时经 `asyncio.to_thread` 跑（llm 的 run_tool 是 async 可调用），长命令不卡事件循环；world_run 内的 bash 绑定是同步执行，长命令会卡住服务端。工具的文件/shell 副作用不参与 world_run 的出错回滚（回滚只覆盖 state 与函数/常量）。
+## 工具
 
-两种 `api_type` 都支持这些工具的多轮调用。`responses` 模式下使用 Responses API 的 `function_call`/`function_call_output` 格式；`chat_completions` 模式下使用标准 OpenAI function-calling 的 `tool_calls`/`tool` 消息格式。落盘历史格式不变。
+schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正文始终是模型的普通文本输出、直接流式给用户，不经过任何工具。
 
-生成与 HTTP 连接解耦（server.py）：一轮生成跑在会话级后台任务里（`_run`，`_active[name]` 存本轮状态：task / events / wake / finished / mode / user_input），POST start|chat|regenerate 与 `GET /api/sessions/{name}/stream` 都只是把 `events` 里的 SSE 文本转发出去（`_tail`，15s 一次 `: ping` 心跳）。客户端断开（刷新、手机掉线、锁屏）只中断这次转发，生成照旧跑完并落盘；页面加载时看 `GET /api/sessions/{name}` 返回的 `generating`（`{mode, user_input}`，无进行中的生成则 null，本轮还没落盘，用户输入与被替换的旧 AI 块靠它还原），前端据此接上 `/stream` 重放整轮（幂等，可多客户端同时接），断了则退避重连。`_gen_of` 判定「正在生成」，生成中再次 POST 只返回一个 popup 错误，不会写重块。`/interrupt` 取消 `_run` 任务，落盘语义与下面一致。
+- **world_run**：持久 Python 环境（`app/world.py`）。每会话一个 exec 命名空间，三者持久化到 `sessions/<name>/world/`：state（state.json）、顶层 def 函数、全大写全局变量（常量，规则 `^[A-Z][A-Z0-9_]*$`）；函数与常量存源码进 lib.py，重放时按 `tree.body` 顺序 exec。无超时保护。
+- **read_file**：只读分页，默认/上限 2000 行、单次约 50KB，超出用 offset/limit 翻页。
+- **write_file**：写 UTF-8（`overwrite` 整篇覆盖/新建、`append` 追加；父目录自动创建，换行统一 LF）。
+- **edit_file**：精确替换一段文字（`old_string` 逐字匹配、默认要求唯一，`replace_all=true` 全部替换；原文件的 LF/CRLF 风格不变）。
+- **bash**：Git Bash 里跑命令，返回 `<cwd>/<exit_code>/<output>`。bash.exe 由 `tools._shell()` 探测并缓存（PATH → `C:\Program Files\Git\bin` 等），找不到以错误文本返回；默认超时 60s / 上限 600s，超时终止（Windows 上可能留下孙进程），输出超 20000 字符只留开头。
 
-生成失败的处理（server.py _generate）：后端/API 错误不再丢弃半截结果——照打断的先例落盘（正文或「（生成失败，无正文输出）」占位、已执行的 tool_calls、tail 思维链），entry 上加 error 字段（前端以「出错」标签+错误条显示；build_input 回放时忽略该字段，不进模型上下文），已执行的工具调用改动一并 commit 保持叙事与世界状态一致；用户可修改/回滚/重新输出。仅当尚未开始流式输出（无内容可落盘）时才只 abort 世界状态。
+文件类工具的相对路径基准与 bash 的工作目录都是**当前会话角色卡所在目录**（`games/<世界包>/`），也接受绝对路径；取不到卡目录时报错。`tools.execute_tool` 先按会话预设解析白名单，未启用的工具名返回带「本会话启用的直接工具」清单的错误文本。直接调 bash 走 `asyncio.to_thread`（不卡事件循环），world_run 内的 bash 绑定是同步执行（长命令卡住服务端）。工具的文件/shell 副作用不参与 world_run 的出错回滚（回滚只覆盖 state 与函数/常量）。
 
-一轮回复是工具循环（app/llm.py 的 stream_respond）：模型可多次调用启用的工具（respond 之外的 world_run/read_file/write_file/edit_file/bash 里白名单内的那些，PTC 下则是 world_run 内的绑定；执行结果追加进输入继续请求），最后一轮输出正文（普通文本）并调用 respond 提交选项收尾。history 格式不变（content/options/reasoning/tool_calls 都在 entry 上）。
+**world_run 快照**：按历史长度存进 `snapshots.json`，只在改动过 world 的轮次结束时记一条。取某长度的状态要用 `world._snapshot_at` 回退到不晚于它的最近快照（两轮之间状态没变），早于所有快照（世界状态还没建立）视为空状态——直接 `snapshots.get(str(len))` 会在开局前/未碰 world 的长度上静默保持最新状态，回滚失效。
 
-- `responses` 模式 build_input 回放：assistant 块 -> 工具循环的 function_call/output 对 + 正文 message + respond 调用（options JSON）+ "ok" 输出；user 块 -> 普通 user message，本次输入也拼成 user message，**请求以 user message 结尾**（不再是未闭合的工具循环）。
-- `chat_completions` 模式 build_input 回放：assistant 块拆分为标准 messages：每个 tool_call 对应一条 assistant(tool_calls) + 一条 tool 消息；正文对应一条 assistant(content)；respond 对应一条 assistant(tool_calls) + 一条 tool("ok") 消息；user 块和本次 draft 对应 user 消息。
+两种 `api_type` 都支持多轮工具调用：`responses` 用 `function_call`/`function_call_output`，`chat_completions` 用 `tool_calls`/`tool` 消息。落盘历史格式不变。
 
-respond 契约自动修复（llm.py）：v4-flash 的主要失败模式是写完正文后不调 respond 直接收笔（纯文本收尾），偶尔反向把正文写进思考里只调 respond；上下文中的完整示范轮（正文 + respond 调用）是最强的行为稳定器，示范轮越多失败越少——因此回放时无论有无选项都固定带 respond 调用。修复手段：模型把正文写进思考里只调 respond 时，把该调用作为工具错误回传让模型补齐，最多修复 2 次；respond 带空选项时同样回传错误（提示一次后模型再传空数组视为有意，接受）；纯文本收尾（没调 respond）时在正文后追加一条 user 元指令让模型补 respond——该消息只存在于本次工具循环，不落盘，无污染；修复用尽才宽容接受为无选项结束。契约校验与修复文案在两种模式间共用（`_contract_problems`/`_repair_text`/`_missing_respond_hint`）。
+## 一轮回复
+
+分两段，都是普通请求（`app/llm.py`）：
+
+1. **正文**（`stream_body`）：工具循环。模型可多次调用白名单内的工具（PTC 下是 world_run 内的绑定），结果追加进输入继续请求；**某一轮不再调用任何工具即视为说完**，回合结束（yield `done`，只含 content 与 reasoning）。全程没有内容、或超过 `MAX_ROUNDS`(25) 轮，都报错。
+2. **选项**（`generate_options`）：正文完成后，若 `options_enabled` 为真，再用同一份 config 发一次非流式请求，只要选项 JSON。
+
+history 条目：`{role, content, options, reasoning, tool_calls?}`，另有 `error` / `options_error` 两个失败标记（回放时都不进模型上下文）。
+
+### 上下文回放（core.build_input）
+
+- `responses`：每个 tool_call -> reasoning + function_call/output 对，正文 -> 一条普通 assistant message；user 块与本次输入都是普通 user message，**请求以 user message 结尾**。
+- `chat_completions`：每个 tool_call 一条 assistant(tool_calls) + 一条 tool 消息，正文一条 assistant(content)，user 块与 draft 对应 user 消息。
+- 都原样回放 `entry["tool_calls"]`；选项不参与回放。
+- `chat_completions` 每轮的 assistant 消息只回传**本轮新增**的正文（`content` 是跨轮累积量，整段回传会让模型把自己的正文反复读一遍）。
+- `responses` 上同一段思考只在它带来的第一个调用前放一次（`core._build_input_responses` 的 `prev_reasoning` 去重），否则一轮里多次调用会把整轮思考重复回放好几遍。
+
+### responses 的思考链约束
+
+deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自的一份 `reasoning_text`，否则 400**——一轮里模型发了两个调用而你只回放一份真文本会 400，连它自己产出的 trace 原样回放也会 400。所以 `llm._stream_body_responses` 中场追加时按调用逐个护航：轮首那份真实思考算第一份，其后每个调用补一个单空格占位（实测合法，空字符串不合法），不重复长文本。同一处还兜了 `output_item.added` 缺失的实现（只发 `reasoning_text.delta` / `output_text.delta`）。
+
+### 选项生成
+
+- **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 一条 user 指令（`core.OPTIONS_INSTRUCTION`：只要 2-4 条、只输出 `{"options": [...]}`、不要续写正文也不要调用工具）。
+- **缓存约束（实测 deepseek 官方端点）**：必须与正文请求共用同一份 config——同 model、同 tools、同 thinking / reasoning_effort，且**不加 `response_format`**。任一项不一致，前缀缓存命中率从 98% 掉到 6%；作为「正文请求的严格续写」它自身只在末尾多几十个 token（命中约 96%）。所以别给选项请求单独压低思考，也别用 `response_format`（该端点不支持 json_schema，`json_object` 同样往 prompt 头部插说明、打断前缀）。
+- **解析与兜底**（`core.parse_options`）：剥围栏 → `json.loads` → 退一步取第一个 `{` 到最后一个 `}`；失败追加一条提醒重发一次（`_OPTIONS_RETRY_HINT`，追加在末尾不影响前缀），仍失败则选项为空、错误写进 entry 的 `options_error`（前端给提示 +「重新生成选项」；与表示整轮失败的 `error` 区分）。正文不受影响。
+- 选项请求的 usage 以 INFO 一行打进日志（含缓存命中数，`llm._usage_note`）。
+- `POST /api/sessions/{name}/regenerate_options`（`_prepare_options` / `_run_options`）只重掷最后一轮的选项：不重新生成正文、不新增块、不碰 world。
 
 ## PTC 模式
-预设 frontmatter 加 `ptc: true`（如 preset/GM-ptc.md）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），其它工具降级为 world_run 持久命名空间内的 Python 绑定函数（app/world.py 的 `_bindings_for` 按预设 `tools` 白名单挂载：`_respond_binding` 恒定，read_file/write_file/edit_file/bash 各一个 `_*_binding`；签名写在 `{{respond_tool}}` 渲染出的 PTC 提示词和 world_run 的 schema 描述里，两处都由 core 按白名单拼）。叙事仍是普通文本；收尾 = 输出正文后调一次 world_run，程序末尾 respond(options=[...])——respond 抛 _TurnEnd(BaseException) 终止程序，world.run 返回 (结果文本, respond_info)，llm 检测到 respond_info 即校验契约（正文非空、选项非空提示一次）并结束回合，修复路径与 respond 工具版同构。终结调用在 history 的 tool_calls 里带 terminal: true 标记，回放时放在正文后（无终结调用的轮次合成 world_run(respond(options=...)) 兜底；回放拆分逻辑共用 `_split_tool_calls`）。保留名是 state/print/respond 加上当前启用的绑定名（world 的 `rt["reserved"]`），不允许模型的顶层 def/常量覆盖；会话中途切换预设由 `world._reconcile_bindings` 换掉绑定（保留当前 state 与函数定义）。
 
-# 会话 fork
-用户块上的「分支」按钮：POST /api/sessions/{name}/fork {index} 在用户块断点处复制出一个新会话（core.fork_session：state 复制 + history[:index]，新名为 原名-fork-时间戳，原会话不动），world.fork 按同一 index 复制世界状态。新会话末尾是 assistant 块（或空历史），可直接继续输入。
+预设 frontmatter 加 `ptc: true`（如 `preset/GM-ptc.md`）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），其余工具降级为 world_run 命名空间内的 Python 绑定函数（`world._bindings_for` 按白名单挂载 read_file/write_file/edit_file/bash 各一个 `_*_binding`；签名写在 `{{respond_tool}}` 提示词和 world_run 的 schema 描述两处，都由 core 按白名单拼）。叙事仍是普通文本，工具只用于判定与记账，回合结束同样是「某一轮不再调用任何工具」，选项与普通模式一样由正文后的独立请求生成。保留名是 state/print 加上当前启用的绑定名，不允许模型的顶层 def/常量覆盖；会话中途切换预设由 `world._reconcile_bindings` 原地换掉绑定（保留当前 state 与函数定义）。
+
+## 流式、落盘与失败
+
+生成与 HTTP 连接解耦：一轮生成跑在会话级后台任务里（`_run`；`_active[name]` 存 task / events / wake / finished / mode / user_input），POST `start|chat|regenerate|regenerate_options` 与 `GET /api/sessions/{name}/stream` 都只是把 `events` 里的 SSE 文本转发出去（`_tail`，15s 一次 `: ping` 心跳）。
+
+- 客户端断开（刷新、掉线、锁屏）只中断这次转发，生成照旧跑完并落盘。页面加载时看 `GET /api/sessions/{name}` 的 `generating`（`{mode, user_input}`，没在跑则 null，mode 可能是 `options`；本轮还没落盘，用户输入与被替换的旧 AI 块靠它还原），前端据此接上 `/stream` 重放整轮（幂等，可多客户端同时接），断了退避重连。
+- `_gen_of` 判定「正在生成」，生成中再次 POST 只返回一个 popup 错误；`/interrupt` 取消任务。
+- 事件类型：`reasoning` / `content` / `tool` / `done`（正文完成，不带 options）/ `options_start` / `options` / `options_error` / `error`。
+- 失败不丢半截结果：后端/API 错误照打断的先例落盘（正文或「（生成失败，无正文输出）」占位、已执行的 tool_calls、tail 思维链），entry 上加 `error`（前端以「出错」标签 + 错误条显示），已执行的工具调用改动一并 commit 保持叙事与状态一致。仅当尚未开始流式输出时才只 abort 世界状态。
+
+## 会话存储与操作
+
+`sessions/<name>/` 下有 `state.json`、`history.jsonl`、`world/`（state.json / lib.py / snapshots.json）。回滚/重生成/打断时 server 调 `world.sync` / `abort_turn` / `commit_turn` 让世界状态与历史对齐。
+
+- **回滚**（用户块上的按钮）：history 截断到该块之前。
+- **重生成**：丢掉最后一个 AI 块，用它回复的那条用户输入重发。
+- **fork**（`POST /api/sessions/{name}/fork {index}`）：在用户块断点处复制出新会话（`core.fork_session`：state 复制 + `history[:index]`，名字 `原名-fork-时间戳`，原会话不动），`world.fork` 按同一 index 复制世界状态。新会话末尾是 assistant 块（或空历史），可直接继续输入。

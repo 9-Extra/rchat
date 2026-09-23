@@ -1,6 +1,6 @@
 ---
 name: GM-ptc
-description: 作者9_Extra（PTC 实验：world_run 单工具，respond/read_file 为代码内绑定）
+description: 作者9_Extra（PTC 实验：world_run 单工具，read_file 等为代码内绑定）
 ptc: true
 ---
 <preset_section role="system">

@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app import core, tools, world
-from app.llm import build_request, stream_respond
+from app.llm import build_request, generate_options, stream_body
 
 logger = logging.getLogger("airp")
 
@@ -114,6 +114,9 @@ def get_session(name: str):
         state["endpoint"] = core.resolve_endpoint_index(state.get("endpoint"), config)
         state["temperature"] = core.resolve_temperature(state.get("temperature"), config)
         state["max_tokens"] = core.resolve_max_tokens(state.get("max_tokens"), config)
+        state["options_enabled"] = core.resolve_options_enabled(
+            state.get("options_enabled"), config
+        )
         # 正在进行的一轮生成：本轮还没落盘（用户输入、被替换的旧 AI 块），
         # 前端靠这两个字段把界面还原出来，再接 /stream 续看
         gen = _gen_of(name)
@@ -210,6 +213,19 @@ def set_params(name: str, req: SetParams):
             state["max_tokens"] = req.max_tokens
         else:
             raise HTTPException(400, f"max_tokens 必须是正整数: {req.max_tokens}")
+    core.save_state(state)
+    return state
+
+
+class SetOptions(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/sessions/{name}/options")
+def set_options(name: str, req: SetOptions):
+    """选项生成开关：关掉后正文照常生成，只是不再发那次选项请求。"""
+    state = core.load_state(name)
+    state["options_enabled"] = req.enabled
     core.save_state(state)
     return state
 
@@ -345,7 +361,8 @@ async def _tail(gen: dict):
             yield ": ping\n\n"
 
 
-def _persist(name, history, mode, user_input, draft, content, options, reasoning, tool_calls, error=None):
+def _persist(name, history, mode, user_input, draft, content, options, reasoning,
+             tool_calls, error=None, options_error=None):
     if mode == "chat":
         history.append({"role": "user", "content": user_input})
     elif mode == "regenerate" and draft is not None:
@@ -359,7 +376,10 @@ def _persist(name, history, mode, user_input, draft, content, options, reasoning
     # 生成失败时落盘的错误说明(前端显示;build_input 回放时忽略,不进模型上下文)
     if error:
         entry["error"] = error
-    # 回合内 respond 之前的 world_run/read_file 调用,重放上下文时用
+    # 选项请求失败:正文照常保留,只标注选项没拿到,前端据此给「重新生成选项」
+    if options_error:
+        entry["options_error"] = options_error
+    # 本轮的 world_run/read_file 调用,重放上下文时用
     if tool_calls:
         entry["tool_calls"] = tool_calls
     history.append(entry)
@@ -401,10 +421,13 @@ def _prepare(name: str, mode: str, user_input: str | None) -> dict:
         "name": name,
         "mode": mode,
         "user_input": user_input,
+        "state": state,
         "history": history,
         "draft": draft,
         "input_items": input_items,
         "config": config,
+        # 正文落盘后要不要再发一次选项请求（会话开关，见 core.resolve_options_enabled）
+        "options_enabled": core.resolve_options_enabled(state.get("options_enabled"), config),
     }
 
 
@@ -417,15 +440,17 @@ async def _run(gen: dict, prep: dict) -> None:
     history = prep["history"]
     tool_calls = []
     partial_content = ""
-    # 当前未完成轮(自上次工具事件后)累积的思维链;打断落盘时作为 respond 前的 reasoning
+    # 当前未完成轮(自上次工具事件后)累积的思维链;打断落盘时作为最后一轮的 reasoning
     tail_reasoning = ""
     streaming_started = False
     try:
         done = None
         streaming_started = True
+        options: list = []
+        options_error = None
         async def run_tool(tool_name, arguments):
             return await tools.execute_tool(name, tool_name, arguments)
-        async for event in stream_respond(prep["input_items"], prep["config"], run_tool):
+        async for event in stream_body(prep["input_items"], prep["config"], run_tool):
             if event["type"] == "done":
                 done = event
             elif event["type"] == "content":
@@ -433,21 +458,28 @@ async def _run(gen: dict, prep: dict) -> None:
             elif event["type"] == "reasoning":
                 tail_reasoning += event["delta"]
             elif event["type"] == "tool":
-                tc = {
+                tool_calls.append({
                     "name": event["name"],
                     "arguments": event["arguments"],
                     "result": event["result"],
                     # 产生该调用的那一轮思维链,重放时放在它的 function_call 前
                     "reasoning": event.get("reasoning", ""),
-                }
-                # PTC 终结调用（程序内调用了 respond 的 world_run），回放时放在正文后
-                if event.get("terminal"):
-                    tc["terminal"] = True
-                tool_calls.append(tc)
+                })
                 tail_reasoning = ""
             _emit(gen, event)
         if done is None:
             raise RuntimeError("API 未返回完整结果")
+        # 正文已经是完整一轮：选项是它之后的第二次请求，失败也不影响正文落盘
+        if prep["options_enabled"]:
+            _emit(gen, {"type": "options_start"})
+            options_input = core.build_options_input(
+                prep["state"], history, done["content"], tool_calls, done.get("reasoning", "")
+            )
+            options, options_error = await generate_options(options_input, prep["config"])
+            if options_error:
+                _emit(gen, {"type": "options_error", "message": options_error})
+            else:
+                _emit(gen, {"type": "options", "options": options})
         # 成功后一次性落盘
         _persist(
             name,
@@ -456,9 +488,10 @@ async def _run(gen: dict, prep: dict) -> None:
             user_input,
             draft,
             done["content"],
-            done["options"],
+            options,
             done.get("reasoning", ""),
             tool_calls,
+            options_error=options_error,
         )
         # 世界状态随历史提交,快照键为落盘后的历史长度
         world.commit_turn(name, len(history))
@@ -515,8 +548,64 @@ async def _run(gen: dict, prep: dict) -> None:
             _active.pop(name, None)
 
 
+def _prepare_options(name: str) -> dict:
+    """只重新生成选项：正文不动、不发正文请求。用户侧错误以 ValueError 抛出。"""
+    state = core.load_state(name)
+    history = core.load_history(name)
+    if not history or history[-1]["role"] != "assistant":
+        raise ValueError("最后一轮不是 AI 块，没有可以重新生成选项的对象")
+    entry = history[-1]
+    config = core.effective_config(state, core.load_config())
+    config["chat_id"] = state.get("chat_id", "")
+    core.apply_preset_tools(config, state)
+    config["reasoning_effort"] = core.resolve_reasoning_effort(
+        state.get("reasoning_effort"), config
+    )
+    return {
+        "name": name,
+        "config": config,
+        "input_items": core.build_options_input(
+            state,
+            history[:-1],
+            entry.get("content", ""),
+            entry.get("tool_calls", []),
+            entry.get("reasoning", ""),
+        ),
+    }
+
+
+async def _run_options(gen: dict, prep: dict) -> None:
+    """只重新生成选项的生产者：改写历史最后一轮的 options / options_error。"""
+    name = prep["name"]
+    try:
+        _emit(gen, {"type": "options_start"})
+        options, options_error = await generate_options(prep["input_items"], prep["config"])
+        history = core.load_history(name)
+        if not history or history[-1]["role"] != "assistant":
+            raise RuntimeError("最后一轮已不是 AI 块，选项无处可写")
+        entry = history[-1]
+        if options_error:
+            entry["options_error"] = options_error
+            _emit(gen, {"type": "options_error", "message": options_error})
+        else:
+            entry["options"] = options
+            entry.pop("options_error", None)
+            _emit(gen, {"type": "options", "options": options})
+        core.save_history(name, history)
+    except asyncio.CancelledError:
+        raise  # 用户打断：选项没生成出来，历史保持原样
+    except Exception as e:
+        logger.exception("会话 %s 重新生成选项失败", name)
+        _emit(gen, {"type": "error", "message": f"重新生成选项失败：{e}", "popup": True})
+    finally:
+        gen["finished"] = True
+        gen["wake"].set()
+        if _active.get(name) is gen:
+            _active.pop(name, None)
+
+
 async def _generate(name: str, mode: str, user_input: str | None):
-    """mode: start（首轮）/ chat（带用户输入）/ regenerate（重发最后一轮）。
+    """mode: start（首轮）/ chat（带用户输入）/ regenerate（重发最后一轮）/ options（只重生成选项）。
 
     生成跑在会话级后台任务 _run 里，本请求只把事件转发给客户端：客户端断开
     （刷新、掉线、锁屏）只停这一次转发，生成继续跑完并落盘，重连走 /stream 续看。
@@ -525,10 +614,11 @@ async def _generate(name: str, mode: str, user_input: str | None):
         yield _sse({"type": "error", "message": "该会话已有生成在进行中", "popup": True})
         return
     try:
-        prep = _prepare(name, mode, user_input)
+        prep = _prepare_options(name) if mode == "options" else _prepare(name, mode, user_input)
     except ValueError as e:
         # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
-        world.abort_turn(name)
+        if mode != "options":
+            world.abort_turn(name)
         logger.warning("会话 %s 用户侧错误: %s", name, e)
         yield _sse({"type": "error", "message": str(e), "popup": True})
         return
@@ -540,7 +630,9 @@ async def _generate(name: str, mode: str, user_input: str | None):
         "mode": mode,
         "user_input": user_input,
     }
-    gen["task"] = asyncio.create_task(_run(gen, prep))
+    gen["task"] = asyncio.create_task(
+        _run_options(gen, prep) if mode == "options" else _run(gen, prep)
+    )
     _active[name] = gen
     async for chunk in _tail(gen):
         yield chunk
@@ -592,4 +684,12 @@ def start(name: str):
 def regenerate(name: str):
     return StreamingResponse(
         _generate(name, "regenerate", None), media_type="text/event-stream"
+    )
+
+
+@app.post("/api/sessions/{name}/regenerate_options")
+def regenerate_options(name: str):
+    """只重新生成最后一轮的选项：正文不动，也不重新跑正文请求。"""
+    return StreamingResponse(
+        _generate(name, "options", None), media_type="text/event-stream"
     )

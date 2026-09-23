@@ -1,7 +1,6 @@
 """world_run 的持久 Python 执行环境（移植自 AIRP 预设的 node:vm 版）。
 
-每个会话一个 exec 命名空间：预置全局对象 state（dict）与 print，以及绑定函数
-respond(options)（提交选项并结束本轮，PTC 模式的收尾契约）与工具绑定
+每个会话一个 exec 命名空间：预置全局对象 state（dict）与 print，以及工具绑定
 （read_file/write_file/edit_file/bash，启用哪些由会话预设 frontmatter 的 tools 白名单
 决定，见 core.preset_tools，工具结果进当次日志）。绑定是命名空间内的普通函数，不是工具；
 预设可在会话中途切换，启用的工具集变化时按 _reconcile_bindings 原地重建命名空间。
@@ -36,15 +35,9 @@ DIFF_ENTRY_CAP = 60
 LOG_LINE_CAP = 2000
 LOG_COUNT_CAP = 100
 
-# respond() 被调用时抛出以终止程序。继承 BaseException，模型程序里的
-# except Exception 吞不掉它（try/finally 的 finally 仍照常执行）。
-class _TurnEnd(BaseException):
-    pass
-
-
 # 命名空间恒定内置名：不允许模型的顶层 def/常量覆盖（否则 lib 重放会遮蔽内置绑定）。
 # 启用的工具绑定名另由会话预设动态加入（见 _refresh_bindings）。
-BASE_RESERVED_NAMES = {"state", "print", "respond"}
+BASE_RESERVED_NAMES = {"state", "print"}
 
 # session 目录名 -> runtime: {"ns": dict, "lib": {name: source},
 #   "committed": {"state": ..., "lib": ...}, "turn_len": int, "logs": list|None,
@@ -207,20 +200,8 @@ def _bash_binding(rt, command, timeout=60):
     return _log_binding_call(rt, result)
 
 
-def _respond_binding(rt, options=None):
-    """命名空间内的 respond 绑定：记录选项并抛 _TurnEnd 终止程序，结束本轮回复。"""
-    if not rt.get("dry"):
-        if isinstance(options, list):
-            rt["respond"] = {"options": [str(o) for o in options]}
-        else:
-            rt["respond"] = {
-                "error": f"respond 的 options 必须是数组，收到 {type(options).__name__}"
-            }
-    raise _TurnEnd()
-
-
 def _bindings_for(rt, name):
-    """按会话预设启用的工具构造绑定函数字典（含恒定的 respond）。
+    """按会话预设启用的工具构造绑定函数字典。
 
     绑定是 world_run 程序内直接调用的普通函数，不是工具；启用哪些由预设 frontmatter
     的 tools 白名单决定（core.preset_tools）。预设不存在或白名单非法时直接抛错，由
@@ -228,7 +209,7 @@ def _bindings_for(rt, name):
     """
     from app import core
     _direct, bindings = core.session_tools(core.load_state(name))
-    out = {"respond": lambda options=None: _respond_binding(rt, options)}
+    out = {}
     for tool_name in bindings:
         if tool_name == "read_file":
             out["read_file"] = lambda file_path, offset=1, limit=2000: _read_file_binding(
@@ -428,16 +409,10 @@ def drop(name: str):
     _runtimes.pop(name, None)
 
 
-def run(name: str, program: str, dry: bool = False):
-    """在指定会话的持久环境中执行 program。
-
-    返回 (模型可见的结果文本, respond_info)：respond_info 为 None（程序未调用
-    respond）或 {"options": [...]} / {"error": ...}（PTC 模式的回合收尾信号）。
-    """
+def run(name: str, program: str, dry: bool = False) -> str:
+    """在指定会话的持久环境中执行 program，返回模型可见的结果文本。"""
     rt = runtime_for(name)
     ns = rt["ns"]
-    rt["respond"] = None
-    rt["dry"] = dry
     # 快照:浅拷贝命名空间(函数等)+ state 深拷贝 + lib 副本,供回滚
     ns_backup = dict(ns)
     state_backup = _json_copy(ns["state"]) if _json_safe(ns["state"]) else None
@@ -449,8 +424,6 @@ def run(name: str, program: str, dry: bool = False):
     skipped_defs = []
     try:
         exec(program, ns)
-    except _TurnEnd:
-        pass  # respond() 主动终止程序，视为正常完成
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         if isinstance(e, SyntaxError) and any(
@@ -473,8 +446,6 @@ def run(name: str, program: str, dry: bool = False):
         hook_state = _json_copy(ns["state"]) if _json_safe(ns["state"]) else None
         try:
             ns["normalize"]()
-        except _TurnEnd:
-            pass  # normalize 里调用 respond 同样只终止执行
         except Exception as e:
             hook_errors.append(f"{type(e).__name__}: {e}（normalize 的改动已回滚）")
             kept_state = ns["state"]
@@ -482,7 +453,6 @@ def run(name: str, program: str, dry: bool = False):
             ns.update(hook_ns)
             ns["state"] = hook_state if hook_state is not None else kept_state
     rt["logs"] = None
-    rt["dry"] = False
     if error is not None or dry:
         # 出错回滚 / 试运行不提交:还原命名空间、state、lib
         ns.clear()
@@ -495,7 +465,6 @@ def run(name: str, program: str, dry: bool = False):
     if error is None and not dry:
         after = _json_copy(ns["state"]) if _json_safe(ns["state"]) else None
     diff = _diff(state_backup, after) if state_backup is not None and after is not None else []
-    respond_info = rt["respond"] if error is None else None
     parts = []
     if error:
         parts.append(f"执行出错：{error}")
@@ -522,15 +491,10 @@ def run(name: str, program: str, dry: bool = False):
         parts.append(
             "保留名不会被持久化（它们是内置绑定）：" + "、".join(skipped_defs)
         )
-    if respond_info is not None:
-        if "error" in respond_info:
-            parts.append(f"respond 调用无效：{respond_info['error']}")
-        else:
-            parts.append("选项已提交，本轮回复结束。")
     if error and state_backup is not None:
         parts.append("已回滚：执行出错，state 与函数定义均已恢复到执行前，未留下半更新。")
     if state_backup is None:
         parts.append("（注意：执行前 state 含不可 JSON 序列化的内容，变化无法追踪，出错也无法回滚。）")
     if dry:
         parts.append("（试运行：以上变化与函数定义均未生效。）")
-    return "\n\n".join(parts), respond_info
+    return "\n\n".join(parts)

@@ -15,10 +15,12 @@ PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
-# AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，选项走 respond 工具，其它工具辅助）。
+# AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，工具只用于判定与记账）。
 # 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
+# 宏名沿用历史叫法，内容已不含任何选项契约：选项不再由模型在正文回合里提交，而是在正文
+# 落盘后由 OPTIONS_INSTRUCTION 驱动的独立请求生成（见 llm.generate_options）。
 # 文本由 respond_tool_text 按预设 frontmatter 的 tools 白名单组装：没启用的工具不出现在
-# 提示词里；默认白名单（world_run + read_file）下与旧版固定文本逐字一致。
+# 提示词里。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
 # 实际上用户可以看到思考内容，但不需要告诉模型
 
@@ -56,21 +58,17 @@ def _airp_prompt(direct: list) -> str:
         flow.append(f"{step}. 输出正文。需要的话中间可以插入{names}。")
     else:
         flow.append(f"{step}. 输出正文。")
-    step += 1
-    flow.append(
-        f"{step}. 在正文写完后，调用 respond 提交的剧情推进选项（options）同时结束本轮。没有合适的选项时传空数组。"
-    )
     parts = ["\n".join(flow)]
     if "world_run" in direct:
         parts += [_WORLD_RUN_PARA, _WORLD_RUN_NOTES]
     parts += [_TOOL_PARAS[n] for n in direct if n in _TOOL_PARAS]
-    parts.append("再次提醒：正文写完后不要忘respond提交选项。")
+    parts.append("再次提醒：正文直接写出来即可，工具只用来做判定与记账。")
     return "\n\n".join(parts)
 
-# PTC 模式的任务提示词：world_run 是唯一直接工具，respond/read_file 等是代码内绑定。
+# PTC 模式的任务提示词：world_run 是唯一直接工具，read_file 等是代码内绑定。
 # 形态对齐 DeepSeek Harness 的 PTC 训练分布（单一代码执行工具 + 程序内绑定调用），
 # 叙事仍是普通文本输出。由 ptc: true 的预设通过 {{respond_tool}} 宏注入；
-# 绑定清单按预设的 tools 白名单裁剪（respond 恒定列出，其余启用什么列什么）。
+# 绑定清单按预设的 tools 白名单裁剪（启用什么列什么）。
 _PTC_BINDING_DOCS = {
     "read_file": "- read_file(file_path: str, offset: int = 1, limit: int = 2000)：读取 UTF-8 文本文件（玩家提供的设定文档、笔记等），内容返回到当次日志；大文件用 offset/limit 分页。",
     "write_file": "- write_file(file_path: str, content: str = '', mode: str = 'overwrite')：写 UTF-8 文本文件（overwrite 整篇覆盖/新建，append 追加到末尾，父目录自动创建），相对路径以角色卡所在目录为基准。",
@@ -81,36 +79,31 @@ _PTC_BINDING_DOCS = {
 
 def _airp_prompt_ptc(bindings: list) -> str:
     """PTC 模式的任务提示词：绑定函数清单按启用的工具生成。"""
-    docs = ["- respond(options: list)：提交剧情推进选项并结束本轮回复，只在正文写完之后调用。"]
-    docs += [_PTC_BINDING_DOCS[b] for b in bindings if b in _PTC_BINDING_DOCS]
-    return "\n\n".join([
+    docs = [_PTC_BINDING_DOCS[b] for b in bindings if b in _PTC_BINDING_DOCS]
+    parts = [
         "每轮回复的固定流程：\n"
         "1.（可选）调用 world_run 收集信息、执行计算、完成判定。world_run 是唯一能直接调用的工具，调用任何其它工具名都会失败。\n"
-        "2. 输出正文。正文直接作为普通文本输出。\n"
-        "3. 正文写完后，再调用一次 world_run，在程序末尾用 respond(options=[...]) 提交剧情推进选项并结束本轮。"
-        "respond 会立即终止程序，它之后的代码不会执行。没有合适的选项时传空数组。",
-        "world_run 代码内的绑定函数（直接调用，不是工具）：\n" + "\n".join(docs),
+        "2. 输出正文。正文直接作为普通文本输出。",
         _WORLD_RUN_PARA,
         _WORLD_RUN_NOTES,
-        "再次提醒：正文写完后不要忘了调用 world_run 用 respond 提交选项。",
-    ])
+    ]
+    if docs:
+        parts.insert(1, "world_run 代码内的绑定函数（直接调用，不是工具）：\n" + "\n".join(docs))
+    parts.append("再次提醒：world_run 只用来做判定与记账，正文直接写出来即可。")
+    return "\n\n".join(parts)
+
+# 选项请求的指令：正文落盘后单独发一次请求，只让它产出选项 JSON。
+# 必须与正文请求共用同一份 config（同 tools / 同 thinking 配置、不加 response_format），
+# 否则端点侧的前缀缓存整体失效（见 llm.generate_options）。
+OPTIONS_INSTRUCTION = """\
+现在只做一件事：为玩家提供接下来的剧情推进选项，不要续写正文、不要调用任何工具。
+要求：2-4 条；每条一句话、具体可执行、彼此不重复；不复述刚写过的正文，不透露玩家角色尚不知情的信息。
+只输出一个 JSON 对象，不要解释、不要代码围栏，格式如下：{"options": ["选项一", "选项二"]}
+没有合适的选项时输出：{"options": []}
+"""
+
 
 # api_type 无关的基础工具定义（只含 name/description/parameters）
-_RESPOND_TOOL_DEF = {
-    "name": "respond",
-    "description": "提交剧情推进选项并结束本轮回复。调用本工具之前，必须已经以普通文本输出了完整正文（正文不写在本工具里）。参数只含选项；无选项时传空数组。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "options": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "正文之后的剧情推进选项，无选项时传空数组",
-            },
-        },
-        "required": ["options"],
-    },
-}
 
 _WORLD_RUN_TOOL_DEF = {
     "name": "world_run",
@@ -227,7 +220,7 @@ _BASH_TOOL_DEF = {
     },
 }
 
-# 可以直接调用的工具（respond 是收尾契约，始终可用，不写进白名单）
+# 可以直接调用的工具（选项不是工具：正文落盘后由独立请求生成）
 TOOL_NAMES = ("world_run", "read_file", "write_file", "edit_file", "bash")
 # 预设未声明 tools 字段时的默认工具集
 DEFAULT_TOOLS = ("world_run", "read_file")
@@ -243,9 +236,9 @@ _TOOL_DEFS = {
 def preset_tools(preset: dict) -> tuple:
     """解析预设启用的工具，返回 (直接工具名单, world_run 内的绑定名)。
 
-    白名单语义：tools 列什么就只有什么（顺序即 schema 顺序），未声明时用 DEFAULT_TOOLS；
-    respond 是收尾契约、始终可用，不必写进列表（写了也忽略）。PTC 模式的 schema 只能有
-    world_run（它是该模式的唯一直接工具），tools 列表决定它程序内可用的绑定函数。
+    白名单语义：tools 列什么就只有什么（顺序即 schema 顺序），未声明时用 DEFAULT_TOOLS。
+    PTC 模式的 schema 只能有 world_run（它是该模式的唯一直接工具），tools 列表决定它程序
+    内可用的绑定函数。
     """
     raw = preset.get("tools")
     if raw is None:
@@ -255,8 +248,6 @@ def preset_tools(preset: dict) -> tuple:
             raise ValueError(f"预设 {preset.get('id')} 的 tools 必须是工具名列表: {raw!r}")
         names = []
         for n in raw:
-            if n == "respond":
-                continue
             if n not in TOOL_NAMES:
                 raise ValueError(
                     f"预设 {preset.get('id')} 的 tools 含未知工具 {n!r}（可选: {', '.join(TOOL_NAMES)}）"
@@ -286,7 +277,8 @@ def apply_preset_tools(config: dict, state: dict) -> None:
 def respond_tool_text(preset: dict) -> str:
     """{{respond_tool}} 宏的内容：按预设模式与启用的工具组装任务提示词。
 
-    末尾保留一个换行，与旧版固定提示词逐字一致（否则老会话的缓存前缀整体失配）。
+    宏名沿用历史叫法，内容已不含任何选项契约（选项由正文落盘后的独立请求生成）。
+    末尾保留一个换行：预设里这个宏独占一行，去掉换行会跟下一段黏在一起。
     """
     direct, bindings = preset_tools(preset)
     text = _airp_prompt_ptc(bindings) if preset.get("ptc") else _airp_prompt(direct)
@@ -296,20 +288,20 @@ def respond_tool_text(preset: dict) -> str:
 def _world_run_ptc_def(bindings: list) -> dict:
     """PTC 模式 world_run 的 schema（唯一直接工具）：描述里的绑定清单按启用情况生成。"""
     sigs = {
-        "respond": "respond(options)",
         "read_file": "read_file(file_path, ...)",
         "write_file": "write_file(file_path, content, ...)",
         "edit_file": "edit_file(file_path, old_string, new_string, ...)",
         "bash": "bash(command, timeout, ...)",
     }
-    named = [sigs[n] for n in ["respond", *bindings] if n in sigs]
-    joined = ("、".join(named[:-1]) + " 与 " + named[-1]) if len(named) > 1 else named[0]
-    reserved = "、".join(["state", "print", "respond", *bindings])
+    named = [sigs[n] for n in bindings if n in sigs]
+    joined = ("、".join(named[:-1]) + " 与 " + named[-1]) if len(named) > 1 else (named[0] if named else "")
+    reserved = "、".join(["state", "print", *bindings])
+    bind_line = f"{joined} 是代码内的绑定函数，直接在程序里调用。" if joined else ""
     return {
         "name": "world_run",
         "description": (
-            "唯一能直接调用的工具：在持久的 Python 环境中执行一段代码。调用任何其它工具名都会失败；"
-            f"{joined} 是代码内的绑定函数，直接在程序里调用。"
+            "唯一能直接调用的工具：在持久的 Python 环境中执行一段代码。调用任何其它工具名都会失败。"
+            + bind_line +
             "只有你 print 的内容会作为执行结果返回给你（用户看不到 print 输出），正文必须作为普通文本输出。"
             "跨调用保留：全局对象 state、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失"
             f"（{reserved} 是内置绑定名，同名定义不会被保留）。"
@@ -350,15 +342,15 @@ def _to_chat_completions_format(tool: dict) -> dict:
 
 
 def get_tools(api_type: str, ptc: bool, direct: list, bindings: list) -> list:
-    """按 api_type 返回工具 schema（顺序同预设白名单）。
+    """按 api_type 返回工具 schema（顺序同预设白名单；白名单为空时返回空列表）。
 
     ptc 模式的 schema 只含 world_run（该模式的唯一直接工具，bindings 决定它程序内的绑定）；
-    普通模式是 respond + 白名单里的直接工具。
+    普通模式是白名单里的直接工具。
     """
     if ptc:
         base = [_world_run_ptc_def(bindings)]
     else:
-        base = [_RESPOND_TOOL_DEF] + [_TOOL_DEFS[n] for n in direct]
+        base = [_TOOL_DEFS[n] for n in direct]
     if api_type == "chat_completions":
         return [_to_chat_completions_format(t) for t in base]
     return [_to_responses_format(t) for t in base]
@@ -567,6 +559,18 @@ def resolve_reasoning_effort(state_value, config: dict) -> str:
     return default
 
 
+def resolve_options_enabled(state_value, config: dict) -> bool:
+    """解析是否生成选项：会话值合法直接用，否则回退 config 默认，最后默认开启。"""
+    if isinstance(state_value, bool):
+        return state_value
+    default = config.get("options_enabled")
+    if default is None:
+        return True
+    if not isinstance(default, bool):
+        raise ValueError(f"config.yaml 的 options_enabled 非法: {default!r}（应为 true/false）")
+    return default
+
+
 # ---------- session 存储 ----------
 
 def _session_dir(name: str) -> Path:
@@ -616,8 +620,9 @@ def create_session(name: str, preset: str, card: str, beginning_index):
         "endpoint": resolve_endpoint_index(prev.get("endpoint"), config),
         "temperature": resolve_temperature(prev.get("temperature"), config),
         "max_tokens": resolve_max_tokens(prev.get("max_tokens"), config),
-        # 创建时快照思考强度,之后前端可按会话覆盖(config 非法时此处直接报错)
+        # 创建时快照思考强度与选项开关,之后前端可按会话覆盖(config 非法时此处直接报错)
         "reasoning_effort": resolve_reasoning_effort(prev.get("reasoning_effort"), config),
+        "options_enabled": resolve_options_enabled(prev.get("options_enabled"), config),
     }
     save_state(state)
     return state
@@ -688,50 +693,24 @@ def _message_item(role: str, content: str) -> dict:
     return {"type": "message", "role": role, "content": [{"type": part_type, "text": content}]}
 
 
-def _split_tool_calls(entry: dict, ptc: bool):
-    """把一轮 assistant 的工具调用拆成（辅助调用列表, 收尾调用四元组）。
-
-    收尾调用 (name, arguments, result, reasoning) 回放在正文后：PTC 用带 terminal
-    标记的终结 world_run，没有（打断/出错轮）则合成 respond 绑定调用兜底；
-    非 PTC 合成 respond 工具调用。无论有无选项都固定回放，保持示范轮一致
-    （DeepSeek 会模仿旧轮次的行为，固定模式反而强化选项的稳定生成）。
-    """
-    tool_calls = entry.get("tool_calls", [])
-    terminal_tc = next((tc for tc in tool_calls if tc.get("terminal")), None) if ptc else None
-    normal = [tc for tc in tool_calls if tc is not terminal_tc]
-    if terminal_tc is not None:
-        end = (terminal_tc["name"], terminal_tc["arguments"], terminal_tc["result"],
-               terminal_tc.get("reasoning") or " ")
-    elif ptc:
-        end = ("world_run",
-               json.dumps({"program": "respond(options="
-                           + json.dumps(entry.get("options") or [], ensure_ascii=False) + ")"},
-                          ensure_ascii=False),
-               "选项已提交，本轮回复结束。", " ")
-    else:
-        end = ("respond",
-               json.dumps({"options": entry.get("options") or []}, ensure_ascii=False),
-               "ok", " ")
-    if end[3] == " ":
-        # 终结调用自身没存思维链：用整轮或最后一个辅助调用的思维链兜底
-        end = end[:3] + (entry.get("reasoning") or next(
-            (tc["reasoning"] for tc in reversed(tool_calls) if tc.get("reasoning")), " "),)
-    return normal, end
-
-
 def _build_input_responses(state, history, draft, preset, env):
     """拼装 Responses API 的 input_items。"""
     items = [_message_item(sec["role"], render_template(sec["content"], env)) for sec in preset["sections"]]
-    ptc = bool(preset.get("ptc"))
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
-            normal_tcs, (end_name, end_args, end_result, end_reasoning) = _split_tool_calls(entry, ptc)
-            for tc in normal_tcs:
-                items.append({
-                    "type": "reasoning",
-                    "content": [{"type": "reasoning_text", "text": tc.get("reasoning") or " "}],
-                })
+            # 模型的同一轮只产生一个 reasoning 项：同一段思考只在它带来的第一个调用前放一次。
+            # 一轮里调了多次工具时，历史里每个调用都存着那一段思考，逐个回放会把整轮思考重复
+            # 好几遍。
+            prev_reasoning = None
+            for tc in entry.get("tool_calls", []):
+                reasoning = tc.get("reasoning") or " "
+                if reasoning != prev_reasoning:
+                    items.append({
+                        "type": "reasoning",
+                        "content": [{"type": "reasoning_text", "text": reasoning}],
+                    })
+                    prev_reasoning = reasoning
                 call_n += 1
                 items.append({
                     "type": "function_call",
@@ -743,20 +722,7 @@ def _build_input_responses(state, history, draft, preset, env):
             # 正文:普通 assistant message
             if entry.get("content"):
                 items.append(_message_item("assistant", entry["content"]))
-            items.append({
-                "type": "reasoning",
-                "content": [{"type": "reasoning_text", "text": end_reasoning}],
-            })
-            call_n += 1
-            items.append({
-                "type": "function_call",
-                "call_id": f"call_{call_n}",
-                "name": end_name,
-                "arguments": end_args,
-            })
-            items.append({"type": "function_call_output", "call_id": f"call_{call_n}", "output": end_result})
         else:
-            # 用户输入:普通 user message(不再伪装成 respond 的工具结果)
             items.append(_message_item("user", entry["content"]))
     # 输入框中的本次输入：作为新的 user message 拼在末尾,请求以 user message 结尾。
     # 预设含 preset_user_input 块时,先按模板渲染(提供 user_input 变量);
@@ -772,14 +738,14 @@ def _build_input_responses(state, history, draft, preset, env):
 def _build_input_chat_completions(state, history, draft, preset, env):
     """拼装 Chat Completions API 的 messages 列表。"""
     messages = [{"role": sec["role"], "content": render_template(sec["content"], env)} for sec in preset["sections"]]
-    ptc = bool(preset.get("ptc"))
     call_n = 0
     for entry in history:
         if entry["role"] == "assistant":
             entry_reasoning = entry.get("reasoning") or " "
-            normal_tcs, (end_name, end_args, end_result, end_reasoning) = _split_tool_calls(entry, ptc)
-            # 辅助工具调用：每个 tool_call 独立成 assistant(tool_calls) + tool 消息
-            for tc in normal_tcs:
+            # 工具调用：每个 tool_call 独立成 assistant(tool_calls) + tool 消息。这里每条消息都要
+            # 自己带 reasoning_content（assistant 消息的字段，不像 responses 的 reasoning 项是
+            # 独立公用的一份），所以一轮里多个调用会各带一份整轮思考——这是拆分的必然结果。
+            for tc in entry.get("tool_calls", []):
                 call_n += 1
                 messages.append({
                     "role": "assistant",
@@ -803,23 +769,6 @@ def _build_input_chat_completions(state, history, draft, preset, env):
                     "content": entry["content"],
                     "reasoning_content": entry_reasoning,
                 })
-            # 收尾调用（见 _split_tool_calls）
-            call_n += 1
-            messages.append({
-                "role": "assistant",
-                "content": "",
-                "reasoning_content": end_reasoning,
-                "tool_calls": [{
-                    "id": f"call_{call_n}",
-                    "type": "function",
-                    "function": {"name": end_name, "arguments": end_args},
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": f"call_{call_n}",
-                "content": end_result,
-            })
         else:
             messages.append({"role": "user", "content": entry["content"]})
     # 输入框中的本次输入：作为新的 user message 拼在末尾。
@@ -847,3 +796,51 @@ def build_input(state: dict, history: list, draft=None) -> list:
     if api_type == "chat_completions":
         return _build_input_chat_completions(state, history, draft, preset, env)
     return _build_input_responses(state, history, draft, preset, env)
+
+
+def build_options_input(state: dict, history: list, content: str, tool_calls: list, reasoning: str) -> list:
+    """拼装「选项请求」的输入：正文请求的输入 + 本轮的助手回复 + 选项指令。
+
+    history 是不含本轮的那段历史，本轮回复按 content/tool_calls/reasoning 现场拼出来，
+    于是这次请求的输入就是正文请求输入的严格续写：端点侧的前缀缓存能整段命中（实测约 96%），
+    每轮只多付末尾那几十个 token。
+
+    必须与正文请求共用同一份 config（同 model / 同 tools / 同 thinking 配置、不加
+    response_format），否则前缀整体失配——这是硬约束，不是优化。
+    """
+    entry = {
+        "role": "assistant",
+        "content": content,
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
+    }
+    items = list(build_input(state, history + [entry]))
+    if effective_config(state, load_config()).get("api_type", "responses") == "chat_completions":
+        items.append({"role": "user", "content": OPTIONS_INSTRUCTION})
+    else:
+        items.append(_message_item("user", OPTIONS_INSTRUCTION))
+    return items
+
+
+def parse_options(text: str) -> list:
+    """从选项请求的回复里解析出选项列表；解析不出合法结构时抛 ValueError。
+
+    模型偶尔会带代码围栏或前后废话，所以先剥围栏，再退一步取第一个 { 到最后一个 }。
+    """
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    data = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if 0 <= start < end:
+            try:
+                data = json.loads(raw[start:end + 1])
+            except json.JSONDecodeError:
+                data = None
+    if not isinstance(data, dict) or not isinstance(data.get("options"), list):
+        raise ValueError('模型输出里没有 {"options": [...]} 结构')
+    return [str(o) for o in data["options"]]

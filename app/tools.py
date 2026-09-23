@@ -308,18 +308,15 @@ def _unknown_tool(session: str, name: str) -> str:
             f"错误：未知工具 {name}（只有 schema 中声明的工具可以直接调用；"
             "绑定函数请在 world_run 代码内使用）"
         )
-    hint = f"本会话启用的直接工具：{'、'.join(direct) if direct else '无'}；respond 始终可用"
+    hint = f"本会话启用的直接工具：{'、'.join(direct) if direct else '无'}"
     if "world_run" in direct and bindings:
         hint += f"；{'、'.join(bindings)} 是 world_run 程序内的绑定函数，不能直接调用"
     return f"错误：未知工具 {name}（{hint}）"
 
 
-async def execute_tool(session: str, name: str, arguments: str):
-    """执行一个非 respond 的工具调用。
+async def execute_tool(session: str, name: str, arguments: str) -> str:
+    """执行一个工具调用，返回模型的 function_call_output 文本。
 
-    返回 (function_call_output 文本, respond_info)；respond_info 仅当 world_run
-    程序内调用了 respond 绑定时非 None（{"options": [...]} 或 {"error": ...}），
-    是 PTC 模式的回合收尾信号。
     arguments 是模型给出的 JSON 字符串;解析失败/未知工具同样以文本返回。
     文件类工具的相对路径以当前会话角色卡所在目录为基准，bash 在该目录下执行；
     只有会话预设 tools 白名单里启用的工具才会执行（见 core.preset_tools）。
@@ -327,25 +324,25 @@ async def execute_tool(session: str, name: str, arguments: str):
     try:
         args = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError as e:
-        return f"错误：工具参数不是合法 JSON：{e}", None
+        return f"错误：工具参数不是合法 JSON：{e}"
     if not isinstance(args, dict):
-        return f"错误：工具参数必须是 JSON 对象，收到 {type(args).__name__}", None
+        return f"错误：工具参数必须是 JSON 对象，收到 {type(args).__name__}"
     try:
         state = core.load_state(session)
         direct, _bindings = core.preset_tools(core.load_presets()[state["preset"]])
     except Exception as e:
-        return f"错误：无法确定本会话启用的工具：{type(e).__name__}: {e}", None
+        return f"错误：无法确定本会话启用的工具：{type(e).__name__}: {e}"
     if name not in direct:
-        return _unknown_tool(session, name), None
+        return _unknown_tool(session, name)
     if name == "world_run":
         try:
             return world.run(session, str(args.get("program", "")), dry=args.get("dry") is True)
         except Exception as e:
             logger.exception("工具 %s 执行失败", name)
-            return f"错误：{type(e).__name__}: {e}", None
+            return f"错误：{type(e).__name__}: {e}"
     base_dir, error = _session_card_dir(session)
     if error:
-        return error, None
+        return error
     try:
         if name == "read_file":
             return read_file(
@@ -353,14 +350,14 @@ async def execute_tool(session: str, name: str, arguments: str):
                 args.get("offset", 1),
                 args.get("limit", READ_LIMIT),
                 base_dir=base_dir,
-            ), None
+            )
         if name == "write_file":
             return write_file(
                 args.get("file_path", ""),
                 args.get("content", ""),
                 args.get("mode", "overwrite"),
                 base_dir=base_dir,
-            ), None
+            )
         if name == "edit_file":
             return edit_file(
                 args.get("file_path", ""),
@@ -368,11 +365,11 @@ async def execute_tool(session: str, name: str, arguments: str):
                 args.get("new_string", ""),
                 args.get("replace_all") is True,
                 base_dir=base_dir,
-            ), None
+            )
         # bash：subprocess 阻塞执行，放进工作线程，避免长命令卡住事件循环
         return await asyncio.to_thread(
             bash, args.get("command", ""), args.get("timeout", BASH_TIMEOUT), base_dir
-        ), None
+        )
     except Exception as e:
         logger.exception("工具 %s 执行失败", name)
-        return f"错误：{type(e).__name__}: {e}", None
+        return f"错误：{type(e).__name__}: {e}"
