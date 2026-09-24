@@ -42,4 +42,4 @@ world_run: 在持久的 Python 环境中执行一段代码，用于一切涉及�
 read_file: 读文件，这允许我们把卡组织成一组外部文档（参见[久远之旅](./games/久远之旅/久远之旅.md)），卡里只用放目录+索引，AI自主选读需要的部分，而不是全量塞入上下文。
 write_file / edit_file: 写文件，以及把文件里的一段文字精确替换掉。AI 因此能把笔记、存档、生成的内容落到磁盘上（相对路径以角色卡所在目录为基准，也接受绝对路径）。
 bash: 在角色卡所在目录里执行一段 shell 命令（Git Bash），适合批量处理文件、跑脚本、查环境这类事情。命令有超时上限（默认 60 秒，最多 600 秒）。
-选项: 不再是模型调用的工具。正文流式输出结束后，服务端会再发一次独立请求（指令见 core.OPTIONS_INSTRUCTION），让模型只产出 `{"options": [...]}`，写进该轮 entry 的 options 字段；这次调用不进上下文。前端可按会话关掉它（state 的 `options_enabled` / `POST /api/sessions/{name}/options`），也可以只把选项重掷一次（`POST /api/sessions/{name}/regenerate_options`）。
+选项: 不再是模型调用的工具。正文流式输出结束后，服务端会再发一次独立请求（指令见 core.OPTIONS_INSTRUCTION），让模型只产出 `{"options": [...]}`，写进该轮 entry 的 options 字段；这次调用不进上下文。前端可按会话关掉它（state 的 `options_enabled` / `POST /api/sessions/{name}/options`），也可以只把选项重掷一次（`POST /api/sessions/{name}/regenerate_options`）。选项没解析出来不会影响正文：错误记在 entry 的 `options_error`，模型这次的原始输出记在 `options_raw`（重试的各次分别标注），前端在「选项生成失败」那一行下面折叠显示，服务器日志里也有全文。

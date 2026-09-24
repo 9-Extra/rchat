@@ -82,8 +82,10 @@ def build_request(input_items: list, config: dict) -> dict:
             payload["max_tokens"] = config["max_tokens"]
         effort = config.get("reasoning_effort")
         if effort == "none":
-            # 禁用思考：部分厂商要求显式的 thinking.disabled
-            payload["thinking"] = {"type": "disabled"}
+            # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
+            # TypeError），只能塞 extra_body 透传。实测 deepseek 官方与 OpenRouter 都认它；
+            # 反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
         elif effort is not None:
             payload["reasoning_effort"] = effort
         return payload
@@ -99,8 +101,10 @@ def build_request(input_items: list, config: dict) -> dict:
         payload["max_output_tokens"] = config["max_tokens"]
     effort = config.get("reasoning_effort")
     if effort == "none":
-        # 禁用思考：部分厂商要求显式的 thinking.disabled
-        payload["thinking"] = {"type": "disabled"}
+        # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
+        # TypeError），只能塞 extra_body 透传。实测 deepseek 官方与 OpenRouter 都认它；
+        # 反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
+        payload["extra_body"] = {"thinking": {"type": "disabled"}}
     elif effort is not None:
         payload["reasoning"] = {"effort": effort}
     return payload
@@ -249,6 +253,36 @@ async def _stream_body_responses(input_items: list, config: dict, run_tool):
         raise RuntimeError(f"工具循环超过 {MAX_ROUNDS} 轮仍未结束回复,已中止")
 
 
+def _delta_reasoning(delta) -> str:
+    """取 chat_completions 流式 delta 里的思考链文本：字段名各家不一，按出现情况自动兜底。
+
+    - reasoning_content：deepseek 与多数 OpenAI 兼容端点的叫法
+    - reasoning：OpenRouter 归一化出来的纯文本；它同一块里还会带内容相同的 reasoning_details，
+      所以优先认它，否则同一段思考会被拼两遍（实测两块文本逐字相同）
+    - reasoning_details：OpenRouter 的结构化块，只在上两个都没给文本时用；取 reasoning.text /
+      reasoning.summary 的文本，reasoning.encrypted 只有密文、跳过
+
+    判断依据只有「这个字段有没有文本」，不用按端点配置。
+    """
+    for key in ("reasoning_content", "reasoning"):
+        text = getattr(delta, key, None)
+        if isinstance(text, str) and text:
+            return text
+    details = getattr(delta, "reasoning_details", None)
+    if not details:
+        return ""
+    parts = []
+    for item in details:
+        if isinstance(item, dict):
+            dtype, text = item.get("type"), item.get("text") or item.get("summary")
+        else:
+            dtype = getattr(item, "type", None)
+            text = getattr(item, "text", None) or getattr(item, "summary", None)
+        if dtype in ("reasoning.text", "reasoning.summary") and text:
+            parts.append(text)
+    return "".join(parts)
+
+
 async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
     """Chat Completions API 流式调用实现（内含工具循环，某一轮没有工具调用即回合结束）。"""
     last_reasoning = ""
@@ -265,7 +299,7 @@ async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
                 if choice is None:
                     continue
                 delta = choice.delta
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = _delta_reasoning(delta)
                 if reasoning:
                     round_reasoning += reasoning
                     yield {"type": "reasoning", "delta": reasoning}
@@ -330,8 +364,9 @@ async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
 async def generate_options(input_items: list, config: dict) -> tuple:
     """正文结束后的选项请求：用与正文请求**完全相同**的参数再问一次，只要选项 JSON。
 
-    返回 (options, 错误文本)。解析失败就追加一句提醒重试一次；仍失败则选项为空、错误文本
-    非空，由调用方落盘成 options_error（正文不受影响）。
+    返回 (options, 错误文本, 原始输出)。解析失败就追加一句提醒重试一次；仍失败则选项为空、
+    错误文本非空，由调用方落盘成 options_error（正文不受影响）；原始输出非空时由调用方
+    落盘成 options_raw，供前端查看模型这次到底产出了什么。
 
     沿用同一份 config 是硬要求：实测 deepseek 官方端点上 tools 数组、thinking /
     reasoning_effort 三者任一与正文请求不一致，前缀缓存命中率就从 98% 掉到 6%。
@@ -340,17 +375,42 @@ async def generate_options(input_items: list, config: dict) -> tuple:
     """
     async with _make_client(config) as client:
         error = ""
+        attempts: list[tuple[int, str]] = []
         for attempt in range(2):
             items = list(input_items)
             if attempt:
                 items.append(_followup_item(config, _OPTIONS_RETRY_HINT))
             try:
-                text = await _request_options_once(client, items, config)
-                return core.parse_options(text), ""
+                text, problem = await _request_options_once(client, items, config)
             except Exception as e:
                 error = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
                 logger.warning("选项请求失败(第 %d 次): %s", attempt + 1, error)
-        return [], error
+                continue
+            if problem:
+                # 输出根本不可能带选项 JSON（模型调了工具 / 被输出上限截断），不必再解析
+                error = problem
+            else:
+                try:
+                    return core.parse_options(text), "", ""
+                except ValueError as e:
+                    error = str(e)
+            attempts.append((attempt + 1, text or "（空输出）"))
+            logger.warning(
+                "选项请求失败(第 %d 次): %s\n模型原始输出:\n%s",
+                attempt + 1,
+                error,
+                text or "（空输出）",
+            )
+        return [], error, _format_raw_attempts(attempts)
+
+
+def _format_raw_attempts(attempts: list) -> str:
+    """把失败的几次原始输出拼成一段文本：只有一次失败时不加次数标题。"""
+    parts = [
+        text if len(attempts) == 1 else f"--- 第 {n} 次 ---\n{text}"
+        for n, text in attempts
+    ]
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 def _followup_item(config: dict, text: str) -> dict:
@@ -371,6 +431,11 @@ def _usage_note(usage) -> str:
         if cached is None:
             cached = (data.get(key) or {}).get("cached_tokens")
     out = data.get("completion_tokens", data.get("output_tokens"))
+    # 思考 token 也占输出上限：选项请求被压空时，这里是第一嫌疑人
+    think = None
+    for key in ("completion_tokens_details", "output_tokens_details"):
+        if think is None:
+            think = (data.get(key) or {}).get("reasoning_tokens")
     parts = []
     if prompt is not None:
         parts.append(f"prompt={prompt}")
@@ -378,11 +443,17 @@ def _usage_note(usage) -> str:
         parts.append(f"缓存命中={cached}")
     if out is not None:
         parts.append(f"输出={out}")
+    if think:
+        parts.append(f"其中思考={think}")
     return " ".join(parts)
 
 
-async def _request_options_once(client, input_items: list, config: dict) -> str:
-    """发一次非流式的选项请求，返回模型给出的文本（不解析）。"""
+async def _request_options_once(client, input_items: list, config: dict) -> tuple:
+    """发一次非流式的选项请求，返回 (模型输出文本, 说明)。
+
+    说明非空表示这次输出不可能是选项 JSON（模型调了工具、或被输出上限截断成空），
+    调用方不再拿它去解析、直接把说明当错误。文本始终是模型这次的真实产出，供排查用。
+    """
     api_type = config.get("api_type", "responses")
     payload = build_request(input_items, config)
     payload.pop("stream", None)  # 要完整 JSON，用非流式一次拿到
@@ -391,11 +462,41 @@ async def _request_options_once(client, input_items: list, config: dict) -> str:
         payload["max_tokens"] = limit
         resp = await client.chat.completions.create(**payload)
         logger.info("选项请求 %s", _usage_note(getattr(resp, "usage", None)))
-        message = resp.choices[0].message
-        if getattr(message, "tool_calls", None):
-            raise ValueError("模型在选项请求里调用了工具，没有给出 JSON")
-        return message.content or ""
+        choice = resp.choices[0]
+        calls = getattr(choice.message, "tool_calls", None)
+        if calls:
+            return _render_calls(calls), "模型在选项请求里调用了工具，没有给出 JSON"
+        text = choice.message.content or ""
+        if not text.strip():
+            return "", f"模型没输出任何文本（finish_reason={choice.finish_reason}）"
+        return text, ""
     payload["max_output_tokens"] = limit
     resp = await client.responses.create(**payload)
     logger.info("选项请求 %s", _usage_note(getattr(resp, "usage", None)))
-    return resp.output_text or ""
+    calls = [o for o in (getattr(resp, "output", None) or [])
+             if getattr(o, "type", "") == "function_call"]
+    if calls:
+        return _render_calls(calls), "模型在选项请求里调用了工具，没有给出 JSON"
+    text = resp.output_text or ""
+    if not text.strip():
+        return "", f"模型没输出任何文本（{_response_status(resp)}）"
+    return text, ""
+
+
+def _render_calls(calls) -> str:
+    """把工具调用渲染成文本：这是选项请求失败时最该被看到的东西。"""
+    lines = []
+    for c in calls:
+        fn = getattr(c, "function", None)
+        name = getattr(fn, "name", None) or getattr(c, "name", "")
+        args = getattr(fn, "arguments", None) or getattr(c, "arguments", "")
+        lines.append(f"{name}({args})")
+    return "\n".join(lines)
+
+
+def _response_status(resp) -> str:
+    """响应为什么没有文本：截断、被拒，还是模型什么都没说。"""
+    status = getattr(resp, "status", None) or "unknown"
+    details = getattr(resp, "incomplete_details", None)
+    reason = getattr(details, "reason", None) if details else None
+    return f"status={status}, reason={reason}" if reason else f"status={status}"

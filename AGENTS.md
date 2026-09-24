@@ -17,7 +17,7 @@ uv run -m main
 - `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
 - 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `options_enabled` / `user_agent`（覆盖 SDK 默认 UA）。
 - 可按会话覆盖（存 state.json）：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` / `options_enabled`，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`、`/options`）。新会话继承 created_at 最大的那个会话的这几项，无会话时用端点 0 + config 默认；会话值非法/缺失回退 config 默认，config 值非法直接报错；fork 自动继承。
-- `reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置按 `low`；`none` = 禁用思考（请求带 `"thinking": {"type": "disabled"}`）。
+- `reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置按 `low`；`none` = 禁用思考（请求带 `"thinking": {"type": "disabled"}`，这个参数名 OpenAI SDK 不认，只能经 `extra_body` 透传：直接当 kwarg 传会 TypeError，一行都发不出去）。
 - `options_enabled`（缺省 true）：正文之后要不要再发一次选项请求，见「选项生成」。
 - `x_opencode_session`：`true` 时每个会话的请求都带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控 / GPU KV 缓存亲和）。UUID 存在 state.json 的 `chat_id`，创建时生成，fork 换新值。
 
@@ -60,7 +60,7 @@ schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正�
 1. **正文**（`stream_body`）：工具循环。模型可多次调用白名单内的工具（PTC 下是 world_run 内的绑定），结果追加进输入继续请求；**某一轮不再调用任何工具即视为说完**，回合结束（yield `done`，只含 content 与 reasoning）。全程没有内容、或超过 `MAX_ROUNDS`(25) 轮，都报错。
 2. **选项**（`generate_options`）：正文完成后，若 `options_enabled` 为真，再用同一份 config 发一次非流式请求，只要选项 JSON。
 
-history 条目：`{role, content, options, reasoning, tool_calls?}`，另有 `error` / `options_error` 两个失败标记（回放时都不进模型上下文）。
+history 条目：`{role, content, options, reasoning, tool_calls?}`，另有 `error` / `options_error` / `options_raw` 三个失败标记（回放时都不进模型上下文）。
 
 ### 上下文回放（core.build_input）
 
@@ -69,6 +69,7 @@ history 条目：`{role, content, options, reasoning, tool_calls?}`，另有 `er
 - 都原样回放 `entry["tool_calls"]`；选项不参与回放。
 - `chat_completions` 每轮的 assistant 消息只回传**本轮新增**的正文（`content` 是跨轮累积量，整段回传会让模型把自己的正文反复读一遍）。
 - `responses` 上同一段思考只在它带来的第一个调用前放一次（`core._build_input_responses` 的 `prev_reasoning` 去重），否则一轮里多次调用会把整轮思考重复回放好几遍。
+- `chat_completions` 的思考链字段名各家不一，`llm._delta_reasoning` 依次兜底 `reasoning_content`（deepseek 等）→ `reasoning`（OpenRouter 归一化字段）→ `reasoning_details`（OpenRouter 的结构化块，取 `reasoning.text` / `reasoning.summary`、跳过 encrypted）；OpenRouter 同时发前两个且逐字相同，所以按顺序只认第一个。判断只看字段有没有文本，不按端点配置。回传照旧用 assistant 的 `reasoning_content`（OpenRouter 认它是 `reasoning` 的别名；实测不传、只传 `reasoning`、原样回传 `reasoning_details` 都不报错）。
 
 ### responses 的思考链约束
 
@@ -79,7 +80,8 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 - **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 一条 user 指令（`core.OPTIONS_INSTRUCTION`：只要 2-4 条、只输出 `{"options": [...]}`、不要续写正文也不要调用工具）。
 - **缓存约束（实测 deepseek 官方端点）**：必须与正文请求共用同一份 config——同 model、同 tools、同 thinking / reasoning_effort，且**不加 `response_format`**。任一项不一致，前缀缓存命中率从 98% 掉到 6%；作为「正文请求的严格续写」它自身只在末尾多几十个 token（命中约 96%）。所以别给选项请求单独压低思考，也别用 `response_format`（该端点不支持 json_schema，`json_object` 同样往 prompt 头部插说明、打断前缀）。
 - **解析与兜底**（`core.parse_options`）：剥围栏 → `json.loads` → 退一步取第一个 `{` 到最后一个 `}`；失败追加一条提醒重发一次（`_OPTIONS_RETRY_HINT`，追加在末尾不影响前缀），仍失败则选项为空、错误写进 entry 的 `options_error`（前端给提示 +「重新生成选项」；与表示整轮失败的 `error` 区分）。正文不受影响。
-- 选项请求的 usage 以 INFO 一行打进日志（含缓存命中数，`llm._usage_note`）。
+- **失败现场**：两次都失败时，模型每次输出的原文（第 1/2 次分别标注，空输出记成「（空输出）」）经 `generate_options` 的第三个返回值落盘为 entry 的 `options_raw`，前端在错误行下折叠显示；整段原文同时进 WARNING 日志。模型调工具或被输出上限压空时 `_request_options_once` 不返回文本而直接给出说明（含 `finish_reason` / `status`+`reason`、工具调用的名字与参数），这条说明就是错误文本本身。
+- 选项请求的 usage 以 INFO 一行打进日志（含缓存命中数与其中的思考 token 数，`llm._usage_note`）。
 - `POST /api/sessions/{name}/regenerate_options`（`_prepare_options` / `_run_options`）只重掷最后一轮的选项：不重新生成正文、不新增块、不碰 world。
 
 ## PTC 模式

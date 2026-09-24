@@ -96,10 +96,12 @@ def _airp_prompt_ptc(bindings: list) -> str:
 # 必须与正文请求共用同一份 config（同 tools / 同 thinking 配置、不加 response_format），
 # 否则端点侧的前缀缓存整体失效（见 llm.generate_options）。
 OPTIONS_INSTRUCTION = """\
+<system>
 现在只做一件事：为玩家提供接下来的剧情推进选项，不要续写正文、不要调用任何工具。
-要求：2-4 条；每条一句话、具体可执行、彼此不重复；不复述刚写过的正文，不透露玩家角色尚不知情的信息。
-只输出一个 JSON 对象，不要解释、不要代码围栏，格式如下：{"options": ["选项一", "选项二"]}
+要求：2-4 条；每条一句话、导向不同的发展方向、不透露玩家角色未知的信息。
+只输出一个 JSON 对象，格式如下：{"options": ["选项一", "选项二"]}
 没有合适的选项时输出：{"options": []}
+</system>
 """
 
 

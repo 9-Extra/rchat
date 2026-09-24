@@ -362,7 +362,7 @@ async def _tail(gen: dict):
 
 
 def _persist(name, history, mode, user_input, draft, content, options, reasoning,
-             tool_calls, error=None, options_error=None):
+             tool_calls, error=None, options_error=None, options_raw=None):
     if mode == "chat":
         history.append({"role": "user", "content": user_input})
     elif mode == "regenerate" and draft is not None:
@@ -379,6 +379,9 @@ def _persist(name, history, mode, user_input, draft, content, options, reasoning
     # 选项请求失败:正文照常保留,只标注选项没拿到,前端据此给「重新生成选项」
     if options_error:
         entry["options_error"] = options_error
+    # 失败时模型实际产出的原文(build_input 同样忽略,不进模型上下文),前端折叠显示
+    if options_raw:
+        entry["options_raw"] = options_raw
     # 本轮的 world_run/read_file 调用,重放上下文时用
     if tool_calls:
         entry["tool_calls"] = tool_calls
@@ -448,6 +451,7 @@ async def _run(gen: dict, prep: dict) -> None:
         streaming_started = True
         options: list = []
         options_error = None
+        options_raw = ""
         async def run_tool(tool_name, arguments):
             return await tools.execute_tool(name, tool_name, arguments)
         async for event in stream_body(prep["input_items"], prep["config"], run_tool):
@@ -475,9 +479,11 @@ async def _run(gen: dict, prep: dict) -> None:
             options_input = core.build_options_input(
                 prep["state"], history, done["content"], tool_calls, done.get("reasoning", "")
             )
-            options, options_error = await generate_options(options_input, prep["config"])
+            options, options_error, options_raw = await generate_options(
+                options_input, prep["config"]
+            )
             if options_error:
-                _emit(gen, {"type": "options_error", "message": options_error})
+                _emit(gen, {"type": "options_error", "message": options_error, "raw": options_raw})
             else:
                 _emit(gen, {"type": "options", "options": options})
         # 成功后一次性落盘
@@ -492,6 +498,7 @@ async def _run(gen: dict, prep: dict) -> None:
             done.get("reasoning", ""),
             tool_calls,
             options_error=options_error,
+            options_raw=options_raw,
         )
         # 世界状态随历史提交,快照键为落盘后的历史长度
         world.commit_turn(name, len(history))
@@ -579,17 +586,21 @@ async def _run_options(gen: dict, prep: dict) -> None:
     name = prep["name"]
     try:
         _emit(gen, {"type": "options_start"})
-        options, options_error = await generate_options(prep["input_items"], prep["config"])
+        options, options_error, options_raw = await generate_options(
+            prep["input_items"], prep["config"]
+        )
         history = core.load_history(name)
         if not history or history[-1]["role"] != "assistant":
             raise RuntimeError("最后一轮已不是 AI 块，选项无处可写")
         entry = history[-1]
         if options_error:
             entry["options_error"] = options_error
-            _emit(gen, {"type": "options_error", "message": options_error})
+            entry["options_raw"] = options_raw
+            _emit(gen, {"type": "options_error", "message": options_error, "raw": options_raw})
         else:
             entry["options"] = options
             entry.pop("options_error", None)
+            entry.pop("options_raw", None)
             _emit(gen, {"type": "options", "options": options})
         core.save_history(name, history)
     except asyncio.CancelledError:
