@@ -25,10 +25,12 @@ MAX_ROUNDS = 25
 OPTIONS_MAX_TOKENS = 2048
 
 # 选项请求第一次没给出合法 JSON 时追加的提醒：作为上下文末尾的续写，不影响前缀缓存。
-_OPTIONS_RETRY_HINT = (
-    "上一次输出不是合法的 JSON 对象。请只输出一个 JSON 对象，形如 "
-    '{"options": ["选项一", "选项二"]}，不要解释、不要代码围栏、不要调用工具。'
-)
+_OPTIONS_RETRY_HINT = """
+上一次输出不是合法的 JSON 对象。请输出一个严格的 JSON 对象，形如
+```
+{"options": ["选项\"一\"", "选项\"二\""]}
+```
+"""
 
 
 def _make_client(config: dict) -> AsyncOpenAI:
@@ -49,6 +51,35 @@ def _make_client(config: dict) -> AsyncOpenAI:
         timeout=600.0,
         default_headers=headers or None,
     )
+
+
+def _mapped_effort(config: dict):
+    """该端点实际要发的 reasoning_effort：端点可配 reasoning_effort_map 给它改名。
+
+    OpenRouter 的 effort 枚举只到 xhigh（另有 minimal），没有本项目的 max，配置里写
+    `reasoning_effort_map: {max: xhigh}` 就落在这里。只认端点自己那份 config，不影响别的端点。
+    """
+    effort = config.get("reasoning_effort")
+    if effort is None:
+        return None
+    return (config.get("reasoning_effort_map") or {}).get(effort, effort)
+
+
+def _extra_body(config: dict, fields: dict):
+    """SDK 不认的字段只能经 extra_body 透传（直接当 kwarg 传会 TypeError），没有内容时返回 None。
+
+    - provider：OpenRouter 的路由偏好（排序、最低吞吐），端点里配了才发
+    - session_id：端点开了 session_id 就把本会话的 chat_id 发过去——OpenRouter 拿它做粘性路由
+      与上游缓存亲和（正文与选项两条请求才可能落到同一个上游、命中同一份前缀缓存）
+    - fields：调用方按需附上的厂商私有参数（如禁用思考的 thinking.disabled）
+    """
+    extra = {}
+    if config.get("provider"):
+        extra["provider"] = config["provider"]
+    if config.get("session_id") and config.get("chat_id"):
+        extra["session_id"] = config["chat_id"]
+    extra.update(fields)
+    return extra or None
 
 
 def build_request(input_items: list, config: dict) -> dict:
@@ -80,14 +111,18 @@ def build_request(input_items: list, config: dict) -> dict:
             payload["temperature"] = config["temperature"]
         if config.get("max_tokens") is not None:
             payload["max_tokens"] = config["max_tokens"]
-        effort = config.get("reasoning_effort")
+        effort = _mapped_effort(config)
+        fields = {}
         if effort == "none":
             # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
-            # TypeError），只能塞 extra_body 透传。实测 deepseek 官方与 OpenRouter 都认它；
-            # 反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
-            payload["extra_body"] = {"thinking": {"type": "disabled"}}
+            # TypeError），只能塞 extra_body 透传。实测 deepseek 官方、OpenRouter、kimicode 都
+            # 认它；反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
+            fields["thinking"] = {"type": "disabled"}
         elif effort is not None:
             payload["reasoning_effort"] = effort
+        extra = _extra_body(config, fields)
+        if extra:
+            payload["extra_body"] = extra
         return payload
 
     payload = {"model": config["model"], "input": input_items}
@@ -99,14 +134,18 @@ def build_request(input_items: list, config: dict) -> dict:
         payload["temperature"] = config["temperature"]
     if config.get("max_tokens") is not None:
         payload["max_output_tokens"] = config["max_tokens"]
-    effort = config.get("reasoning_effort")
+    effort = _mapped_effort(config)
+    fields = {}
     if effort == "none":
         # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
-        # TypeError），只能塞 extra_body 透传。实测 deepseek 官方与 OpenRouter 都认它；
-        # 反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
-        payload["extra_body"] = {"thinking": {"type": "disabled"}}
+        # TypeError），只能塞 extra_body 透传。实测 deepseek 官方、OpenRouter、kimicode 都
+        # 认它；反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
+        fields["thinking"] = {"type": "disabled"}
     elif effort is not None:
         payload["reasoning"] = {"effort": effort}
+    extra = _extra_body(config, fields)
+    if extra:
+        payload["extra_body"] = extra
     return payload
 
 

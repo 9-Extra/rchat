@@ -99,7 +99,8 @@ OPTIONS_INSTRUCTION = """\
 <system>
 现在只做一件事：为玩家提供接下来的剧情推进选项，不要续写正文、不要调用任何工具。
 要求：2-4 条；每条一句话、导向不同的发展方向、不透露玩家角色未知的信息。
-只输出一个 JSON 对象，格式如下：{"options": ["选项一", "选项二"]}
+只输出一个 JSON 对象，格式如下：{"options": ["选项\"一\"", "选项\"二\""]}
+json字符串的引号必须转义：\"
 没有合适的选项时输出：{"options": []}
 </system>
 """
@@ -472,7 +473,64 @@ def load_config() -> dict:
 # ---------- 多端点与生成参数 ----------
 
 # 端点的合法键（来自 config.yaml 的 endpoints 列表）
-_ENDPOINT_KEYS = ("display_name", "api_base", "model", "api_key", "api_type", "x_opencode_session")
+_ENDPOINT_KEYS = ("display_name", "api_base", "model", "api_key", "api_type",
+                  "x_opencode_session", "reasoning_effort_map", "provider", "session_id")
+
+# provider 路由（OpenRouter 的字段，写错它自己会 400）里本项目校验的部分
+_PROVIDER_SORTS = ("price", "throughput", "latency")
+_PROVIDER_PERCENTILES = ("p50", "p75", "p90", "p99")
+
+
+def _check_effort_map(value, i: int) -> None:
+    """reasoning_effort_map：发给该端点前给思考强度改名（如 OpenRouter 只到 xhigh，没有 max）。"""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"config.yaml 的 endpoints[{i}].reasoning_effort_map 不是映射: {value!r}")
+    for k, v in value.items():
+        if k not in EFFORT_LEVELS:
+            raise ValueError(
+                f"config.yaml 的 endpoints[{i}].reasoning_effort_map 键非法: {k!r}"
+                f"（可选值: {', '.join(EFFORT_LEVELS)}）"
+            )
+        if not isinstance(v, str) or not v:
+            raise ValueError(
+                f"config.yaml 的 endpoints[{i}].reasoning_effort_map[{k!r}] 不是非空字符串: {v!r}"
+            )
+
+
+def _is_threshold(v) -> bool:
+    """吞吐/延迟阈值：一个数字（p50），或 p50/p75/p90/p99 的子集。"""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return True
+    return (
+        isinstance(v, dict) and bool(v)
+        and all(k in _PROVIDER_PERCENTILES and isinstance(n, (int, float)) and not isinstance(n, bool)
+                for k, n in v.items())
+    )
+
+
+def _check_provider(value, i: int) -> None:
+    """provider：原样塞进请求体的 provider 字段（OpenRouter 的路由偏好）。这里只校验本项目
+    文档化的三项，其余键透传——OpenRouter 对未知键会 400，报错由它给更准的信息。"""
+    if value is None:
+        return
+    where = f"config.yaml 的 endpoints[{i}].provider"
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} 不是映射: {value!r}")
+    sort = value.get("sort")
+    if sort is not None:
+        if isinstance(sort, str):
+            ok = sort in _PROVIDER_SORTS
+        else:
+            ok = isinstance(sort, dict) and sort.get("by") in _PROVIDER_SORTS
+        if not ok:
+            raise ValueError(f"{where}.sort 非法: {sort!r}（{ '/'.join(_PROVIDER_SORTS) }，或 {{by: ..., partition: ...}}）")
+    for key in ("preferred_min_throughput", "preferred_max_latency"):
+        if key in value and not _is_threshold(value[key]):
+            raise ValueError(
+                f"{where}.{key} 非法: {value[key]!r}（数字，或 {{p50/p75/p90/p99: 数字}}）"
+            )
 
 
 def endpoints(config: dict) -> list:
@@ -486,6 +544,8 @@ def endpoints(config: dict) -> list:
             if not ep.get(k):
                 raise ValueError(f"config.yaml 的 endpoints[{i}] 缺少必填项 {k}")
         ep.setdefault("display_name", ep["model"])
+        _check_effort_map(ep.get("reasoning_effort_map"), i)
+        _check_provider(ep.get("provider"), i)
         out.append(ep)
     if not out:
         raise ValueError("config.yaml 没有配置任何端点（endpoints 为空）")
@@ -528,6 +588,8 @@ def effective_config(state: dict, config: dict) -> dict:
     merged.update(endpoints(config)[resolve_endpoint_index(state.get("endpoint"), config)])
     merged["temperature"] = resolve_temperature(state.get("temperature"), config)
     merged["max_tokens"] = resolve_max_tokens(state.get("max_tokens"), config)
+    # 会话标识（llm 读 chat_id）：X-Opencode-Session 头，以及端点开了 session_id 时的请求体 session_id
+    merged["chat_id"] = state.get("chat_id", "")
     return merged
 
 

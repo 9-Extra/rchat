@@ -410,10 +410,8 @@ def _prepare(name: str, mode: str, user_input: str | None) -> dict:
     # 上一轮被打断时丢弃未提交的内存改动）
     world.sync(name, len(history))
     input_items = core.build_input(state, history, draft=draft)
-    # 合并选中端点与会话生成参数覆盖，得到 llm 使用的扁平 config
+    # 合并选中端点与会话生成参数覆盖，得到 llm 使用的扁平 config（会话标识 chat_id 在其中）
     config = core.effective_config(state, core.load_config())
-    # 会话标识随 config 传给 llm，作为 X-Opencode-Session 请求头
-    config["chat_id"] = state.get("chat_id", "")
     # PTC 实验模式与工具白名单由预设 frontmatter 决定（ptc / tools）
     core.apply_preset_tools(config, state)
     # 思考强度按会话覆盖（会话值非法/缺失时回退 config 默认；非法默认在此报错）
@@ -563,7 +561,6 @@ def _prepare_options(name: str) -> dict:
         raise ValueError("最后一轮不是 AI 块，没有可以重新生成选项的对象")
     entry = history[-1]
     config = core.effective_config(state, core.load_config())
-    config["chat_id"] = state.get("chat_id", "")
     core.apply_preset_tools(config, state)
     config["reasoning_effort"] = core.resolve_reasoning_effort(
         state.get("reasoning_effort"), config

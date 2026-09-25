@@ -14,7 +14,7 @@ uv run -m main
 
 ## 配置（config.yaml）
 
-- `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
+- `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`、`reasoning_effort_map`（发给该端点前给思考强度改名，如 OpenRouter 写 `{max: xhigh}`，它的枚举只到 xhigh）、`provider`（原样塞进请求体的 `provider` 字段，OpenRouter 的路由偏好，如 `{preferred_min_throughput: 30}`＝默认负载均衡不变、只把低于 30 tok/s 的上游降到末尾；`sort` 与两个 `preferred_*` 阈值在启动时校验，其余键透传）、`session_id`（true 时把本会话的 `chat_id` 当**请求体** `session_id` 发出去——OpenRouter 靠它做粘性路由与上游缓存亲和，正文与选项请求才更容易落到同一个上游、命中同一份前缀缓存）。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
 - 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `options_enabled` / `user_agent`（覆盖 SDK 默认 UA）。
 - 可按会话覆盖（存 state.json）：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` / `options_enabled`，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`、`/options`）。新会话继承 created_at 最大的那个会话的这几项，无会话时用端点 0 + config 默认；会话值非法/缺失回退 config 默认，config 值非法直接报错；fork 自动继承。
 - `reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置按 `low`；`none` = 禁用思考（请求带 `"thinking": {"type": "disabled"}`，这个参数名 OpenAI SDK 不认，只能经 `extra_body` 透传：直接当 kwarg 传会 TypeError，一行都发不出去）。
