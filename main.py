@@ -78,9 +78,16 @@ def main() -> None:
 
     try:
         asyncio.run(serve())
+    except KeyboardInterrupt:
+        # 优雅关闭后 uvicorn 会把捕获到的 SIGINT 原样重放（Server.capture_signals 的 finally），
+        # asyncio.run 再把它包成 KeyboardInterrupt 抛出来。uvicorn 自己的 run() 就是这么吞掉的；
+        # 不接住的话进程会带着一串 CancelledError → KeyboardInterrupt 的回溯退出。
+        pass
     finally:
         if args.keep_awake:
             keep_awake(False)
+
+    logging.info("已停止")
 
 
 if __name__ == "__main__":
