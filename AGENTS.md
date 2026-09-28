@@ -58,7 +58,7 @@ schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正�
 分两段，都是普通请求（`app/llm.py`）：
 
 1. **正文**（`stream_body`）：工具循环。模型可多次调用白名单内的工具（PTC 下是 world_run 内的绑定），结果追加进输入继续请求；**某一轮不再调用任何工具即视为说完**，回合结束（yield `done`，只含 content 与 reasoning）。全程没有内容、或超过 `MAX_ROUNDS`(25) 轮，都报错。
-2. **选项**（`generate_options`）：正文完成后，若 `options_enabled` 为真，再用同一份 config 发一次非流式请求，只要选项 JSON。
+2. **选项**（`generate_options`）：正文完成后，若 `options_enabled` 为真，再用同一份 config 发一次非流式请求，只要选项列表。
 
 history 条目：`{role, content, options, reasoning, tool_calls?}`，另有 `error` / `options_error` / `options_raw` 三个失败标记（回放时都不进模型上下文）。
 
@@ -77,9 +77,10 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 
 ### 选项生成
 
-- **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 一条 user 指令（`core.OPTIONS_INSTRUCTION`：只要 2-4 条、只输出 `{"options": [...]}`、不要续写正文也不要调用工具）。
+- **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 一条 user 指令（`core.OPTIONS_INSTRUCTION`：只要 2-4 条、只输出以「- 」开头的选项行、不要续写正文也不要调用工具）。
+- **输出格式**：一行一条、每行以「- 」开头（模型因此不必转义选项里的引号；此前用 JSON 时「引号未转义」和「括号配错」两类语法错都实际发生过）。没有合适选项时输出单独一行「无」。
 - **缓存约束（实测 deepseek 官方端点）**：必须与正文请求共用同一份 config——同 model、同 tools、同 thinking / reasoning_effort，且**不加 `response_format`**。任一项不一致，前缀缓存命中率从 98% 掉到 6%；作为「正文请求的严格续写」它自身只在末尾多几十个 token（命中约 96%）。所以别给选项请求单独压低思考，也别用 `response_format`（该端点不支持 json_schema，`json_object` 同样往 prompt 头部插说明、打断前缀）。
-- **解析与兜底**（`core.parse_options`）：剥围栏 → `json.loads` → 退一步取第一个 `{` 到最后一个 `}`；失败追加一条提醒重发一次（`_OPTIONS_RETRY_HINT`，追加在末尾不影响前缀），仍失败则选项为空、错误写进 entry 的 `options_error`（前端给提示 +「重新生成选项」；与表示整轮失败的 `error` 区分）。正文不受影响。
+- **解析与兜底**（`core.parse_options`）：按行扫，只认 `_OPTION_LINE_RE` 匹配的选项行（行首 `-` / `*` / `•` / `·`，或 `1.` `2、` `3)` 这类编号）——前言、后记、代码围栏、空行一律丢弃，**不做宽松兜底**（把杂行当选项会在页面上多出假按钮）；一行都没有时抛 ValueError；单独一行「无」表示这轮没有合适选项、返回空列表。失败追加一条提醒重发一次（`_OPTIONS_RETRY_HINT`，追加在末尾不影响前缀），仍失败则选项为空、错误写进 entry 的 `options_error`（前端给提示 +「重新生成选项」；与表示整轮失败的 `error` 区分）。正文不受影响。
 - **失败现场**：两次都失败时，模型每次输出的原文（第 1/2 次分别标注，空输出记成「（空输出）」）经 `generate_options` 的第三个返回值落盘为 entry 的 `options_raw`，前端在错误行下折叠显示；整段原文同时进 WARNING 日志。模型调工具或被输出上限压空时 `_request_options_once` 不返回文本而直接给出说明（含 `finish_reason` / `status`+`reason`、工具调用的名字与参数），这条说明就是错误文本本身。
 - 选项请求的 usage 以 INFO 一行打进日志（含缓存命中数与其中的思考 token 数，`llm._usage_note`）。
 - `POST /api/sessions/{name}/regenerate_options`（`_prepare_options` / `_run_options`）只重掷最后一轮的选项：不重新生成正文、不新增块、不碰 world。

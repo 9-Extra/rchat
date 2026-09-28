@@ -3,9 +3,10 @@
 一轮回复分两段，都是普通请求：
 1. 正文：模型可多次调用启用的工具（执行结果追加进输入继续请求），正文是普通文本输出，
    某一轮不再调用工具即视为说完，回合结束。
-2. 选项：正文结束后用 generate_options 再发一次请求，让它只产出选项 JSON。这次请求必须
-   与正文请求共用同一份 config（同 model / tools / thinking 配置、不加 response_format），
-   否则端点侧的前缀缓存整体失效（实测：这三者任一变化，命中率从 98% 掉到 6%）。
+2. 选项：正文结束后用 generate_options 再发一次请求，让它只产出选项行（一行一条，见
+   core.OPTIONS_INSTRUCTION）。这次请求必须与正文请求共用同一份 config（同 model /
+   tools / thinking 配置、不加 response_format），否则端点侧的前缀缓存整体失效（实测：
+   这三者任一变化，命中率从 98% 掉到 6%）。
 """
 import json
 import logging
@@ -24,12 +25,11 @@ MAX_ROUNDS = 25
 # 选项请求的输出上限（选项很短）。只影响输出、不参与前缀缓存，所以可以随便压。
 OPTIONS_MAX_TOKENS = 2048
 
-# 选项请求第一次没给出合法 JSON 时追加的提醒：作为上下文末尾的续写，不影响前缀缓存。
+# 选项请求第一次没给出可解析的选项行时追加的提醒：作为上下文末尾的续写，不影响前缀缓存。
 _OPTIONS_RETRY_HINT = """
-上一次输出不是合法的 JSON 对象。请输出一个严格的 JSON 对象，形如
-```
-{"options": ["选项\"一\"", "选项\"二\""]}
-```
+上一次输出不是合法的选项列表。请一行一个选项、每行以「- 」开头，除选项行外不要输出任何文字，例如：
+- 选项一
+- 选项二
 """
 
 
@@ -401,7 +401,7 @@ async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
 
 
 async def generate_options(input_items: list, config: dict) -> tuple:
-    """正文结束后的选项请求：用与正文请求**完全相同**的参数再问一次，只要选项 JSON。
+    """正文结束后的选项请求：用与正文请求**完全相同**的参数再问一次，只要选项列表。
 
     返回 (options, 错误文本, 原始输出)。解析失败就追加一句提醒重试一次；仍失败则选项为空、
     错误文本非空，由调用方落盘成 options_error（正文不受影响）；原始输出非空时由调用方
@@ -426,7 +426,7 @@ async def generate_options(input_items: list, config: dict) -> tuple:
                 logger.warning("选项请求失败(第 %d 次): %s", attempt + 1, error)
                 continue
             if problem:
-                # 输出根本不可能带选项 JSON（模型调了工具 / 被输出上限截断），不必再解析
+                # 输出根本不可能带选项行（模型调了工具 / 被输出上限截断），不必再解析
                 error = problem
             else:
                 try:
@@ -490,12 +490,12 @@ def _usage_note(usage) -> str:
 async def _request_options_once(client, input_items: list, config: dict) -> tuple:
     """发一次非流式的选项请求，返回 (模型输出文本, 说明)。
 
-    说明非空表示这次输出不可能是选项 JSON（模型调了工具、或被输出上限截断成空），
+    说明非空表示这次输出不可能是选项列表（模型调了工具、或被输出上限截断成空），
     调用方不再拿它去解析、直接把说明当错误。文本始终是模型这次的真实产出，供排查用。
     """
     api_type = config.get("api_type", "responses")
     payload = build_request(input_items, config)
-    payload.pop("stream", None)  # 要完整 JSON，用非流式一次拿到
+    payload.pop("stream", None)  # 要完整输出，用非流式一次拿到
     limit = min(config.get("max_tokens") or OPTIONS_MAX_TOKENS, OPTIONS_MAX_TOKENS)
     if api_type == "chat_completions":
         payload["max_tokens"] = limit
@@ -504,7 +504,7 @@ async def _request_options_once(client, input_items: list, config: dict) -> tupl
         choice = resp.choices[0]
         calls = getattr(choice.message, "tool_calls", None)
         if calls:
-            return _render_calls(calls), "模型在选项请求里调用了工具，没有给出 JSON"
+            return _render_calls(calls), "模型在选项请求里调用了工具，没有给出选项列表"
         text = choice.message.content or ""
         if not text.strip():
             return "", f"模型没输出任何文本（finish_reason={choice.finish_reason}）"
@@ -515,7 +515,7 @@ async def _request_options_once(client, input_items: list, config: dict) -> tupl
     calls = [o for o in (getattr(resp, "output", None) or [])
              if getattr(o, "type", "") == "function_call"]
     if calls:
-        return _render_calls(calls), "模型在选项请求里调用了工具，没有给出 JSON"
+        return _render_calls(calls), "模型在选项请求里调用了工具，没有给出选项列表"
     text = resp.output_text or ""
     if not text.strip():
         return "", f"模型没输出任何文本（{_response_status(resp)}）"

@@ -92,16 +92,20 @@ def _airp_prompt_ptc(bindings: list) -> str:
     parts.append("再次提醒：world_run 只用来做判定与记账，正文直接写出来即可。")
     return "\n\n".join(parts)
 
-# 选项请求的指令：正文落盘后单独发一次请求，只让它产出选项 JSON。
+# 选项请求的指令：正文落盘后单独发一次请求，只让它产出选项行。
 # 必须与正文请求共用同一份 config（同 tools / 同 thinking 配置、不加 response_format），
 # 否则端点侧的前缀缓存整体失效（见 llm.generate_options）。
+# 格式用「一行一条、行首 - 空格」而不是 JSON：选项原文里常带引号（「"是，主人"」），JSON
+# 要求转义、还要括号配对，实测两种错都出过；逐行则没有可写错的语法骨架（见 parse_options）。
 OPTIONS_INSTRUCTION = """\
 <system>
 现在只做一件事：为玩家提供接下来的剧情推进选项，不要续写正文、不要调用任何工具。
 要求：2-4 条；每条一句话、导向不同的发展方向、不透露玩家角色未知的信息。
-只输出一个 JSON 对象，格式如下：{"options": ["选项\"一\"", "选项\"二\""]}
-json字符串的引号必须转义：\"
-没有合适的选项时输出：{"options": []}
+只输出选项本身，一行一条，每行以「- 」开头（半角短横线加一个空格）：
+- 选项一
+- 选项二
+除这些选项行以外不要输出任何文字：不要前言与说明、不要额外建议。
+没有合适的选项时只输出一个字：无
 </system>
 """
 
@@ -886,25 +890,44 @@ def build_options_input(state: dict, history: list, content: str, tool_calls: li
     return items
 
 
-def parse_options(text: str) -> list:
-    """从选项请求的回复里解析出选项列表；解析不出合法结构时抛 ValueError。
+# 选项行：行首是短横线/星号/圆点，或「1.」「2、」「3)」这类编号；后面要有内容。
+# 只认这一类行，是为了把模型顺手写的前言、后记、代码围栏、空行全部丢掉——逐行格式没有
+# JSON 那种天然的起止边界，边界只能靠行首标记来定（见 OPTIONS_INSTRUCTION）。
+_OPTION_LINE_RE = re.compile(r"^(?:[-*•·]\s+|\d{1,2}\s*[.、)．）]\s*)(.+)$")
 
-    模型偶尔会带代码围栏或前后废话，所以先剥围栏，再退一步取第一个 { 到最后一个 }。
+# 没有合适选项时的哨兵行：模型偶尔会在「无」后面带个句号
+_NO_OPTIONS_RE = re.compile(r"^无[。.！!]*$")
+
+
+def parse_options(text: str) -> list:
+    """从选项请求的回复里解析出选项；一条选项行都找不到时抛 ValueError。
+
+    一行一条（行首带「- 」，见 OPTIONS_INSTRUCTION），选项原文里的引号、括号一律不用转义，
+    也就没有 JSON 那类「引号没转义 / 括号配错」的语法失败面。不在规定格式里的行直接丢弃，
+    所以别对它们做宽松兜底——前言、后记一旦被当成选项，就成了页面上的假按钮。
+    单独一行「无」表示这轮没有合适选项，返回空列表。
     """
-    raw = (text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-    data = None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if 0 <= start < end:
-            try:
-                data = json.loads(raw[start:end + 1])
-            except json.JSONDecodeError:
-                data = None
-    if not isinstance(data, dict) or not isinstance(data.get("options"), list):
-        raise ValueError('模型输出里没有 {"options": [...]} 结构')
-    return [str(o) for o in data["options"]]
+    lines = (text or "").splitlines()
+    options = []
+    sentinel = False  # 出现过「无」：表示这轮没有合适选项，而不是解析失败
+    for line in lines:
+        stripped = line.strip()
+        if _NO_OPTIONS_RE.match(stripped):
+            sentinel = True
+            continue
+        m = _OPTION_LINE_RE.match(stripped)
+        if not m:
+            continue
+        item = m.group(1).strip()
+        if not item:
+            continue
+        if _NO_OPTIONS_RE.match(item):
+            # 模型给哨兵行也加了个前缀，同样表示没有合适选项
+            sentinel = True
+            continue
+        options.append(item)
+    if options:
+        return options
+    if sentinel:
+        return []
+    raise ValueError("模型输出里没有以「- 」开头的选项行")
