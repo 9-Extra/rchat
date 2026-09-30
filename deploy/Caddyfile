@@ -1,0 +1,16 @@
+# Caddyfile 片段：把 https://rchat.example.com 反代到本机 25530
+#
+# Caddy 负责申请/续期证书，所以 config.yaml 里 auth.cookie_secure 要置 true
+# （Cookie 只经 TLS 发送），并保证反代转发 X-Forwarded-For（Caddy 默认就发）。
+#
+# SSE 不需要额外配置：Caddy 默认不缓冲响应体，正文流式会逐块透传。
+
+rchat.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:25530 {
+		# 流式对话可能长时间没有数据（思考中每 15s 有心跳），放宽读超时
+		transport http {
+			read_timeout 1h
+		}
+	}
+}

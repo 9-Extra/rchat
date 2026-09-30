@@ -1,0 +1,43 @@
+[Unit]
+Description=AIRP 后端（rchat）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 换成跑服务的账号与项目路径（先在项目里 `uv sync` 生成 .venv）
+User=rchat
+Group=rchat
+WorkingDirectory=/srv/rchat
+
+# 只监听回环，公网入口交给 Caddy/nginx（TLS 终止在反代上）
+# --no-browser：服务器上没有浏览器可开；--no-keep-awake：非 Windows 平台本来也不生效
+ExecStart=/srv/rchat/.venv/bin/python -m main --host 127.0.0.1 --port 25530 --no-browser --no-keep-awake
+
+# 生成跑在服务进程内存里：重启会打断正在跑的那一轮（用户输入开局即落盘，
+# 界面上那一轮的按钮会变成「继续」，点一下就把缺的那一轮补回来）
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# 日志进 journald：journalctl -u rchat -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rchat
+
+# 软保险：跑飞了自动拉回（world_run 没有超时保护，见 AGENTS.md）。
+# 实测本进程常驻约 120MB，1G 是 8 倍余量；上限设在 cgroup 内，超了只杀本服务，
+# 不会把整机（同机器上别的服务）拖进系统级 OOM。
+MemoryMax=1G
+TasksMax=256
+
+# 注意：world_run / bash / 文件工具 = 以本服务账号执行任意代码。
+# 这些开关只防误伤，不是隔离手段；要隔离就得上容器或独立机器。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# 项目若放在 /home 下，别加 ProtectHome=read-only，否则工具写不进去
+
+[Install]
+WantedBy=multi-user.target
