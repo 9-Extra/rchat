@@ -31,6 +31,11 @@ BASH_MAX_TIMEOUT = 600
 # bash 单次返回的字符上限
 BASH_MAX_CHARS = 20000
 
+# 打断 world_run 时的收尾宽限（秒）：线程杀不掉，等它跑完再抛取消，避免与
+# world.abort_turn / commit_turn 抢同一个 state。超时说明模型代码还在跑（死循环），
+# 只能放行并记 WARNING。
+WORLD_RUN_CANCEL_GRACE = 5.0
+
 
 def read_file(
     file_path: str, offset: int = 1, limit: int = READ_LIMIT, base_dir: str | None = None
@@ -335,8 +340,31 @@ async def execute_tool(session: str, name: str, arguments: str) -> str:
     if name not in direct:
         return _unknown_tool(session, name)
     if name == "world_run":
+        # world_run 是同步 exec 且没有超时保护（预设可信）。放进工作线程执行：一个死循环
+        # 的 program 只会占住一个线程，不会把事件循环连同所有会话的 SSE 一起冻住。
+        program = str(args.get("program", ""))
+        dry = args.get("dry") is True
+        run_task = asyncio.ensure_future(asyncio.to_thread(world.run, session, program, dry))
         try:
-            return world.run(session, str(args.get("program", "")), dry=args.get("dry") is True)
+            # shield：当前任务被取消时**不**连带取消这个线程任务，好让我们在下面等它收尾
+            return await asyncio.shield(run_task)
+        except asyncio.CancelledError:
+            # 用户打断：线程杀不掉。必须等它跑完再往上抛——否则 server 的取消处理器
+            # （world.abort_turn / commit_turn，都在读 rt["ns"]["state"]）会和还在改
+            # state 的线程同时动手：轻则 json.dumps 撞出 "dictionary changed size during
+            # iteration"，重则该轮函数定义留进 lib、状态与历史对不上。
+            try:
+                await asyncio.wait_for(asyncio.shield(run_task), timeout=WORLD_RUN_CANCEL_GRACE)
+                logger.info("world_run 已跑完，打断在等它收尾后生效")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "world_run 打断后 %gs 仍未结束（多半是死循环）：放行取消，"
+                    "它可能继续改 state，与随后的 abort/commit 存在竞争",
+                    WORLD_RUN_CANCEL_GRACE,
+                )
+            except Exception:
+                pass  # 程序自己出错：结果本来就要丢弃
+            raise
         except Exception as e:
             logger.exception("工具 %s 执行失败", name)
             return f"错误：{type(e).__name__}: {e}"

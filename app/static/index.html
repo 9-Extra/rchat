@@ -131,6 +131,16 @@
   #modal select, #modal input { width: 100%; }
   #modal .row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 4px; }
 
+  /* ---------- 登录页（只有服务端开了鉴权才出现） ---------- */
+  #loginMask { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 100; }
+  #loginBox { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 26px; width: 320px; display: flex; flex-direction: column; gap: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+  #loginBox h3 { font-size: 15px; }
+  #loginBox label { font-size: 12px; color: var(--dim); display: block; margin-bottom: 5px; }
+  #loginBox input { width: 100%; }
+  #loginBox button { width: 100%; padding: 9px; }
+  #loginErr { color: #f0b0b0; font-size: 12px; min-height: 15px; white-space: pre-wrap; }
+  #logoutBtn { display: none; }
+
   /* ---------- 移动端侧栏改为抽屉 ---------- */
   @media (max-width: 640px) {
     #topBar {
@@ -209,6 +219,7 @@
   <aside id="sidebar">
     <div class="aside-head">
       <span class="logo">AIRP</span>
+      <button id="logoutBtn" title="注销当前账号">退出</button>
       <button id="toggleSide" title="收起/展开侧栏">«</button>
     </div>
     <div id="sideBody">
@@ -256,6 +267,16 @@
     <div><label>预设</label><select id="mPreset"></select></div>
     <div><label>开局</label><select id="mBeginning"></select></div>
     <div class="row"><button id="mCancel">取消</button><button id="mCreate">创建</button></div>
+  </div>
+</div>
+
+<div id="loginMask">
+  <div id="loginBox">
+    <h3>AIRP 登录</h3>
+    <div><label>用户名</label><input type="text" id="loginUser" autocomplete="username"></div>
+    <div><label>密码</label><input type="password" id="loginPass" autocomplete="current-password"></div>
+    <div id="loginErr"></div>
+    <button id="loginBtn">登录</button>
   </div>
 </div>
 
@@ -311,8 +332,17 @@ document.addEventListener('click', e => {
   }
 });
 
+// 服务端是否开了鉴权、当前登录的是谁（启动时问 /api/me 得到）
+let authEnabled = false;
+let currentUser = null;
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
+  // 会话过期/被踢/未登录：统一收口到登录页（/api/login 与 /api/me 之外不会有 401 的正常路径）
+  if (r.status === 401) {
+    showLogin('登录已过期，请重新登录');
+    throw new Error('未登录');
+  }
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
   return r.json();
 }
@@ -331,11 +361,12 @@ function renderMarkdown(text) {
 }
 
 // ---------- 会话列表 ----------
-// 记住当前会话，刷新/重开页面时自动回到它
+// 记住当前会话，刷新/重开页面时自动回到它；同一个浏览器换账号登录时按用户分开记
 const LAST_SESSION_KEY = 'last_session';
+const lastSessionKey = () => LAST_SESSION_KEY + (currentUser ? ':' + currentUser : '');
 function rememberSession(id) {
-  if (id) localStorage.setItem(LAST_SESSION_KEY, id);
-  else localStorage.removeItem(LAST_SESSION_KEY);
+  if (id) localStorage.setItem(lastSessionKey(), id);
+  else localStorage.removeItem(lastSessionKey());
 }
 
 async function loadSessions() {
@@ -420,9 +451,12 @@ function renderEndpointSelect() {
 }
 
 function updateComposer() {
-  // 空历史 = 等待点击「开始」；最后一块是 AI = 等待用户输入
+  // 空历史 = 等待点击「开始」；最后一块是 AI = 等待用户输入；
+  // 最后一块是用户块 = 这一轮还没写出来（生成被打断在落盘前、或进程重启过），点「继续」补回来
+  const last = cur.history[cur.history.length - 1];
   const started = cur.history.length > 0;
-  const waiting = !started || cur.history[cur.history.length - 1].role === 'assistant';
+  const waiting = !started || last.role === 'assistant';
+  const resumable = started && last.role === 'user';
   const btn = $('send');
   // cur.generating：后端这一轮还在跑（本页刷新回来、或别的页面/设备发起的）
   const busy = streaming || !!cur.generating;
@@ -432,8 +466,8 @@ function updateComposer() {
     btn.classList.add('interrupting');
   } else {
     btn.classList.remove('interrupting');
-    btn.textContent = started ? '发送' : '开始';
-    btn.disabled = !waiting;
+    btn.textContent = !started ? '开始' : (resumable ? '继续' : '发送');
+    btn.disabled = !(waiting || resumable);
   }
   $('input').disabled = busy || !started || !waiting;
 }
@@ -642,6 +676,8 @@ async function streamInto(url, opts, userText, reuseAI) {
   }
   try {
     const resp = await fetch(url, opts);
+    // 会话过期/被踢：不当作"断线重连"，直接回登录页
+    if (resp.status === 401) { showLogin('登录已过期，请重新登录'); return; }
     activeReader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -746,8 +782,9 @@ async function reconnectTurn(userText) {
 async function attachTurn() {
   const g = cur.generating;
   if (!g || streaming) return;
-  // regenerate 期间磁盘上还是被替换掉的旧 AI 块，先按点「重新输出」时那样删掉它
-  if (g.mode === 'regenerate') {
+  const last = cur.history[cur.history.length - 1];
+  // regenerate 的旧 AI 块后端已经删了：只有末尾仍是 AI 块时才要从屏幕上摘掉它
+  if (g.mode === 'regenerate' && last && last.role === 'assistant') {
     const blocks = $('chat').querySelectorAll('.block.ai');
     if (blocks.length) blocks[blocks.length - 1].remove();
   }
@@ -758,7 +795,10 @@ async function attachTurn() {
     const blocks = $('chat').querySelectorAll('.block.ai');
     if (blocks.length) reuseAI = blocks[blocks.length - 1];
   }
-  await streamInto(`/api/sessions/${enc()}/stream`, {}, g.mode === 'chat' ? g.user_input : null, reuseAI);
+  // 这一轮的用户输入后端开局就已落盘（history 末尾就是它，界面已按 history 画好），
+  // 只有末尾不是用户块时才需要现场补画一个
+  const needUserText = g.mode === 'chat' && !(last && last.role === 'user');
+  await streamInto(`/api/sessions/${enc()}/stream`, {}, needUserText ? g.user_input : null, reuseAI);
 }
 
 async function interrupt() {
@@ -779,9 +819,13 @@ function send() {
 
 function regenerate() {
   if (streaming || cur.generating) return;
-  // 立即移除旧的最后一个 AI 块，避免新旧两块同时显示
-  const blocks = $('chat').querySelectorAll('.block.ai');
-  if (blocks.length) blocks[blocks.length - 1].remove();
+  // 立即移除旧的最后一个 AI 块，避免新旧两块同时显示；末尾是用户块时（上一轮没写出来）
+  // 没有要替换的 AI 块，别误删更早的那个
+  const last = cur.history[cur.history.length - 1];
+  if (last && last.role === 'assistant') {
+    const blocks = $('chat').querySelectorAll('.block.ai');
+    if (blocks.length) blocks[blocks.length - 1].remove();
+  }
   streamInto(`/api/sessions/${enc()}/regenerate`, { method: 'POST' });
 }
 
@@ -795,8 +839,9 @@ function regenerateOptions() {
 
 $('send').onclick = () => {
   if (streaming || cur.generating) { interrupt(); return; }
-  if (!cur.history.length)
-    streamInto(`/api/sessions/${enc()}/start`, { method: 'POST' });
+  const last = cur.history[cur.history.length - 1];
+  if (!last) streamInto(`/api/sessions/${enc()}/start`, { method: 'POST' });
+  else if (last.role === 'user') regenerate();  // 末尾是用户块：把这一轮补出来
   else send();
 };
 $('input').addEventListener('keydown', e => {
@@ -885,10 +930,74 @@ document.addEventListener('visibilitychange', async () => {
   } catch (e) {}
 });
 
-// 启动：加载会话列表，并把上次选中的会话恢复回来（已删除则清除记录，退回主界面）
-(async () => {
+// ---------- 登录 / 注销 ----------
+
+function showLogin(message) {
+  // 掉线重连/流式读到一半被踢：先把本地流收掉，别让后台读继续跑
+  streaming = false;
+  if (activeReader) { try { activeReader.cancel(); } catch (e) {} activeReader = null; }
+  cur = null;
+  $('sessionList').innerHTML = '';
+  $('toolbar').style.display = 'none';
+  $('composer').style.display = 'none';
+  $('chat').innerHTML = '<div id="emptyHint">请先登录</div>';
+  $('logoutBtn').style.display = 'none';
+  $('loginErr').textContent = message || '';
+  $('loginMask').style.display = 'flex';
+  $('loginPass').value = '';
+  $('loginUser').focus();
+}
+
+async function doLogin() {
+  const username = $('loginUser').value.trim();
+  const password = $('loginPass').value;
+  if (!username || !password) { $('loginErr').textContent = '请填写用户名和密码'; return; }
+  const btn = $('loginBtn');
+  btn.disabled = true;
+  $('loginErr').textContent = '';
+  try {
+    // 登录失败是 401，这里不能走 api()（那会把 401 当成"登录过期"再弹一次登录页）
+    const r = await fetch('/api/login', post({ username, password }));
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      $('loginErr').textContent = data.detail || '登录失败';
+      btn.disabled = false;
+      return;
+    }
+    currentUser = data.user || username;
+    $('loginPass').value = '';
+    $('loginMask').style.display = 'none';
+    btn.disabled = false;
+    await boot();
+  } catch (e) {
+    $('loginErr').textContent = '登录请求失败：' + e.message;
+    btn.disabled = false;
+  }
+}
+
+$('loginBtn').onclick = doLogin;
+$('loginUser').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginPass').focus(); });
+$('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+$('logoutBtn').onclick = async () => {
+  if (!confirm('退出登录？')) return;
+  try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+  currentUser = null;
+  rememberSession(null);
+  showLogin('');
+};
+
+// ---------- 启动 ----------
+
+// 先问服务端要不要登录（没开鉴权时 user 为 null、auth_enabled 为 false，直接进主界面），
+// 再加载会话列表并把上次选中的会话恢复回来（已删除则清除记录，退回主界面）
+async function boot() {
+  const me = await api('/api/me');
+  authEnabled = !!me.auth_enabled;
+  if (me.user) currentUser = me.user;
+  $('logoutBtn').style.display = authEnabled && currentUser ? 'inline-flex' : 'none';
+  if (authEnabled && !currentUser) { showLogin(''); return; }
   const list = await loadSessions();
-  const last = localStorage.getItem(LAST_SESSION_KEY);
+  const last = localStorage.getItem(lastSessionKey());
   if (!last) return;
   if (!list.some(s => s.id === last)) { rememberSession(null); return; }
   try {
@@ -896,7 +1005,9 @@ document.addEventListener('visibilitychange', async () => {
   } catch (e) {
     rememberSession(null);
   }
-})();
+}
+
+boot();
 </script>
 </body>
 </html>

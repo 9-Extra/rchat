@@ -27,7 +27,7 @@ import logging
 import re
 from pathlib import Path
 
-from app.core import SESSIONS_DIR, load_history
+from app.core import _atomic_write_text, _session_dir, load_history
 
 logger = logging.getLogger("airp.world")
 
@@ -46,7 +46,8 @@ _runtimes: dict = {}
 
 
 def _world_dir(name: str):
-    return SESSIONS_DIR / name / "world"
+    # 目录解析统一走 core：会话键带用户名作用域（多用户时是 sessions/<用户>/<会话>/world）
+    return _session_dir(name) / "world"
 
 
 def _json_copy(value):
@@ -328,13 +329,14 @@ def _snapshot_at(snaps: dict, turn_len: int):
 def _write_disk(name: str, committed: dict, turn_len: int):
     d = _world_dir(name)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "state.json").write_text(
-        json.dumps(committed["state"], ensure_ascii=False, indent=2), encoding="utf-8"
+    _atomic_write_text(
+        d / "state.json",
+        json.dumps(committed["state"], ensure_ascii=False, indent=2),
     )
-    (d / "lib.py").write_text("\n\n".join(committed["lib"].values()), encoding="utf-8")
+    _atomic_write_text(d / "lib.py", "\n\n".join(committed["lib"].values()))
     snaps = {k: v for k, v in _snapshots(name).items() if int(k) <= turn_len}
     snaps[str(turn_len)] = committed
-    (d / "snapshots.json").write_text(json.dumps(snaps, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(d / "snapshots.json", json.dumps(snaps, ensure_ascii=False))
 
 
 def sync(name: str, turn_len: int):
@@ -395,14 +397,15 @@ def fork(src: str, dst: str, turn_len: int):
     committed = _snapshot_at(snaps, turn_len)
     d = _world_dir(dst)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "state.json").write_text(
-        json.dumps(committed["state"], ensure_ascii=False, indent=2), encoding="utf-8"
+    _atomic_write_text(
+        d / "state.json",
+        json.dumps(committed["state"], ensure_ascii=False, indent=2),
     )
-    (d / "lib.py").write_text("\n\n".join(committed["lib"].values()), encoding="utf-8")
+    _atomic_write_text(d / "lib.py", "\n\n".join(committed["lib"].values()))
     # 保留 fork 点及更早的快照，新会话内继续回滚/重生成时状态仍能对齐
     dst_snaps = {k: v for k, v in snaps.items() if int(k) <= turn_len}
     dst_snaps[str(turn_len)] = committed
-    (d / "snapshots.json").write_text(json.dumps(dst_snaps, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(d / "snapshots.json", json.dumps(dst_snaps, ensure_ascii=False))
 
 
 def drop(name: str):

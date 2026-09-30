@@ -1,9 +1,13 @@
 """预设/角色卡解析、session 存储、上下文拼装。"""
+import copy
 import datetime
 import json
 import math
+import os
 import random
 import re
+import secrets
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -416,6 +420,83 @@ def safe_dir_name(name: str) -> str:
     return safe
 
 
+# ---------- 会话作用域（多用户） ----------
+# 内部「会话键」是 "<用户名>/<会话名>"；本地模式（未启用鉴权）下没有用户名，键就是裸会话名，
+# 行为与改造前完全一致。作用域只体现在磁盘路径与进程内字典的 key 上：API 路径始终只暴露
+# 裸会话名（当前用户从 cookie 取），这样前端 URL 不用变，也避开 %2F 被路由解码成 / 的坑。
+
+
+def session_key(user: str | None, name: str) -> str:
+    """把用户名与会话名拼成内部会话键。user 为空（本地模式）时就是裸名。"""
+    return f"{user}/{name}" if user else name
+
+
+def split_scope(key: str) -> tuple:
+    """把会话键拆成 (用户名, 会话名)；裸名（本地模式）的用户名为 None。"""
+    if "/" in key:
+        user, name = key.split("/", 1)
+        return user, name
+    return None, key
+
+
+# 解析结果缓存：值为 (文件签名, 解析结果)。签名 = 各文件的 (路径, mtime_ns, 大小)，
+# 文件新增/删除/改动都会变，因此改完预设/角色卡/配置无需重启。
+_CACHE: dict = {}
+
+
+def _file_signature(paths) -> tuple:
+    sig = []
+    for p in paths:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        sig.append((str(p), st.st_mtime_ns, st.st_size))
+    return tuple(sig)
+
+
+# 同一文件的写入串行化。FastAPI 的同步端点跑在工作线程池里，所以「同一个文件被两个
+# 线程同时写」是真会发生的（典型：两个人同时登录写 auth_sessions.json）。
+# 实测 40 线程 × 25 次并发写同一文件（临时名只带 pid 的旧实现）：
+#   Linux  → 每 1000 次约 39 次 FileNotFoundError（后写者把临时文件搬走了，先写者 os.replace 找不到它）
+#   Windows→ 每 1000 次约 39 次 PermissionError/WinError 32（同一个临时文件被占用）
+# 两者都会让一次落盘直接失败（在应用里就是那一轮 history 没保存）。锁按路径分，
+# 不同会话互不阻塞；跨进程仍由「写临时文件 + os.replace」保证。
+_WRITE_LOCKS: dict = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _write_lock(path: Path) -> threading.Lock:
+    key = str(path)
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = _WRITE_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """先写同目录临时文件再 os.replace 顶替：崩溃/并发读不会看到半截文件。
+
+    临时名带 pid + 线程 id + 随机后缀（不能只用 pid：同进程多线程会撞名），
+    同进程内同一路径再加一把锁串行化。
+    """
+    with _write_lock(path):
+        tmp = path.with_name(
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+        )
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            # 写失败/被打断时别把临时文件留在会话目录里
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+
 def _split_frontmatter(text: str):
     if text.startswith("---"):
         m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.S)
@@ -425,8 +506,17 @@ def _split_frontmatter(text: str):
 
 
 def load_presets() -> dict:
+    """加载全部预设。解析结果按文件签名缓存（工具循环里每次调用都要读，别每轮重解析）。
+
+    返回顶层浅拷贝：调用方只读，不要改嵌套结构（tools/user_input_template 等）。
+    """
+    paths = sorted(PRESET_DIR.glob("*.md"))
+    sig = _file_signature(paths)
+    hit = _CACHE.get("presets")
+    if hit is not None and hit[0] == sig:
+        return dict(hit[1])
     presets = {}
-    for p in sorted(PRESET_DIR.glob("*.md")):
+    for p in paths:
         meta, body = _split_frontmatter(p.read_text(encoding="utf-8"))
         sections = [
             {"role": m.group(1), "content": m.group(2).strip()}
@@ -446,13 +536,19 @@ def load_presets() -> dict:
             # 用户输入后处理模板,渲染时提供 user_input 变量;缺省 None 表示原样透传
             "user_input_template": uim.group(1).strip() if uim else None,
         }
-    return presets
+    _CACHE["presets"] = (sig, presets)
+    return dict(presets)
 
 
 def load_cards() -> dict:
-    cards = {}
+    """加载全部角色卡。按文件签名缓存，返回顶层浅拷贝（调用方只读）。"""
     # id 用相对路径（去 .md），天然唯一
     paths = sorted(GAMES_DIR.glob("*.md")) + sorted(GAMES_DIR.glob("*/*.md"))
+    sig = _file_signature(paths)
+    hit = _CACHE.get("cards")
+    if hit is not None and hit[0] == sig:
+        return dict(hit[1])
+    cards = {}
     for p in paths:
         meta, body = _split_frontmatter(p.read_text(encoding="utf-8"))
         m = SETTING_RE.search(body)
@@ -467,11 +563,23 @@ def load_cards() -> dict:
             "user_setting": um.group(1).strip() if um else "",
             "beginnings": [b.group(1).strip() for b in BEGINNING_RE.finditer(body)],
         }
-    return cards
+    _CACHE["cards"] = (sig, cards)
+    return dict(cards)
 
 
 def load_config() -> dict:
-    return yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+    """加载 config.yaml（按 mtime 缓存）。返回深拷贝：调用方会往里塞生成参数。
+
+    服务端改配置（加账号、调并发上限）保存文件即生效，不需要重启。
+    """
+    path = ROOT / "config.yaml"
+    sig = _file_signature([path])
+    hit = _CACHE.get("config")
+    if hit is not None and hit[0] == sig:
+        return copy.deepcopy(hit[1])
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    _CACHE["config"] = (sig, config)
+    return copy.deepcopy(config)
 
 
 # ---------- 多端点与生成参数 ----------
@@ -597,9 +705,12 @@ def effective_config(state: dict, config: dict) -> dict:
     return merged
 
 
-def _latest_session_state() -> dict | None:
-    """created_at 最大的会话 state（新会话继承其模型与生成参数配置）；无会话返回 None。"""
-    states = list_sessions()
+def _latest_session_state(user: str | None = None) -> dict | None:
+    """created_at 最大的会话 state（新会话继承其模型与生成参数配置）；无会话返回 None。
+
+    user 给定时只在同一用户的会话里找——否则新会话会继承别人的端点与温度。
+    """
+    states = list_sessions(user)
     if not states:
         return None
     return max(states, key=lambda s: s.get("created_at") or 0)
@@ -642,20 +753,27 @@ def resolve_options_enabled(state_value, config: dict) -> bool:
 # ---------- session 存储 ----------
 
 def _session_dir(name: str) -> Path:
-    return SESSIONS_DIR / safe_dir_name(name)
+    """会话键 -> 目录。带作用域的键落 sessions/<用户名>/<会话名>/，裸名仍落 sessions/<会话名>/。"""
+    user, bare = split_scope(name)
+    if user is None:
+        return SESSIONS_DIR / safe_dir_name(bare)
+    return SESSIONS_DIR / safe_dir_name(user) / safe_dir_name(bare)
 
 
-def list_sessions() -> list:
-    if not SESSIONS_DIR.exists():
+def list_sessions(user: str | None = None) -> list:
+    """会话 state 列表。给了 user 只列该用户的目录；本地模式（user=None）列 sessions/ 根目录。"""
+    root = SESSIONS_DIR / safe_dir_name(user) if user else SESSIONS_DIR
+    if not root.exists():
         return []
     out = []
-    for d in sorted(SESSIONS_DIR.iterdir()):
+    for d in sorted(root.iterdir()):
         if (d / "state.json").exists():
-            out.append(load_state(d.name))
+            out.append(load_state(session_key(user, d.name)))
     return out
 
 
 def create_session(name: str, preset: str, card: str, beginning_index):
+    user, bare = split_scope(name)
     cards = load_cards()
     if preset not in load_presets():
         raise ValueError(f"预设不存在: {preset}")
@@ -664,7 +782,7 @@ def create_session(name: str, preset: str, card: str, beginning_index):
     card_obj = cards[card]
     d = _session_dir(name)
     if d.exists():
-        raise ValueError(f"session 已存在: {name}")
+        raise ValueError(f"session 已存在: {bare}")
     if beginning_index is None:
         text = ""
     else:
@@ -672,11 +790,14 @@ def create_session(name: str, preset: str, card: str, beginning_index):
     d.mkdir(parents=True)
     (d / "history.jsonl").touch()
     config = load_config()
-    # 模型端点与生成参数继承上一个会话（最近创建者）；没有会话时回退端点 0 + config 默认值
-    prev = _latest_session_state() or {}
+    # 模型端点与生成参数继承上一个会话（最近创建者，只在同一用户范围内找）；
+    # 没有会话时回退端点 0 + config 默认值
+    prev = _latest_session_state(user) or {}
     state = {
+        # id 是用户作用域内的目录名（前端 URL 用它）；owner 是归属用户（本地模式为 None）
         "id": d.name,
-        "name": name,
+        "name": bare,
+        "owner": user,
         "preset": preset,
         "card": card_obj["id"],
         "card_name": card_obj["name"],
@@ -702,35 +823,45 @@ def fork_session(name: str, index: int) -> dict:
     新会话最后一项是 assistant 块（或空历史），可直接继续输入。世界状态由
     world.fork 按同一 index 复制。
     """
+    user, _bare = split_scope(name)
     state = load_state(name)
     history = load_history(name)
     if not (0 <= index < len(history)) or history[index]["role"] != "user":
         raise ValueError("fork 目标不是用户块")
     base = f"{state['name']}-fork-{time.strftime('%Y%m%d-%H%M%S')}"
     new_name, n = base, 2
-    while _session_dir(new_name).exists():
+    while _session_dir(session_key(user, new_name)).exists():
         new_name, n = f"{base}-{n}", n + 1
     new_state = {
         **state,
         "id": safe_dir_name(new_name),
         "name": new_name,
+        "owner": user,
         "created_at": time.time(),
         # fork 是新对话,重新生成 chat_id,不与原会话共用
         "chat_id": str(uuid.uuid4()),
     }
-    _session_dir(new_name).mkdir(parents=True)
+    _session_dir(session_key(user, new_name)).mkdir(parents=True)
     save_state(new_state)
-    save_history(new_name, history[:index])
+    save_history(session_key(user, new_name), history[:index])
     return new_state
 
 
 def load_state(name: str) -> dict:
-    return json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
+    state = json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
+    # 按读取时的作用域补上 owner：把旧会话（没有 owner 字段）手动挪进 sessions/<用户名>/ 后，
+    # 之后的 save_state 才会写回同一目录，而不是按裸名写回 sessions/ 根。
+    owner, _bare = split_scope(name)
+    if owner is not None and state.get("owner") != owner:
+        state["owner"] = owner
+    return state
 
 
 def save_state(state: dict) -> None:
-    (_session_dir(state["name"]) / "state.json").write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    # 落盘位置由 owner + name 决定（owner 缺失 = 改造前的旧 state，仍按裸名落根目录）
+    _atomic_write_text(
+        _session_dir(session_key(state.get("owner"), state["name"])) / "state.json",
+        json.dumps(state, ensure_ascii=False, indent=2),
     )
 
 
@@ -742,9 +873,9 @@ def load_history(name: str) -> list:
 
 
 def save_history(name: str, history: list) -> None:
-    f = _session_dir(name) / "history.jsonl"
-    f.write_text(
-        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in history), encoding="utf-8"
+    _atomic_write_text(
+        _session_dir(name) / "history.jsonl",
+        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in history),
     )
 
 

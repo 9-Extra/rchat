@@ -3,6 +3,7 @@ __pycache__
 uv.lock
 /sessions
 config.yaml
+auth_sessions.json
 
 # 本地预设/角色卡：白名单模式，默认不提交，仅保留以下文件
 /preset/*

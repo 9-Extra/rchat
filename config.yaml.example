@@ -31,3 +31,18 @@ temperature: 0.7         # 缺省不设置时请求不带该参数
 max_tokens: 100000       # 缺省不设置时请求不带该参数
 reasoning_effort: "medium"  # 思考强度默认值：none/low/medium/high/max（none=禁用思考）；不设置时按 low 处理
 # user_agent: "rchat/0.1"  # 覆盖 SDK 默认 UA（opencode-go 等端点风控拒绝语言默认 UA）
+
+# 服务端设置（本地自己跑时整段可以不管）
+server:
+  max_concurrent_generations: 4  # 全服务器同时在跑的生成上限，多出来的排队；改了要重启才生效
+
+# 用户名密码鉴权：enabled 为 false（或缺省）时不做鉴权，与本地单机行为完全一致。
+# 放服务器上时改成 true 并填账号，同时把这个文件 chmod 600（里面有 API key 和明文密码）。
+auth:
+  enabled: false
+  users:
+    alice: "换一个强密码"
+    # bob: "另一个强密码"
+  session_ttl_days: 30    # 登录态有效期（天）
+  cookie_secure: false    # 走 https 反代时置 true
+
