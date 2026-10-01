@@ -12,7 +12,7 @@ uv run -m main
 
 启动时除端点外还校验 `auth` 段：开了鉴权却一个账号都没有直接报错退出。
 
-**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 20 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
+**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 26 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
 
 **测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 

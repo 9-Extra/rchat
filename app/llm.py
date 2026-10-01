@@ -167,6 +167,19 @@ async def stream_body(input_items: list, config: dict, run_tool):
         yield event
 
 
+def _empty_output_error(status: str, *, streamed: bool) -> str:
+    """整轮没吐出任何内容的报错文本。
+
+    多数情况是模型被输出上限压空（max_tokens 太小，或思考 token 吃满了额度），这时笼统的
+    「模型未输出任何内容」会把人引向错误的排查方向（去看预设、看端点），所以把上游给的
+    结束原因一并写出来；确实什么都没说时 status 为空，退回原来的说法。
+    """
+    where = "流式响应" if streamed else "响应"
+    if status:
+        return f"模型未输出任何内容（{where} {status}）"
+    return "模型未输出任何内容"
+
+
 def _note_reasoning(reasonings: dict, round_output: list, item_id) -> None:
     """按第一次出现的位置记录一个 reasoning 项（只记一次，文本后填）。"""
     if item_id not in reasonings:
@@ -193,6 +206,7 @@ async def _stream_body_responses(input_items: list, config: dict, run_tool):
             by_item = {}  # function_call item_id -> calls 中的下标
             texts = {}  # message item_id -> 本轮该消息项累积的文本
             round_output = []
+            cut = ""  # 本轮为什么没跑完（response.incomplete，如 max_output_tokens）
             stream = await client.responses.create(**build_request(input_items, config), stream=True)
             async for event in stream:
                 etype = event.type
@@ -237,6 +251,9 @@ async def _stream_body_responses(input_items: list, config: dict, run_tool):
                     idx = by_item.get(getattr(item, "id", None))
                     if idx is not None and getattr(item, "arguments", None):
                         calls[idx]["arguments"] = item.arguments
+                elif etype == "response.incomplete":
+                    # 被输出上限/内容过滤提前收尾：流照样正常结束，只有这个事件说明原因
+                    cut = _response_status(event.response)
                 elif etype == "response.failed":
                     error = getattr(event.response, "error", None)
                     raise RuntimeError(f"Responses API 失败: {error}")
@@ -285,7 +302,7 @@ async def _stream_body_responses(input_items: list, config: dict, run_tool):
             if not calls:
                 # 本轮没有任何工具调用 = 正文说完了,回合结束(选项另行请求)
                 if not content:
-                    raise RuntimeError("模型未输出任何内容")
+                    raise RuntimeError(_empty_output_error(cut, streamed=True))
                 yield {"type": "done", "content": content,
                        "reasoning": round_reasoning or last_reasoning or PLACEHOLDER}
                 return
@@ -332,11 +349,14 @@ async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
             round_reasoning = ""
             round_text = ""  # 本轮新增的正文（回合级累积的是 content）
             calls = []  # 本轮工具调用：[{"id", "type", "name", "arguments"}]
+            finish_reason = ""  # 本轮上游给的结束原因（length = 被输出上限截断）
             stream = await client.chat.completions.create(**build_request(messages, config))
             async for chunk in stream:
                 choice = chunk.choices[0] if chunk.choices else None
                 if choice is None:
                     continue
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
                 delta = choice.delta
                 reasoning = _delta_reasoning(delta)
                 if reasoning:
@@ -392,7 +412,9 @@ async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
             if not calls:
                 # 本轮没有任何工具调用 = 正文说完了,回合结束(选项另行请求)
                 if not content:
-                    raise RuntimeError("模型未输出任何内容")
+                    raise RuntimeError(_empty_output_error(
+                        f"finish_reason={finish_reason}" if finish_reason else "", streamed=True
+                    ))
                 yield {"type": "done", "content": content, "reasoning": reasoning_for_items}
                 return
 
@@ -507,7 +529,9 @@ async def _request_options_once(client, input_items: list, config: dict) -> tupl
             return _render_calls(calls), "模型在选项请求里调用了工具，没有给出选项列表"
         text = choice.message.content or ""
         if not text.strip():
-            return "", f"模型没输出任何文本（finish_reason={choice.finish_reason}）"
+            return "", _empty_output_error(
+                f"finish_reason={choice.finish_reason}" if choice.finish_reason else "", streamed=False
+            )
         return text, ""
     payload["max_output_tokens"] = limit
     resp = await client.responses.create(**payload)
