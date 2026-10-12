@@ -6,11 +6,12 @@
 """
 import json
 import unittest
+from unittest import mock
 
 import tests.support  # noqa: F401
 
 from app import core
-from tests.support import TEST_USERS, AppTestCase
+from tests.support import TEST_CARD, TEST_PRESET, TEST_USERS, AppTestCase
 
 
 class AuthGateTest(AppTestCase):
@@ -102,6 +103,62 @@ class IsolationTest(AppTestCase):
             r = await bob.post("/api/sessions", json={"name": "b2", "preset": "GM-ptc",
                                                       "card": "龙娘x猫娘", "beginning_index": 0})
             self.assertNotEqual(r.json()["temperature"], 1.9, "bob 的新会话继承了 alice 的参数")
+
+
+class SessionNameTest(AppTestCase):
+    """会话名里混进 "/" 会让内部会话键错位：core.session_key 用 "/" 分隔用户名与会话名，
+    裸名带 "/" 时本地模式会落进 sessions/<前半截>/，前端拿裸 id 就再也找不回来
+    （角色卡 id 是相对路径，games/<世界包>/<角色卡>.md 就会带 "/"）。"""
+
+    def nested_cards(self, cid="世界包/角色卡"):
+        """造一张带世界包前缀的角色卡——load_cards 用相对路径当 id，长这样。"""
+        cards = dict(core.load_cards())
+        cards[cid] = {**cards[TEST_CARD], "id": cid, "name": "包里的卡"}
+        return cid, cards
+
+    async def create(self, cid, cards, name=""):
+        with mock.patch.object(core, "load_cards", lambda: cards):
+            return await self.client.post("/api/sessions", json={
+                "name": name, "preset": TEST_PRESET, "card": cid, "beginning_index": 0,
+            })
+
+    async def test_auto_name_from_nested_card_stays_bare(self):
+        cid, cards = self.nested_cards()
+        r = await self.create(cid, cards)
+        self.assertEqual(r.status_code, 200, r.text)
+        state = r.json()
+        self.assertTrue(state["name"].startswith("角色卡-"), state["name"])
+        self.assertNotIn("/", state["id"])
+        self.assertIsNone(state["owner"], "本地模式没有用户名，不该凭空多出一层作用域")
+        self.assertTrue((self.sessions_dir / state["id"] / "state.json").exists())
+        self.assertFalse((self.sessions_dir / "世界包").exists(), "落进了 <包名>/<会话名> 错位目录")
+        # 前端创建完就拿这个 id 去 GET 和列表：两处必须落在同一个目录
+        self.assertEqual((await self.client.get(f"/api/sessions/{state['id']}")).status_code, 200)
+        self.assertEqual([s["id"] for s in (await self.client.get("/api/sessions")).json()],
+                         [state["id"]])
+
+    async def test_typed_name_with_slash_stays_bare(self):
+        cid, cards = self.nested_cards()
+        # 名字的 strip + 归一化现在都在 core.create_session 里，前端原样传即可
+        r = await self.create(cid, cards, name=" 我的/会话 ")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["id"], "我的-会话")
+        self.assertEqual(r.json()["name"], "我的-会话")
+        self.assertEqual((await self.client.get("/api/sessions/我的-会话")).status_code, 200)
+        self.assertFalse((self.sessions_dir / "我的").exists())
+
+    async def test_bare_key_repairs_stale_owner(self):
+        """目录位置与 state.owner 打架时（错位目录、手工挪动后）以读取作用域为准：
+        否则裸名读到的会话会写回 sessions/<owner>/，读与写永远对不上。"""
+        d = self.sessions_dir / "s1"
+        d.mkdir()
+        (d / "state.json").write_text(
+            json.dumps({"id": "s1", "name": "s1", "owner": "世界包"}), encoding="utf-8")
+        state = core.load_state("s1")
+        self.assertIsNone(state["owner"])
+        core.save_state(state)
+        self.assertFalse((self.sessions_dir / "世界包").exists())
+        self.assertIsNone(json.loads((d / "state.json").read_text(encoding="utf-8"))["owner"])
 
 
 class TurnFlowTest(AppTestCase):

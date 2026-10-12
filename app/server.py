@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import time
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -204,12 +203,9 @@ class CreateSession(BaseModel):
 
 @app.post("/api/sessions")
 def post_session(req: CreateSession, user: str | None = Depends(current_user)):
-    name = req.name.strip()
-    if not name:
-        # 自动生成：角色卡 id + 时间戳（目录名由 core 在落盘时安全化，显示名保持原样）
-        name = f"{req.card}-{time.strftime('%Y%m%d-%H%M%S')}"
+    # 名字归一化、留空自动命名、作用域拼装都在 core.create_session 里（格式规则只在一处）
     try:
-        return core.create_session(_key(user, name), req.preset, req.card, req.beginning_index)
+        return core.create_session(user, req.name, req.preset, req.card, req.beginning_index)
     except (ValueError, IndexError) as e:
         raise HTTPException(400, str(e))
 

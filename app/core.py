@@ -30,8 +30,10 @@ SESSIONS_DIR = ROOT / "sessions"
 
 # world_run 的说明段（它被启用时才出现）
 _WORLD_RUN_PARA = """\
-world_run是你的计算器兼笔记本。所有数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）必须用代码生成，口头编点数的随机性很糟糕。所有需要追踪的游戏数据（生命、资源、物品、位置、旗标……）放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
-state只记当前状态，避免无限增长的日志，防止无效信息堆积。上下文本身就是日志。"""
+world_run是你的计算器兼笔记本，你自主决定如何使用，可以完全不使用。
+以下只是建议：
+数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）用代码生成，口头编点数的随机性很糟糕。需要计算和追踪的游戏数据放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
+state只记当前状态，避免无限增长的日志，防止无效信息堆积。"""
 
 _WORLD_RUN_NOTES = """\
 书写 world_run 代码的注意事项：
@@ -104,7 +106,7 @@ def _airp_prompt_ptc(bindings: list) -> str:
 OPTIONS_INSTRUCTION = """\
 <system>
 现在只做一件事：为玩家提供接下来的剧情推进选项，不要续写正文、不要调用任何工具。
-要求：2-4 条；每条一句话、导向不同的发展方向、不透露玩家角色未知的信息。
+要求：每条一句话、不透露玩家角色未知的信息。4条，分别为继续推进，意外反转，天马行空地展开，色情淫乱的展开
 只输出选项本身，一行一条，每行以「- 」开头（半角短横线加一个空格）：
 - 选项一
 - 选项二
@@ -121,7 +123,7 @@ _WORLD_RUN_TOOL_DEF = {
     "description": (
         "在持久的 Python 环境中执行一段代码，用于一切涉及数值与规则的判定与状态更新。"
         "跨调用保留：全局对象 state、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失。"
-        "约定：会变的游戏数据（生命、资源、旗标……）放进 state；固定不变的常量表/魔法数字用全大写变量定义（如 TIERS = [...]、MAX_HP = 100）；可复用的流程用顶层 def 函数定义（函数内部的 def 是局部的，调用结束即消失）。"
+        "约定：会变的游戏数据放进 state；固定不变的常量表/魔法数字用全大写变量定义（如 TIERS = [...]、MAX_HP = 100）；可复用的流程用顶层 def 函数定义（函数内部的 def 是局部的，调用结束即消失）。"
         "输出：print(...值) 写入当次日志返回。注意 normalize 之外的 print 是 normalize 执行前的值，normalize 执行后的结果在 state diff 中自动返回。"
         "原子执行：代码出错时自动回滚到执行前（state、函数、常量全部还原），不会留下半更新的状态。"
         "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
@@ -437,6 +439,16 @@ def split_scope(key: str) -> tuple:
         user, name = key.split("/", 1)
         return user, name
     return None, key
+
+
+def bare_session_name(name: str) -> str:
+    """把任意来源（角色卡 id、用户手输）的名字变成合法的「裸会话名」。
+
+    内部会话键是 "<用户名>/<会话名>"，裸名里混进 "/" 会被 split_scope 当成作用域前缀：
+    本地模式下会话落进 sessions/<前半截>/，前端拿裸 id 去 GET 就找不到它（创建目录与
+    访问目录错位）。角色卡 id 是相对路径，games/<世界包>/<角色卡>.md 天生带 "/"。
+    """
+    return name.replace("/", "-")
 
 
 # 解析结果缓存：值为 (文件签名, 解析结果)。签名 = 各文件的 (路径, mtime_ns, 大小)，
@@ -772,15 +784,26 @@ def list_sessions(user: str | None = None) -> list:
     return out
 
 
-def create_session(name: str, preset: str, card: str, beginning_index):
-    user, bare = split_scope(name)
+def create_session(user: str | None, name: str, preset: str, card: str, beginning_index):
+    """新建会话并返回 state。user 是归属用户（本地模式 None），name 是裸会话名。
+
+    名字的作用域拼装、归一化与「留空自动命名」都在这儿做：其余端点都按「带作用域的
+    会话键」定位已有会话，只有创建这一条路要造名字，格式规则就只在这一个地方维护。
+    """
     cards = load_cards()
     if preset not in load_presets():
         raise ValueError(f"预设不存在: {preset}")
     if card not in cards:
         raise ValueError(f"角色卡不存在: {card}")
     card_obj = cards[card]
-    d = _session_dir(name)
+    # 裸名里不能有 "/"：会话键用 "/" 分隔用户名与裸会话名（见 bare_session_name），
+    # 混进来会被 split_scope 当成作用域前缀，会话落进 sessions/<前半截>/ 后就找不回来了
+    bare = bare_session_name(name.strip())
+    if not bare:
+        # 留空则自动命名：角色卡文件名 + 时间戳（卡 id 是相对路径 games/<世界包>/<卡>.md）
+        bare = f"{card_obj['id'].rsplit('/', 1)[-1]}-{time.strftime('%Y%m%d-%H%M%S')}"
+    key = session_key(user, bare)
+    d = _session_dir(key)
     if d.exists():
         raise ValueError(f"session 已存在: {bare}")
     if beginning_index is None:
@@ -849,10 +872,11 @@ def fork_session(name: str, index: int) -> dict:
 
 def load_state(name: str) -> dict:
     state = json.loads((_session_dir(name) / "state.json").read_text(encoding="utf-8"))
-    # 按读取时的作用域补上 owner：把旧会话（没有 owner 字段）手动挪进 sessions/<用户名>/ 后，
-    # 之后的 save_state 才会写回同一目录，而不是按裸名写回 sessions/ 根。
+    # owner 一律以读取时的作用域为准：把旧会话（没有 owner 字段）手动挪进 sessions/<用户名>/
+    # 后，之后的 save_state 才会写回同一目录；反过来，错位目录（sessions/<包名>/<会话名>/）
+    # 被挪到根目录后 owner 也会清成 None，不会又把后面的每一次落盘写回错位目录。
     owner, _bare = split_scope(name)
-    if owner is not None and state.get("owner") != owner:
+    if state.get("owner") != owner:
         state["owner"] = owner
     return state
 

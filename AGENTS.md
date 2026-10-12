@@ -12,7 +12,7 @@ uv run -m main
 
 启动时除端点外还校验 `auth` 段：开了鉴权却一个账号都没有直接报错退出。
 
-**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 26 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
+**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 29 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
 
 **测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 
@@ -128,7 +128,7 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 
 ## 会话存储与操作
 
-`sessions/<用户名>/<name>/`（未启用鉴权时是 `sessions/<name>/`）下有 `state.json`、`history.jsonl`、`world/`（state.json / lib.py / snapshots.json）。state.json 里的 `owner` 决定落盘位置（缺失 = 改造前的旧 state，按裸名落根目录），`id` 是用户作用域内的目录名（前端 URL 用的就是它）。回滚/重生成/打断时 server 调 `world.sync` / `abort_turn` / `commit_turn` 让世界状态与历史对齐。
+`sessions/<用户名>/<name>/`（未启用鉴权时是 `sessions/<name>/`）下有 `state.json`、`history.jsonl`、`world/`（state.json / lib.py / snapshots.json）。`id` 是用户作用域内的目录名（前端 URL 用的就是它），所以**新建会话的名字里不能有 `/`**：会话键用 `/` 分隔用户名与裸会话名，裸名带 `/` 会被 `split_scope` 当成作用域前缀，会话落进 `sessions/<前半截>/` 里、前端拿裸 id 再也找不到它。新建会话走 `core.create_session(user, 裸会话名, preset, card, beginning_index)`：strip、`/` → `-` 的归一化（`bare_session_name`）、留空时的自动命名（角色卡文件名 + 时间戳；卡 id 是相对路径 `games/<世界包>/<卡>.md`，取末段）、以及按 user 拼会话键，全在这一个函数里，所以格式规则只有一处（其余端点都按带作用域的会话键定位已有会话，只管读不管造名字）。state.json 里的 `owner` 是归属用户、`save_state` 按它定位目录，`load_state` 每次按读取作用域校正它（缺失 = 改造前的旧 state 落根目录；错位目录被挪回根目录后 owner 也会清成 `None`，不会把后续落盘写回错位目录）。回滚/重生成/打断时 server 调 `world.sync` / `abort_turn` / `commit_turn` 让世界状态与历史对齐。
 
 所有落盘都是「写同目录临时文件 + `os.replace`」（`core._atomic_write_text`，临时名带 pid+线程 id+随机后缀，并按路径加一把进程内锁）：多人同时用、或者进程被 kill 时，不会留下半截的 state.json / history.jsonl / snapshots.json。那把锁不是多余的——FastAPI 的同步端点跑在工作线程池里，同进程两个线程同时写一个文件（最典型是两个人同时登录写 `auth_sessions.json`）在旧实现下实测每 1000 次约 39 次直接失败（Linux `FileNotFoundError`、Windows `WinError 32`），在应用里就是那一轮 history 没保存。
 
