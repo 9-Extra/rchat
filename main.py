@@ -56,6 +56,16 @@ def main() -> None:
         raise SystemExit(f"配置错误: {e}")
     logging.info("已加载 %d 个模型端点，默认: %s", len(eps), eps[0]["display_name"])
 
+    # 联网工具（web_search / web_fetch）配置：写了 web_tools 段就校验一遍，缺 key/非法值时
+    # 直接报错退出；完全没写这一段不报错（不启用这两个工具的预设用不上它）
+    config = core.load_config()
+    if "web_tools" in config:
+        try:
+            core.web_tool_config(config)
+        except ValueError as e:
+            raise SystemExit(f"配置错误: {e}")
+        logging.info("已启用联网工具：web_search / web_fetch")
+
     # 鉴权配置同样启动即校验：开了鉴权却没有账号，等于谁都进不来（也提示别把用户名写错）
     try:
         auth_cfg = auth.auth_settings()

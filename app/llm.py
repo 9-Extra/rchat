@@ -3,10 +3,11 @@
 一轮回复分两段，都是普通请求：
 1. 正文：模型可多次调用启用的工具（执行结果追加进输入继续请求），正文是普通文本输出，
    某一轮不再调用工具即视为说完，回合结束。
-2. 选项：正文结束后用 generate_options 再发一次请求，让它只产出选项行（一行一条，见
-   core.OPTIONS_INSTRUCTION）。这次请求必须与正文请求共用同一份 config（同 model /
-   tools / thinking 配置、不加 response_format），否则端点侧的前缀缓存整体失效（实测：
-   这三者任一变化，命中率从 98% 掉到 6%）。
+2. 选项：正文结束后用 generate_options 再发一次请求，让它只产出选项行（一行一条）。指令
+   来自预设的 <preset_options> 块（未定义时回退到 core.OPTIONS_INSTRUCTION），格式要求由
+   预设作者按 parse_options 的固定协议写清楚。这次请求必须与正文请求共用同一份 config
+   （同 model / tools / thinking 配置、不加 response_format），否则端点侧的前缀缓存整体
+   失效（实测：这三者任一变化，命中率从 98% 掉到 6%）。
 """
 import json
 import logging
@@ -26,6 +27,7 @@ MAX_ROUNDS = 25
 OPTIONS_MAX_TOKENS = 2048
 
 # 选项请求第一次没给出可解析的选项行时追加的提醒：作为上下文末尾的续写，不影响前缀缓存。
+# 它属于 parse_options 的固定协议，不随预设的 <preset_options> 变化；重试只追加、不改前缀。
 _OPTIONS_RETRY_HINT = """
 上一次输出不是合法的选项列表。请一行一个选项、每行以「- 」开头，除选项行外不要输出任何文字，例如：
 - 选项一
@@ -431,8 +433,8 @@ async def generate_options(input_items: list, config: dict) -> tuple:
 
     沿用同一份 config 是硬要求：实测 deepseek 官方端点上 tools 数组、thinking /
     reasoning_effort 三者任一与正文请求不一致，前缀缓存命中率就从 98% 掉到 6%。
-    response_format 同样会打断（且该端点不支持 json_schema），所以格式约束写在
-    core.OPTIONS_INSTRUCTION 里，靠解析兜底。
+    response_format 同样会打断（且该端点不支持 json_schema），所以格式约束写在预设的
+    <preset_options> 里（未定义时用 core.OPTIONS_INSTRUCTION），靠解析兜底。
     """
     async with _make_client(config) as client:
         error = ""

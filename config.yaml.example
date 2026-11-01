@@ -32,6 +32,15 @@ max_tokens: 100000       # 缺省不设置时请求不带该参数
 reasoning_effort: "medium"  # 思考强度默认值：none/low/medium/high/max（none=禁用思考）；不设置时按 low 处理
 # user_agent: "rchat/0.1"  # 覆盖 SDK 默认 UA（opencode-go 等端点风控拒绝语言默认 UA）
 
+# 联网工具（web_search / web_fetch）：打的是 DeepSeek 的 Search / Fetch 接口，与模型端点
+# 各自独立配置。api_key 就是 DeepSeek API Key，直接把端点上那个 key 复制过来即可。
+# 只有预设的 tools 列表里启用了 web_search / web_fetch 才用得上这一段（不写不报错）。
+web_tools:
+  api_base: "https://api.deepseek.com"   # 缺省就是这个
+  api_key: "YOUR_DEEPSEEK_API_KEY"
+  timeout: 60                            # 单次请求超时（秒），缺省 60
+  count: 10                              # web_search 缺省的返回条数（1~50），缺省 10
+
 # 服务端设置（本地自己跑时整段可以不管）
 server:
   max_concurrent_generations: 4  # 全服务器同时在跑的生成上限，多出来的排队；改了要重启才生效

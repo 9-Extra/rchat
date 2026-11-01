@@ -12,7 +12,7 @@ uv run -m main
 
 启动时除端点外还校验 `auth` 段：开了鉴权却一个账号都没有直接报错退出。
 
-**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 29 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
+**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 53 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
 
 **测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 
@@ -39,6 +39,7 @@ auth:
 
 - `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`、`reasoning_effort_map`（发给该端点前给思考强度改名，如 OpenRouter 写 `{max: xhigh}`，它的枚举只到 xhigh）、`provider`（原样塞进请求体的 `provider` 字段，OpenRouter 的路由偏好，如 `{preferred_min_throughput: 30}`＝默认负载均衡不变、只把低于 30 tok/s 的上游降到末尾；`sort` 与两个 `preferred_*` 阈值在启动时校验，其余键透传）、`session_id`（true 时把本会话的 `chat_id` 当**请求体** `session_id` 发出去——OpenRouter 靠它做粘性路由与上游缓存亲和，正文与选项请求才更容易落到同一个上游、命中同一份前缀缓存）。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
 - 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `options_enabled` / `user_agent`（覆盖 SDK 默认 UA）。
+- `web_tools`：联网工具（`web_search` / `web_fetch`）的**独立**配置，与模型端点无关——打的是 DeepSeek 的 `/v1/tools/search` 与 `/v1/tools/fetch`。`api_base`（缺省 `https://api.deepseek.com`）/ `api_key`（就是 DeepSeek API Key，从端点复制即可，**必填**，否则调用时以错误文本返回）/ `timeout`（秒，缺省 60）/ `count`（`web_search` 缺省条数，1~50，缺省 10）。写了这一段启动时校验，没写不报错（不启用这两个工具的预设用不上它，见 `core.web_tool_config`）。
 - `server.max_concurrent_generations`（缺省 4）：全服务器同时在跑的生成上限，多出来的排队等槽位（`server._generation_sem`，`_run` / `_run_options` 各占一个）。第一次用到时建成，改了要重启才生效。
 - `auth.*`：见「多用户与鉴权」。
 - 可按会话覆盖（存 state.json）：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` / `options_enabled`，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`、`/options`）。新会话继承 created_at 最大的那个会话的这几项（**同一用户内**），无会话时用端点 0 + config 默认；会话值非法/缺失回退 config 默认，config 值非法直接报错；fork 自动继承。
@@ -50,15 +51,35 @@ auth:
 
 ## 预设与角色卡
 
-预设 = 通用的 AI 主持指南（文风、禁词、防止全知），决定如何基于角色卡与历史拼出最开头的上下文，含系统提示词；角色卡 = 几个大字符串（世界设定、用户人设、开局），由预设通过宏决定插到哪。
+预设 = 通用的 AI 主持指南（文风、禁词、防止全知），决定如何基于角色卡与历史拼出最开头的上下文，含系统提示词；也定义正文之后选项请求的指令（`<preset_options>`）。角色卡 = 几个大字符串（世界设定、用户人设、开局），由预设通过宏决定插到哪。
 
-预设格式（示例 `./preset/GM.md`）：`<preset_section role="system|user|assistant">` 块组织内容。只有 `<preset_section>` 是代码处理的格式标记，其它 xml 标签是预设的**内部文本**，原样发给模型。宏：`{{game_setting}}`（世界设定）、`{{game_beginning}}`（选中的开局）、`{{user_setting}}`（用户人设）、`{{respond_tool}}`（工具相关提示词）。
+预设格式（示例 `./preset/GM.md`）：`<preset_section role="system|user|assistant">` 块组织内容。代码处理的格式标记只有 `<preset_section>`、`<preset_user_input>`、`<preset_options>`，其它 xml 标签是预设的**内部文本**，原样发给模型。宏：`{{game_setting}}`（世界设定）、`{{game_beginning}}`（选中的开局）、`{{user_setting}}`（用户人设）、`{{respond_tool}}`（工具相关提示词）。
 
 宏实现：所有 `{{...}}` 按 Python 表达式 eval（`core.render_template`），四个固定宏就是求值环境里的同名变量；环境里还预置 random / time / math / datetime。严格模式：未知变量或求值出错直接抛 ValueError，不静默兜底。
 
 `<preset_user_input>` 块（前后空白 trim）是用户输入的后处理模板，渲染时额外提供 `user_input`。它只作用于当前这一轮发给模型的内容，落盘的 history 仍是原文（回滚拿到原文，重生成会重新渲染）；没有这个块时用户输入原样透传。
 
-预设 frontmatter 的 `tools` 是工具白名单：列什么就只有什么（顺序即 schema 顺序），未定义时用 `world_run` + `read_file`。可选 `world_run` / `read_file` / `write_file` / `edit_file` / `bash`；未知名字（含历史上的 `respond`）在生成/预览时抛 ValueError。`core.respond_tool_text` 渲染的任务提示词按白名单裁剪：没启用的工具不出现，启用 write_file/edit_file/bash 会附上用法段。PTC 模式下 schema 只有 world_run，这个列表决定它程序内的绑定函数。
+`<preset_options>` 块（前后空白 trim）是选项生成请求的**完整指令**：正文落盘、选项请求发出前，它被渲染成一条追加在请求末尾的 user 消息（不在正文上下文里）。它和预设 section 共用宏环境（四个固定宏 + random/time/math/datetime），但没有 `user_input`（选项阶段没有输入框草稿）。未定义该块时回退到 `core.OPTIONS_INSTRUCTION`（旧预设行为不变）；块存在但为空、渲染后为空、或宏求值失败会抛 ValueError，选项阶段把它记成 `options_error`，**正文照常落盘**。块要放在 `<preset_section>` 外，否则会同时作为正文文本发给模型；同一预设多个块时取第一个。
+
+**选项格式是编写 `<preset_options>` 时的固定规范**：代码不会在块外再附加任何格式要求，预设作者必须自己写清楚；解析器也不随预设变化。预设必须要求模型一行一条、行首 `- `（半角短横线 + 空格）；没有合适选项时只输出单独一行「无」；除选项行外不要前言、后记、代码围栏或 JSON。条数不限，由预设自己规定。解析器也接受 `*` / `•` / `·` 与 `1.` / `2、` / `3)` 这类行首，但建议统一用 `- `。
+
+示例（可直接复制到预设里改引导语）：
+
+```xml
+<preset_options>
+现在只做一件事：为玩家提供接下来的剧情推进选项，不要续写正文、不要调用任何工具。
+要求：每条一句话、不透露玩家角色未知的信息。4条，分别为继续推进，意外反转，天马行空地展开，色情淫乱的展开
+只输出选项本身，一行一条，每行以「- 」开头（半角短横线加一个空格）：
+- 选项一
+- 选项二
+除这些选项行以外不要输出任何文字：不要前言与说明、不要额外建议。
+没有合适的选项时只输出一个字：无
+</preset_options>
+```
+
+选项请求必须与正文请求共用同一份 config（同 model / tools / thinking，且不加 `response_format`）；指令在请求末尾，替换它不影响前缀缓存。
+
+预设 frontmatter 的 `tools` 是工具白名单：列什么就只有什么（顺序即 schema 顺序），未定义时用 `world_run` + `read_file`。可选 `world_run` / `read_file` / `write_file` / `edit_file` / `bash` / `web_search` / `web_fetch`；未知名字（含历史上的 `respond`）在生成/预览时抛 ValueError。`core.respond_tool_text` 渲染的任务提示词按白名单裁剪：没启用的工具不出现，启用 write_file/edit_file/bash/web_search/web_fetch 会附上用法段。PTC 模式下 schema 只有 world_run，这个列表决定它程序内的绑定函数。
 
 角色卡格式：`<game_setting>` / `<user_setting>` / `<game_beginning>` 等 XML 块，宏名同名；示例见 `./games/龙娘x猫娘.md`。
 
@@ -71,6 +92,10 @@ schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正�
 - **write_file**：写 UTF-8（`overwrite` 整篇覆盖/新建、`append` 追加；父目录自动创建，换行统一 LF）。
 - **edit_file**：精确替换一段文字（`old_string` 逐字匹配、默认要求唯一，`replace_all=true` 全部替换；原文件的 LF/CRLF 风格不变）。
 - **bash**：Git Bash 里跑命令，返回 `<cwd>/<exit_code>/<output>`。bash.exe 由 `tools._shell()` 探测并缓存（PATH → `C:\Program Files\Git\bin` 等），找不到以错误文本返回；默认超时 60s / 上限 600s，超时终止（Windows 上可能留下孙进程），输出超 20000 字符只留开头。
+- **web_search**：联网搜索（DeepSeek Search 接口，`POST <api_base>/v1/tools/search`）。参数 `query`（1~128 字符，透传 `site:` / `-site:` / `-关键词` / `"精确短语"` / `lang:zh,en` / `after:` / `before:` 语法）、`count`（1~50，缺省取 config 的 `web_tools.count`）、`need_content`（是否附正文）、`ori_question`。结果按条格式化：标题 / 链接 / 站点·日期·权威性 / 摘要（`summary`，缺失时用 `snippet`）/ 正文（`need_content` 时，每条截到 1500 字符）；整段返回文本上限 16000 字符，无结果时返回「没有匹配的结果」（不算错误）。
+- **web_fetch**：抓单个网页（`POST <api_base>/v1/tools/fetch`），返回 `<url>/<title>/<content>`，正文是 Markdown、上限 24000 字符。url 必须是含主机名的 http/https，不能带用户名密码（本地先校验，无效 URL 不发请求）。
+
+两个联网工具的配置在 `config.yaml` 的 `web_tools` 段（与端点独立，key 就是 DeepSeek 的 key）：`core.web_tool_config` 负责解析与校验，缺 key 时**以错误文本返回**给模型（不抛异常、不中断本轮），并记一条 WARNING。HTTP 非 200 时把状态码、含义（401/402/403/404/429/5xx）与接口的 `error.message` 拼成一句话返回。同步 httpx 客户端 → `execute_tool` 用 `asyncio.to_thread` 调用（world 内的绑定是同步调用）。它们不依赖角色卡目录，所以在 `_session_card_dir` 之前分发。
 
 文件类工具的相对路径基准与 bash 的工作目录都是**当前会话角色卡所在目录**（`games/<世界包>/`），也接受绝对路径；取不到卡目录时报错。`tools.execute_tool` 先按会话预设解析白名单，未启用的工具名返回带「本会话启用的直接工具」清单的错误文本。直接调 bash 走 `asyncio.to_thread`（不卡事件循环），world_run 内的 bash 绑定是同步执行（长命令卡住服务端）。工具的文件/shell 副作用不参与 world_run 的出错回滚（回滚只覆盖 state 与函数/常量）。
 
@@ -102,7 +127,7 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 
 ### 选项生成
 
-- **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 一条 user 指令（`core.OPTIONS_INSTRUCTION`：只要 2-4 条、只输出以「- 」开头的选项行、不要续写正文也不要调用工具）。
+- **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 预设 `<preset_options>` 渲染出的 user 指令（未定义时用 `core.OPTIONS_INSTRUCTION`；块内容/格式规范见「预设与角色卡」）。
 - **输出格式**：一行一条、每行以「- 」开头（模型因此不必转义选项里的引号；此前用 JSON 时「引号未转义」和「括号配错」两类语法错都实际发生过）。没有合适选项时输出单独一行「无」。
 - **缓存约束（实测 deepseek 官方端点）**：必须与正文请求共用同一份 config——同 model、同 tools、同 thinking / reasoning_effort，且**不加 `response_format`**。任一项不一致，前缀缓存命中率从 98% 掉到 6%；作为「正文请求的严格续写」它自身只在末尾多几十个 token（命中约 96%）。所以别给选项请求单独压低思考，也别用 `response_format`（该端点不支持 json_schema，`json_object` 同样往 prompt 头部插说明、打断前缀）。
 - **解析与兜底**（`core.parse_options`）：按行扫，只认 `_OPTION_LINE_RE` 匹配的选项行（行首 `-` / `*` / `•` / `·`，或 `1.` `2、` `3)` 这类编号）——前言、后记、代码围栏、空行一律丢弃，**不做宽松兜底**（把杂行当选项会在页面上多出假按钮）；一行都没有时抛 ValueError；单独一行「无」表示这轮没有合适选项、返回空列表。失败追加一条提醒重发一次（`_OPTIONS_RETRY_HINT`，追加在末尾不影响前缀），仍失败则选项为空、错误写进 entry 的 `options_error`（前端给提示 +「重新生成选项」；与表示整轮失败的 `error` 区分）。正文不受影响。
@@ -112,7 +137,7 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 
 ## PTC 模式
 
-预设 frontmatter 加 `ptc: true`（如 `preset/GM-ptc.md`）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），其余工具降级为 world_run 命名空间内的 Python 绑定函数（`world._bindings_for` 按白名单挂载 read_file/write_file/edit_file/bash 各一个 `_*_binding`；签名写在 `{{respond_tool}}` 提示词和 world_run 的 schema 描述两处，都由 core 按白名单拼）。叙事仍是普通文本，工具只用于判定与记账，回合结束同样是「某一轮不再调用任何工具」，选项与普通模式一样由正文后的独立请求生成。保留名是 state/print 加上当前启用的绑定名，不允许模型的顶层 def/常量覆盖；会话中途切换预设由 `world._reconcile_bindings` 原地换掉绑定（保留当前 state 与函数定义）。
+预设 frontmatter 加 `ptc: true`（如 `preset/GM-ptc.md`）即开启，形态对齐 DeepSeek Harness 的 PTC 训练分布：schema 只含 world_run 一个工具（调用其它工具名返回错误），其余工具降级为 world_run 命名空间内的 Python 绑定函数（`world._bindings_for` 按白名单挂载 read_file/write_file/edit_file/bash/web_search/web_fetch 各一个 `_*_binding`；签名写在 `{{respond_tool}}` 提示词和 world_run 的 schema 描述两处，都由 core 按白名单拼）。叙事仍是普通文本，工具只用于判定与记账，回合结束同样是「某一轮不再调用任何工具」，选项与普通模式一样由正文后的独立请求生成。保留名是 state/print 加上当前启用的绑定名，不允许模型的顶层 def/常量覆盖；会话中途切换预设由 `world._reconcile_bindings` 原地换掉绑定（保留当前 state 与函数定义）。联网绑定是同步调用（阻塞），长搜索会卡住执行它的工作线程。
 
 ## 流式、落盘与失败
 

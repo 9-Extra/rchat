@@ -647,15 +647,22 @@ async def _run(gen: dict, prep: dict) -> None:
             _emit(gen, event)
         if done is None:
             raise RuntimeError("API 未返回完整结果")
-        # 正文已经是完整一轮：选项是它之后的第二次请求，失败也不影响正文落盘
+        # 正文已经是完整一轮：选项是它之后的第二次请求，失败也不影响正文落盘。
+        # 选项提示词由预设的 <preset_options> 渲染，可能因空块/宏报错而构建失败；那也
+        # 只是选项没拿到，正文已经流完并会照常落盘（错误进 options_error）。
         if prep["options_enabled"]:
             _emit(gen, {"type": "options_start"})
-            options_input = core.build_options_input(
-                prep["state"], history, done["content"], tool_calls, done.get("reasoning", "")
-            )
-            options, options_error, options_raw = await generate_options(
-                options_input, prep["config"]
-            )
+            try:
+                options_input = core.build_options_input(
+                    prep["state"], history, done["content"], tool_calls, done.get("reasoning", "")
+                )
+                options, options_error, options_raw = await generate_options(
+                    options_input, prep["config"]
+                )
+            except Exception as e:
+                logger.exception("会话 %s 选项阶段失败", name)
+                options_error = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+                options_raw = ""
             if options_error:
                 _emit(gen, {"type": "options_error", "message": options_error, "raw": options_raw})
             else:

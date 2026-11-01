@@ -22,7 +22,8 @@ SESSIONS_DIR = ROOT / "sessions"
 # AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，工具只用于判定与记账）。
 # 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
 # 宏名沿用历史叫法，内容已不含任何选项契约：选项不再由模型在正文回合里提交，而是在正文
-# 落盘后由 OPTIONS_INSTRUCTION 驱动的独立请求生成（见 llm.generate_options）。
+# 落盘后由预设的 <preset_options>（缺省时用 OPTIONS_INSTRUCTION）驱动的独立请求生成
+# （见 llm.generate_options）。
 # 文本由 respond_tool_text 按预设 frontmatter 的 tools 白名单组装：没启用的工具不出现在
 # 提示词里。
 # 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
@@ -48,6 +49,10 @@ write_file 用来写文件：默认整篇覆盖（文件不存在就新建，父
 edit_file 用来把文件里的一段文字精确替换成另一段：old_string 必须与文件内容逐字一致（含缩进与空行），默认要求它在文件里唯一，否则报错要你给出更长的上下文；replace_all=True 时全部替换。不确定文件当前内容时先用 read_file 看一眼。""",
     "bash": """\
 bash 在角色卡所在目录执行一段 shell 命令（Git Bash），返回退出码与合并后的输出（stdout 在前、stderr 在后）：适合批量处理文件、跑脚本、查环境这类事情。命令有超时上限（默认 60 秒，最多 600 秒），超时会被终止；不要用它跑需要交互输入的命令。""",
+    "web_search": """\
+web_search 用来联网搜索：按 query 搜网页，返回标题、链接、摘要、发布时间与权威性。涉及实时信息（新闻、版本号、价格、你不确定的事实）先搜再写，不要凭记忆编造。query 支持 site:/lang:/after: 这类搜索语法；一次搜索给不给正文由 need_content 决定，需要细节时一般先看摘要，再用 web_fetch 抓最相关的那一页。""",
+    "web_fetch": """\
+web_fetch 用来抓取单个网页并取回 Markdown 正文：先用 web_search 拿到真实链接再抓，不要凭猜测拼 URL。页面很长时只保留开头部分。""",
 }
 
 
@@ -80,6 +85,8 @@ _PTC_BINDING_DOCS = {
     "write_file": "- write_file(file_path: str, content: str = '', mode: str = 'overwrite')：写 UTF-8 文本文件（overwrite 整篇覆盖/新建，append 追加到末尾，父目录自动创建），相对路径以角色卡所在目录为基准。",
     "edit_file": "- edit_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False)：把文件里的一段文字精确替换成另一段，old_string 必须与文件内容逐字一致且默认唯一。",
     "bash": "- bash(command: str, timeout: int = 60)：执行一段 shell 命令（Git Bash），返回退出码与合并后的输出，timeout 最多 600 秒。",
+    "web_search": "- web_search(query: str, count: int = 10, need_content: bool = False)：联网搜索网页，返回标题/链接/摘要（need_content=True 时附带正文），用于实时信息。",
+    "web_fetch": "- web_fetch(url: str)：抓取单个网页并以 Markdown 返回正文，url 必须是含主机名的 http/https 地址。",
 }
 
 
@@ -98,7 +105,8 @@ def _airp_prompt_ptc(bindings: list) -> str:
     parts.append("再次提醒：world_run 只用来做判定与记账，正文直接写出来即可。")
     return "\n\n".join(parts)
 
-# 选项请求的指令：正文落盘后单独发一次请求，只让它产出选项行。
+# 选项请求的默认指令：未在预设里写 <preset_options> 时回退到这份文本，保证旧预设行为不变。
+# 预设定义后整段替换（见 options_instruction），所以这里同时是格式规范的参考实现。
 # 必须与正文请求共用同一份 config（同 tools / 同 thinking 配置、不加 response_format），
 # 否则端点侧的前缀缓存整体失效（见 llm.generate_options）。
 # 格式用「一行一条、行首 - 空格」而不是 JSON：选项原文里常带引号（「"是，主人"」），JSON
@@ -233,8 +241,43 @@ _BASH_TOOL_DEF = {
     },
 }
 
+_WEB_SEARCH_TOOL_DEF = {
+    "name": "web_search",
+    "description": (
+        "联网搜索网页（DeepSeek Search 接口），返回标题、链接、摘要与发布时间等结果，用于获取实时信息"
+        "（新闻、版本、价格、事实核查）。query 支持搜索语法：site:/-site:/-关键词/\"精确短语\"/lang:zh,en/"
+        "after:2025-01-01/before:2026。一般先用默认参数看摘要，需要正文时再 need_content=True 或用 "
+        "web_fetch 抓具体那一页。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "搜索词（1~128 字符），支持 site:/lang:/after: 等搜索语法。"},
+            "count": {"type": "number", "description": "返回条数，1~50；缺省用 config.yaml 的 web_tools.count（默认 10）。"},
+            "need_content": {"type": "boolean", "description": "是否一并返回网页正文（默认 false，只给摘要，省上下文）。"},
+            "ori_question": {"type": "string", "description": "触发这次搜索的用户原始问题（1~128 字符），有助于理解搜索意图。"},
+        },
+        "required": ["query"],
+    },
+}
+
+_WEB_FETCH_TOOL_DEF = {
+    "name": "web_fetch",
+    "description": (
+        "抓取单个网页并以 Markdown 文本返回正文（DeepSeek Fetch 接口）。一般先用 web_search 找到链接再抓"
+        "最相关的那一页，不要凭猜测拼 URL。url 必须是含主机名的 http/https 地址，且不能携带用户名或密码。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "要抓取的网页地址（http/https，含主机名）。"},
+        },
+        "required": ["url"],
+    },
+}
+
 # 可以直接调用的工具（选项不是工具：正文落盘后由独立请求生成）
-TOOL_NAMES = ("world_run", "read_file", "write_file", "edit_file", "bash")
+TOOL_NAMES = ("world_run", "read_file", "write_file", "edit_file", "bash", "web_search", "web_fetch")
 # 预设未声明 tools 字段时的默认工具集
 DEFAULT_TOOLS = ("world_run", "read_file")
 _TOOL_DEFS = {
@@ -243,6 +286,8 @@ _TOOL_DEFS = {
     "write_file": _WRITE_FILE_TOOL_DEF,
     "edit_file": _EDIT_FILE_TOOL_DEF,
     "bash": _BASH_TOOL_DEF,
+    "web_search": _WEB_SEARCH_TOOL_DEF,
+    "web_fetch": _WEB_FETCH_TOOL_DEF,
 }
 
 
@@ -305,6 +350,8 @@ def _world_run_ptc_def(bindings: list) -> dict:
         "write_file": "write_file(file_path, content, ...)",
         "edit_file": "edit_file(file_path, old_string, new_string, ...)",
         "bash": "bash(command, timeout, ...)",
+        "web_search": "web_search(query, ...)",
+        "web_fetch": "web_fetch(url)",
     }
     named = [sigs[n] for n in bindings if n in sigs]
     joined = ("、".join(named[:-1]) + " 与 " + named[-1]) if len(named) > 1 else (named[0] if named else "")
@@ -373,6 +420,9 @@ SECTION_RE = re.compile(
     r'<preset_section\s+role="(system|user|assistant)"\s*>(.*?)</preset_section>', re.S
 )
 USER_INPUT_RE = re.compile(r"<preset_user_input>(.*?)</preset_user_input>", re.S)
+# 选项指令块：正文落盘后追加到请求末尾的 user 消息。它不进入正文上下文；缺失时回退到
+# OPTIONS_INSTRUCTION。输出格式是解析器固定协议，由预设作者按规范写在这个块里。
+OPTIONS_RE = re.compile(r"<preset_options>(.*?)</preset_options>", re.S)
 SETTING_RE = re.compile(r"<game_setting>(.*?)</game_setting>", re.S)
 USER_SETTING_RE = re.compile(r"<user_setting>(.*?)</user_setting>", re.S)
 BEGINNING_RE = re.compile(r"<game_beginning>(.*?)</game_beginning>", re.S)
@@ -399,6 +449,44 @@ def render_template(text: str, env: dict) -> str:
         except Exception as e:
             raise ValueError(f"预设宏执行失败 {expr!r}: {e}")
     return MACRO_RE.sub(repl, text)
+
+
+def _preset_env(state: dict, preset: dict, card: dict) -> dict:
+    """预设正文与 <preset_options> 共用的宏求值环境。
+
+    选项阶段没有输入框草稿，所以不该有 user_input；预设 section、user_input 模板各自
+    再按需把额外变量合进来。
+    """
+    return {
+        **MACRO_MODULES,
+        "game_setting": card["setting"],
+        "game_beginning": state["beginning_text"],
+        "user_setting": card["user_setting"],
+        "respond_tool": respond_tool_text(preset),
+    }
+
+
+def options_instruction(preset: dict, env: dict) -> str:
+    """预设定义的选项指令；未定义时回退到 OPTIONS_INSTRUCTION。
+
+    块存在但为空、或宏求值失败都直接抛 ValueError，不静默兜底——选项阶段会把它记成
+    options_error，正文照常落盘。输出格式（每行「- 」开头、无合适选项输出「无」）由
+    parse_options 固定，预设作者必须在自己的指令里写清楚。
+    """
+    raw = preset.get("options_instruction")
+    if raw is None:
+        return OPTIONS_INSTRUCTION
+    if not raw.strip():
+        raise ValueError(f"预设 {preset.get('id')} 的 <preset_options> 块为空")
+    try:
+        text = render_template(raw, env)
+    except ValueError as e:
+        raise ValueError(f"预设 {preset.get('id')} 的 <preset_options> 渲染失败: {e}") from e
+    if not text.strip():
+        raise ValueError(f"预设 {preset.get('id')} 的 <preset_options> 渲染后为空")
+    return text
+
+
 # 文件系统明确不允许的字符（Windows 保留字符 + 控制字符）
 INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # Windows 保留设备名
@@ -535,6 +623,7 @@ def load_presets() -> dict:
             for m in SECTION_RE.finditer(body)
         ]
         uim = USER_INPUT_RE.search(body)
+        om = OPTIONS_RE.search(body)
         presets[p.stem] = {
             "id": p.stem,
             "name": meta.get("name") or p.stem,
@@ -547,6 +636,9 @@ def load_presets() -> dict:
             "tools": meta.get("tools"),
             # 用户输入后处理模板,渲染时提供 user_input 变量;缺省 None 表示原样透传
             "user_input_template": uim.group(1).strip() if uim else None,
+            # 选项请求的指令块；缺省 None = 用 OPTIONS_INSTRUCTION 回退。
+            # 不在这里渲染：宏依赖角色卡与会话状态，每次请求时再算（见 options_instruction）。
+            "options_instruction": om.group(1).strip() if om else None,
         }
     _CACHE["presets"] = (sig, presets)
     return dict(presets)
@@ -592,6 +684,52 @@ def load_config() -> dict:
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     _CACHE["config"] = (sig, config)
     return copy.deepcopy(config)
+
+
+# ---------- 联网工具（web_search / web_fetch）----------
+# 这两个工具打的是 DeepSeek 的 Search / Fetch 接口（/v1/tools/search、/v1/tools/fetch），
+# 与模型端点彼此独立：config.yaml 里单独一段 web_tools 配它们的 api_base / api_key。
+# 实际用的 key 就是 DeepSeek API Key，从端点那边复制过来即可。
+WEB_TOOL_API_BASE = "https://api.deepseek.com"
+WEB_TOOL_TIMEOUT = 60
+WEB_TOOL_COUNT = 10
+WEB_TOOL_COUNT_MAX = 50
+
+
+def web_tool_config(config: dict) -> dict:
+    """解析 config.yaml 的 web_tools 段，返回 {api_base, api_key, timeout, count}。
+
+    缺 api_key 时抛 ValueError：只有真的调用了 web_search / web_fetch 才会走到这儿，
+    没启用这两个工具的预设不必写这一段（启动校验也只校验写了的段）。
+    """
+    raw = config.get("web_tools")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"config.yaml 的 web_tools 不是映射: {raw!r}")
+    api_key = raw.get("api_key")
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ValueError(
+            "config.yaml 的 web_tools.api_key 未配置：web_search / web_fetch 需要 DeepSeek API Key"
+            "（与 DeepSeek 端点用的同一个 key，复制过来即可）"
+        )
+    api_base = raw.get("api_base") or WEB_TOOL_API_BASE
+    if not isinstance(api_base, str) or not api_base.startswith(("http://", "https://")):
+        raise ValueError(f"config.yaml 的 web_tools.api_base 非法: {api_base!r}")
+    timeout = raw.get("timeout", WEB_TOOL_TIMEOUT)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 600:
+        raise ValueError(f"config.yaml 的 web_tools.timeout 非法: {timeout!r}（1~600 秒）")
+    count = raw.get("count", WEB_TOOL_COUNT)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= WEB_TOOL_COUNT_MAX:
+        raise ValueError(
+            f"config.yaml 的 web_tools.count 非法: {count!r}（1~{WEB_TOOL_COUNT_MAX} 条）"
+        )
+    return {
+        "api_base": api_base.rstrip("/"),
+        "api_key": api_key.strip(),
+        "timeout": float(timeout),
+        "count": count,
+    }
 
 
 # ---------- 多端点与生成参数 ----------
@@ -1009,24 +1147,21 @@ def build_input(state: dict, history: list, draft=None) -> list:
     api_type = config.get("api_type", "responses")
     preset = load_presets()[state["preset"]]
     card = load_cards()[state["card"]]
-    env = {
-        **MACRO_MODULES,
-        "game_setting": card["setting"],
-        "game_beginning": state["beginning_text"],
-        "user_setting": card["user_setting"],
-        "respond_tool": respond_tool_text(preset),
-    }
+    env = _preset_env(state, preset, card)
     if api_type == "chat_completions":
         return _build_input_chat_completions(state, history, draft, preset, env)
     return _build_input_responses(state, history, draft, preset, env)
 
 
 def build_options_input(state: dict, history: list, content: str, tool_calls: list, reasoning: str) -> list:
-    """拼装「选项请求」的输入：正文请求的输入 + 本轮的助手回复 + 选项指令。
+    """拼装「选项请求」的输入：正文请求的输入 + 本轮的助手回复 + 预设的选项指令。
 
     history 是不含本轮的那段历史，本轮回复按 content/tool_calls/reasoning 现场拼出来，
     于是这次请求的输入就是正文请求输入的严格续写：端点侧的前缀缓存能整段命中（实测约 96%），
     每轮只多付末尾那几十个 token。
+
+    选项指令来自预设的 <preset_options> 块（宏按本会话的角色卡渲染）；未定义时回退到
+    OPTIONS_INSTRUCTION。它作为最后一条 user 消息追加，所以换指令只影响末尾、不碰前缀。
 
     必须与正文请求共用同一份 config（同 model / 同 tools / 同 thinking 配置、不加
     response_format），否则前缀整体失配——这是硬约束，不是优化。
@@ -1038,16 +1173,19 @@ def build_options_input(state: dict, history: list, content: str, tool_calls: li
         "tool_calls": tool_calls,
     }
     items = list(build_input(state, history + [entry]))
+    preset = load_presets()[state["preset"]]
+    card = load_cards()[state["card"]]
+    instruction = options_instruction(preset, _preset_env(state, preset, card))
     if effective_config(state, load_config()).get("api_type", "responses") == "chat_completions":
-        items.append({"role": "user", "content": OPTIONS_INSTRUCTION})
+        items.append({"role": "user", "content": instruction})
     else:
-        items.append(_message_item("user", OPTIONS_INSTRUCTION))
+        items.append(_message_item("user", instruction))
     return items
 
 
 # 选项行：行首是短横线/星号/圆点，或「1.」「2、」「3)」这类编号；后面要有内容。
 # 只认这一类行，是为了把模型顺手写的前言、后记、代码围栏、空行全部丢掉——逐行格式没有
-# JSON 那种天然的起止边界，边界只能靠行首标记来定（见 OPTIONS_INSTRUCTION）。
+# JSON 那种天然的起止边界，边界只能靠行首标记来定（见 <preset_options> / OPTIONS_INSTRUCTION）。
 _OPTION_LINE_RE = re.compile(r"^(?:[-*•·]\s+|\d{1,2}\s*[.、)．）]\s*)(.+)$")
 
 # 没有合适选项时的哨兵行：模型偶尔会在「无」后面带个句号
@@ -1057,8 +1195,8 @@ _NO_OPTIONS_RE = re.compile(r"^无[。.！!]*$")
 def parse_options(text: str) -> list:
     """从选项请求的回复里解析出选项；一条选项行都找不到时抛 ValueError。
 
-    一行一条（行首带「- 」，见 OPTIONS_INSTRUCTION），选项原文里的引号、括号一律不用转义，
-    也就没有 JSON 那类「引号没转义 / 括号配错」的语法失败面。不在规定格式里的行直接丢弃，
+    一行一条（行首带「- 」，见 <preset_options> / OPTIONS_INSTRUCTION），选项原文里的引号、
+    括号一律不用转义，也就没有 JSON 那类「引号没转义 / 括号配错」的语法失败面。不在规定格式里的行直接丢弃，
     所以别对它们做宽松兜底——前言、后记一旦被当成选项，就成了页面上的假按钮。
     单独一行「无」表示这轮没有合适选项，返回空列表。
     """

@@ -201,6 +201,26 @@ def _bash_binding(rt, command, timeout=60):
     return _log_binding_call(rt, result)
 
 
+def _web_search_binding(rt, query, count=None, need_content=False, ori_question=None):
+    """命名空间内的 web_search 绑定：联网搜索，返回格式化后的结果文本。"""
+    from app import tools
+    try:
+        result = tools.web_search(query, count, need_content is True, ori_question)
+    except Exception as e:
+        result = f"错误：web_search 调用失败：{type(e).__name__}: {e}"
+    return _log_binding_call(rt, result)
+
+
+def _web_fetch_binding(rt, url):
+    """命名空间内的 web_fetch 绑定：抓单个网页的 Markdown 正文。"""
+    from app import tools
+    try:
+        result = tools.web_fetch(url)
+    except Exception as e:
+        result = f"错误：web_fetch 调用失败：{type(e).__name__}: {e}"
+    return _log_binding_call(rt, result)
+
+
 def _bindings_for(rt, name):
     """按会话预设启用的工具构造绑定函数字典。
 
@@ -226,6 +246,12 @@ def _bindings_for(rt, name):
             )
         elif tool_name == "bash":
             out["bash"] = lambda command, timeout=60: _bash_binding(rt, command, timeout)
+        elif tool_name == "web_search":
+            out["web_search"] = lambda query, count=None, need_content=False, ori_question=None: (
+                _web_search_binding(rt, query, count, need_content, ori_question)
+            )
+        elif tool_name == "web_fetch":
+            out["web_fetch"] = lambda url: _web_fetch_binding(rt, url)
     return out
 
 

@@ -191,6 +191,21 @@ class TurnFlowTest(AppTestCase):
         entry = (await self.get_session())["history"][0]
         self.assertEqual(entry["options"], ["先去公会看看", "直接出城"])
 
+    async def test_options_prompt_failure_keeps_body(self):
+        """预设选项块坏了（空块/宏错）：正文照常落盘，只把错误记进 options_error。"""
+        await self.new_session()
+        await self.client.post("/api/sessions/s1/options", json={"enabled": True})
+        with mock.patch.object(
+            core, "build_options_input", side_effect=ValueError("预设的 <preset_options> 坏了")
+        ):
+            code, events = await self.turn("/start")
+        self.assertEqual(code, 200)
+        self.assertIn("options_error", [e["type"] for e in events])
+        self.assertNotIn("options", [e["type"] for e in events])
+        entry = (await self.get_session())["history"][0]
+        self.assertIn("假模型", entry["content"])
+        self.assertIn("<preset_options>", entry["options_error"])
+
     async def test_generation_failure_is_persisted(self):
         await self.new_session()
         self.llm.fail = True

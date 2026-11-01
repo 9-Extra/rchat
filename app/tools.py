@@ -1,6 +1,7 @@
-"""工具实现（read_file/write_file/edit_file/bash）与工具分发。
+"""工具实现（read_file/write_file/edit_file/bash/web_search/web_fetch）与工具分发。
 
 文件类工具的相对路径以当前会话角色卡所在目录为基准（也接受绝对路径），bash 在该目录下执行。
+web_search / web_fetch 打 DeepSeek 的 Search / Fetch 接口，配置见 config.yaml 的 web_tools 段。
 启用哪些工具由会话预设 frontmatter 的 tools 白名单决定（见 core.preset_tools）。
 """
 import asyncio
@@ -10,7 +11,10 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
+
+import httpx
 
 from app import core, world
 
@@ -30,6 +34,15 @@ BASH_TIMEOUT = 60
 BASH_MAX_TIMEOUT = 600
 # bash 单次返回的字符上限
 BASH_MAX_CHARS = 20000
+
+# 联网工具（web_search / web_fetch）：query 长度、条数上限与返回文本的长度上限
+# （正文进上下文很贵，抓一整页时只保留开头）
+WEB_QUERY_MAX = 128
+WEB_COUNT_MAX = 50
+WEB_SEARCH_CONTENT_CHARS = 1500  # need_content 时每条结果的正文保留字符数
+WEB_SEARCH_MAX_CHARS = 16000  # 一次搜索返回文本的总上限
+WEB_FETCH_MAX_CHARS = 24000  # 抓单个网页时正文保留的字符数
+WEB_URL_MAX = 8192
 
 # 打断 world_run 时的收尾宽限（秒）：线程杀不掉，等它跑完再抛取消，避免与
 # world.abort_turn / commit_turn 抢同一个 state。超时说明模型代码还在跑（死循环），
@@ -292,6 +305,165 @@ def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = Non
     return render((proc.stdout or "") + (proc.stderr or ""), proc.returncode)
 
 
+def _truncate(text: str, limit: int) -> str:
+    """超长文本截断，并在末尾说明原文有多长。"""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…（已截断，原文 {len(text)} 字符）"
+
+
+def _api_error(resp) -> str:
+    """把 Search/Fetch 的错误响应压成一句话：状态码 + 含义 + 接口给的 message。"""
+    hint = {
+        400: "请求不合法",
+        401: "API Key 缺失或无效",
+        402: "账号余额不足",
+        403: "Fetch 被目标站点的安全策略拒绝",
+        404: "没能取到可用的网页内容",
+        408: "读取请求体超时",
+        413: "请求体超过大小限制",
+        429: "超过 QPS 限制（稍等再试）",
+        500: "服务器内部错误",
+        504: "下游请求超时",
+    }.get(resp.status_code, "")
+    message = ""
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        message = str(data["error"].get("message") or "").strip()
+    if not message:
+        message = (resp.text or "").strip()[:300]
+    return "，".join(p for p in (f"HTTP {resp.status_code}", hint, message) if p)
+
+
+def _web_api(params: dict, path: str, payload: dict) -> dict:
+    """POST 一次 Search/Fetch 接口，返回解析后的 JSON；失败抛 RuntimeError（文本可直接给模型）。"""
+    url = params["api_base"] + path
+    headers = {
+        "Authorization": f"Bearer {params['api_key']}",
+        "Content-Type": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=params["timeout"]) as client:
+            resp = client.post(url, json=payload, headers=headers)
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"请求 {url} 失败：{type(e).__name__}: {e}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"{url} 返回 {_api_error(resp)}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"{url} 返回的不是 JSON：{(resp.text or '').strip()[:200]}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{url} 返回格式异常：{str(data)[:200]}")
+    return data
+
+
+def _format_search_results(query: str, results: list) -> str:
+    """把 Search 接口的 results 压成模型好读的文本：一条一块，摘要与正文按需截断。"""
+    if not results:
+        return f"<query>{query}</query>\n<results>没有匹配的结果。</results>"
+    lines = [f"<query>{query}</query>", f'<results count="{len(results)}">']
+    for i, item in enumerate(results, 1):
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"{i}. {str(item.get('title') or '(无标题)').strip()}")
+        if item.get("url"):
+            lines.append(f"   链接：{item['url']}")
+        meta = []
+        if item.get("site_name"):
+            meta.append(str(item["site_name"]))
+        date = str(item.get("date") or "")[:10]
+        if date:
+            meta.append(date)
+        authority = item.get("authority")
+        if isinstance(authority, int) and not isinstance(authority, bool) and authority >= 0:
+            meta.append(f"权威性 {authority}/4")
+        if meta:
+            lines.append("   " + " · ".join(meta))
+        summary = str(item.get("summary") or item.get("snippet") or "").strip()
+        if summary:
+            lines.append("   摘要：" + summary)
+        content = str(item.get("content") or "").strip()
+        if content:
+            lines.append("   正文：" + _truncate(content, WEB_SEARCH_CONTENT_CHARS))
+    lines.append("</results>")
+    return _truncate("\n".join(lines), WEB_SEARCH_MAX_CHARS)
+
+
+def web_search(query, count=None, need_content: bool = False, ori_question=None) -> str:
+    """调 DeepSeek Search 接口搜网页，返回格式化后的结果文本（错误也以文本返回）。
+
+    配置来自 config.yaml 的 web_tools 段（api_base/api_key/timeout/count）；count 不传时用
+    那一段的默认条数。need_content=True 时每条结果附上正文（截断到 WEB_SEARCH_CONTENT_CHARS）。
+    """
+    try:
+        params = core.web_tool_config(core.load_config())
+    except Exception as e:
+        return f"错误：{e}"
+    if not isinstance(query, str) or not query.strip():
+        return "错误：query 不能为空"
+    query = query.strip()
+    if len(query) > WEB_QUERY_MAX:
+        return f"错误：query 太长（{len(query)} 字符），最多 {WEB_QUERY_MAX} 个字符"
+    if count is None:
+        count = params["count"]
+    if isinstance(count, float) and count.is_integer():
+        count = int(count)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= WEB_COUNT_MAX:
+        return f"错误：count 必须是 1~{WEB_COUNT_MAX} 之间的整数，收到 {count!r}"
+    payload = {"query": query, "count": count, "need_content": need_content is True}
+    if isinstance(ori_question, str) and ori_question.strip():
+        payload["ori_question"] = ori_question.strip()[:WEB_QUERY_MAX]
+    try:
+        data = _web_api(params, "/v1/tools/search", payload)
+    except Exception as e:
+        logger.warning("web_search 失败：%s", e)
+        return f"错误：web_search 失败：{e}"
+    results = data.get("results")
+    if not isinstance(results, list):
+        return f"错误：web_search 返回格式异常：{json.dumps(data, ensure_ascii=False)[:300]}"
+    return _format_search_results(query, results)
+
+
+def web_fetch(url) -> str:
+    """调 DeepSeek Fetch 接口抓一个网页，返回 Markdown 正文（错误也以文本返回）。"""
+    try:
+        params = core.web_tool_config(core.load_config())
+    except Exception as e:
+        return f"错误：{e}"
+    if not isinstance(url, str) or not url.strip():
+        return "错误：url 不能为空"
+    url = url.strip()
+    if len(url) > WEB_URL_MAX:
+        return f"错误：url 太长（{len(url)} 字符），最多 {WEB_URL_MAX} 个字符"
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as e:
+        return f"错误：url 解析失败：{e}"
+    if parts.scheme not in ("http", "https"):
+        return "错误：url 必须是 http:// 或 https:// 开头的地址"
+    if not parts.hostname:
+        return "错误：url 必须包含主机名（如 https://example.com/article）"
+    if parts.username or parts.password:
+        return "错误：url 不能携带用户名或密码"
+    try:
+        data = _web_api(params, "/v1/tools/fetch", {"url": url})
+    except Exception as e:
+        logger.warning("web_fetch 失败：%s", e)
+        return f"错误：web_fetch 失败：{e}"
+    title = str(data.get("title") or "").strip()
+    content = str(data.get("content") or "").strip()
+    if not content:
+        return f"错误：web_fetch 没有取到正文（{url}）"
+    head = f"<url>{url}</url>"
+    if title:
+        head += f"\n<title>{title}</title>"
+    return f"{head}\n<content>\n{_truncate(content, WEB_FETCH_MAX_CHARS)}\n</content>"
+
+
 def _session_card_dir(session: str):
     """会话工具调用的相对路径基准 / bash 工作目录：角色卡所在目录。返回 (目录, 错误文本)。"""
     try:
@@ -365,6 +537,22 @@ async def execute_tool(session: str, name: str, arguments: str) -> str:
             except Exception:
                 pass  # 程序自己出错：结果本来就要丢弃
             raise
+        except Exception as e:
+            logger.exception("工具 %s 执行失败", name)
+            return f"错误：{type(e).__name__}: {e}"
+    if name in ("web_search", "web_fetch"):
+        # 联网请求是阻塞调用（httpx 同步客户端），放进工作线程，别卡事件循环；
+        # 这两个工具不需要角色卡目录，所以放在 _session_card_dir 之前
+        try:
+            if name == "web_search":
+                return await asyncio.to_thread(
+                    web_search,
+                    args.get("query", ""),
+                    args.get("count"),
+                    args.get("need_content") is True,
+                    args.get("ori_question"),
+                )
+            return await asyncio.to_thread(web_fetch, args.get("url", ""))
         except Exception as e:
             logger.exception("工具 %s 执行失败", name)
             return f"错误：{type(e).__name__}: {e}"
