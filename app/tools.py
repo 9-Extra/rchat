@@ -187,7 +187,10 @@ def edit_file(
             return f'错误：无法修改 "{absolute}"：文件不存在（新建文件请用 write_file）'
         if not absolute.is_file():
             return f'错误：无法修改 "{absolute}"：不是普通文件'
-        raw = absolute.read_text(encoding="utf-8", newline="")
+        # newline="" 保留原始换行符（Path.read_text 的 newline 参数是 3.13 才有的，
+        # 而 pyproject 声明 >=3.10，这里只能用 open）
+        with absolute.open(encoding="utf-8", newline="") as f:
+            raw = f.read()
     except UnicodeDecodeError:
         return f'错误：无法修改 "{absolute}"：不是 UTF-8 文本文件'
     except Exception as e:
@@ -212,7 +215,8 @@ def edit_file(
     replaced = count if replace_all else 1
     out = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     try:
-        absolute.write_text(out, encoding="utf-8", newline="\r\n" if crlf else "\n")
+        with absolute.open("w", encoding="utf-8", newline="\r\n" if crlf else "\n") as f:
+            f.write(out)
     except Exception as e:
         return f"错误：{type(e).__name__}: {e}"
     return f'已替换 "{absolute}" 中的 {replaced} 处（现共 {_count_lines(out)} 行）'

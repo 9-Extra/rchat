@@ -12,7 +12,7 @@ uv run -m main
 
 启动时除端点外还校验 `auth` 段：开了鉴权却一个账号都没有直接报错退出。
 
-**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 53 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
+**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 59 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑、3.12 的 `Path.read_text` 不认 `newline` 时 edit_file 仍要能跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
 
 **测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 
@@ -90,7 +90,7 @@ schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正�
 - **world_run**：持久 Python 环境（`app/world.py`）。每会话一个 exec 命名空间，三者持久化到 `<会话目录>/world/`：state（state.json）、顶层 def 函数、全大写全局变量（常量，规则 `^[A-Z][A-Z0-9_]*$`）；函数与常量存源码进 lib.py，重放时按 `tree.body` 顺序 exec。**无超时保护**，所以 `execute_tool` 把它丢进 `asyncio.to_thread` 执行：死循环只占住一个工作线程，不会把事件循环和所有人的 SSE 一起冻住（代价是它会一直占着那个线程，`MemoryMax`/`TasksMax` 兜底）。线程杀不掉，所以**打断时会先等它跑完再抛取消**（`WORLD_RUN_CANCEL_GRACE`＝5 秒；代码用 `asyncio.shield` + `wait_for`）：否则取消处理器里的 `world.abort_turn` / `commit_turn` 会和还在改 `state` 的线程同时动手（`json.dumps` 撞出 `dictionary changed size during iteration`，或让被取消那轮的函数定义留进 lib）。超过宽限（多半是死循环）才放行并记 WARNING。
 - **read_file**：只读分页，默认/上限 2000 行、单次约 50KB，超出用 offset/limit 翻页。
 - **write_file**：写 UTF-8（`overwrite` 整篇覆盖/新建、`append` 追加；父目录自动创建，换行统一 LF）。
-- **edit_file**：精确替换一段文字（`old_string` 逐字匹配、默认要求唯一，`replace_all=true` 全部替换；原文件的 LF/CRLF 风格不变）。
+- **edit_file**：精确替换一段文字（`old_string` 逐字匹配、默认要求唯一，`replace_all=true` 全部替换；原文件的 LF/CRLF 风格不变）。读原文件用 `open(newline="")` 保留原始换行符：`Path.read_text` 的 `newline` 参数是 **3.13** 才加的，而 pyproject 声明 ≥3.10（Debian 12 的系统 python3 就是 3.11），改回 `read_text(..., newline=...)` 会让这个工具在服务器上直接 TypeError，`tests/test_file_tools.py` 会红。
 - **bash**：Git Bash 里跑命令，返回 `<cwd>/<exit_code>/<output>`。bash.exe 由 `tools._shell()` 探测并缓存（PATH → `C:\Program Files\Git\bin` 等），找不到以错误文本返回；默认超时 60s / 上限 600s，超时终止（Windows 上可能留下孙进程），输出超 20000 字符只留开头。
 - **web_search**：联网搜索（DeepSeek Search 接口，`POST <api_base>/v1/tools/search`）。参数 `query`（1~128 字符，透传 `site:` / `-site:` / `-关键词` / `"精确短语"` / `lang:zh,en` / `after:` / `before:` 语法）、`count`（1~50，缺省取 config 的 `web_tools.count`）、`need_content`（是否附正文）、`ori_question`。结果按条格式化：标题 / 链接 / 站点·日期·权威性 / 摘要（`summary`，缺失时用 `snippet`）/ 正文（`need_content` 时，每条截到 1500 字符）；整段返回文本上限 16000 字符，无结果时返回「没有匹配的结果」（不算错误）。
 - **web_fetch**：抓单个网页（`POST <api_base>/v1/tools/fetch`），返回 `<url>/<title>/<content>`，正文是 Markdown、上限 24000 字符。url 必须是含主机名的 http/https，不能带用户名密码（本地先校验，无效 URL 不发请求）。
