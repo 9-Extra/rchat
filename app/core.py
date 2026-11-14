@@ -1,5 +1,4 @@
 """预设/角色卡解析、session 存储、上下文拼装。"""
-import copy
 import datetime
 import json
 import math
@@ -14,7 +13,9 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(__file__).resolve().parent.parent
+from app import config
+from app.config import EFFORT_LEVELS, ROOT, Settings, TurnConfig
+
 PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
@@ -319,15 +320,6 @@ def preset_tools(preset: dict) -> tuple:
 def session_tools(state: dict) -> tuple:
     """按会话预设解析 (直接工具名单, 绑定名)。预设不存在时 KeyError（交由调用方处理）。"""
     return preset_tools(load_presets()[state["preset"]])
-
-
-def apply_preset_tools(config: dict, state: dict) -> None:
-    """把预设决定的生成模式与工具白名单写进扁平 config（server 在生成/预览前调用）。"""
-    preset = load_presets()[state["preset"]]
-    direct, bindings = preset_tools(preset)
-    config["ptc"] = bool(preset.get("ptc"))
-    config["tools"] = direct
-    config["bindings"] = bindings
 
 
 def respond_tool_text(preset: dict) -> str:
@@ -669,188 +661,69 @@ def load_cards() -> dict:
     return dict(cards)
 
 
-def load_config() -> dict:
-    """加载 config.yaml（按 mtime 缓存）。返回深拷贝：调用方会往里塞生成参数。
+def load_settings() -> Settings:
+    """config.yaml 的唯一读取入口（薄封装：测试替换这一个点即可，不必碰磁盘）。
 
-    服务端改配置（加账号、调并发上限）保存文件即生效，不需要重启。
+    解析与校验都在 app/config.py 里，这里只保证调用方拿到的是不可变的 Settings 快照。
     """
-    path = ROOT / "config.yaml"
-    sig = _file_signature([path])
-    hit = _CACHE.get("config")
-    if hit is not None and hit[0] == sig:
-        return copy.deepcopy(hit[1])
-    config = yaml.safe_load(path.read_text(encoding="utf-8"))
-    _CACHE["config"] = (sig, config)
-    return copy.deepcopy(config)
+    return config.Settings.load()
 
 
 # ---------- 联网工具（web_search / web_fetch）----------
 # 这两个工具打的是 DeepSeek 的 Search / Fetch 接口（/v1/tools/search、/v1/tools/fetch），
 # 与模型端点彼此独立：config.yaml 里单独一段 web_tools 配它们的 api_base / api_key。
-# 实际用的 key 就是 DeepSeek API Key，从端点那边复制过来即可。
-WEB_TOOL_API_BASE = "https://api.deepseek.com"
-WEB_TOOL_TIMEOUT = 60
-WEB_TOOL_COUNT = 10
-WEB_TOOL_COUNT_MAX = 50
-
-
-def web_tool_config(config: dict) -> dict:
-    """解析 config.yaml 的 web_tools 段，返回 {api_base, api_key, timeout, count}。
-
-    缺 api_key 时抛 ValueError：只有真的调用了 web_search / web_fetch 才会走到这儿，
-    没启用这两个工具的预设不必写这一段（启动校验也只校验写了的段）。
-    """
-    raw = config.get("web_tools")
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"config.yaml 的 web_tools 不是映射: {raw!r}")
-    api_key = raw.get("api_key")
-    if not isinstance(api_key, str) or not api_key.strip():
-        raise ValueError(
-            "config.yaml 的 web_tools.api_key 未配置：web_search / web_fetch 需要 DeepSeek API Key"
-            "（与 DeepSeek 端点用的同一个 key，复制过来即可）"
-        )
-    api_base = raw.get("api_base") or WEB_TOOL_API_BASE
-    if not isinstance(api_base, str) or not api_base.startswith(("http://", "https://")):
-        raise ValueError(f"config.yaml 的 web_tools.api_base 非法: {api_base!r}")
-    timeout = raw.get("timeout", WEB_TOOL_TIMEOUT)
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 600:
-        raise ValueError(f"config.yaml 的 web_tools.timeout 非法: {timeout!r}（1~600 秒）")
-    count = raw.get("count", WEB_TOOL_COUNT)
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= WEB_TOOL_COUNT_MAX:
-        raise ValueError(
-            f"config.yaml 的 web_tools.count 非法: {count!r}（1~{WEB_TOOL_COUNT_MAX} 条）"
-        )
-    return {
-        "api_base": api_base.rstrip("/"),
-        "api_key": api_key.strip(),
-        "timeout": float(timeout),
-        "count": count,
-    }
+# 解析与校验在 app/config.py（Settings.web_tools()，用到才校验）。
 
 
 # ---------- 多端点与生成参数 ----------
 
-# 端点的合法键（来自 config.yaml 的 endpoints 列表）
-_ENDPOINT_KEYS = ("display_name", "api_base", "model", "api_key", "api_type",
-                  "x_opencode_session", "reasoning_effort_map", "provider", "session_id")
-
-# provider 路由（OpenRouter 的字段，写错它自己会 400）里本项目校验的部分
-_PROVIDER_SORTS = ("price", "throughput", "latency")
-_PROVIDER_PERCENTILES = ("p50", "p75", "p90", "p99")
+# 端点、web_tools、auth、server 的解析与校验都在 app/config.py 里（默认值也只有那一处）：
+# 这里只负责把「会话状态 + 预设」叠到 Settings 上，产出一个 TurnConfig。
 
 
-def _check_effort_map(value, i: int) -> None:
-    """reasoning_effort_map：发给该端点前给思考强度改名（如 OpenRouter 只到 xhigh，没有 max）。"""
-    if value is None:
-        return
-    if not isinstance(value, dict):
-        raise ValueError(f"config.yaml 的 endpoints[{i}].reasoning_effort_map 不是映射: {value!r}")
-    for k, v in value.items():
-        if k not in EFFORT_LEVELS:
-            raise ValueError(
-                f"config.yaml 的 endpoints[{i}].reasoning_effort_map 键非法: {k!r}"
-                f"（可选值: {', '.join(EFFORT_LEVELS)}）"
-            )
-        if not isinstance(v, str) or not v:
-            raise ValueError(
-                f"config.yaml 的 endpoints[{i}].reasoning_effort_map[{k!r}] 不是非空字符串: {v!r}"
-            )
-
-
-def _is_threshold(v) -> bool:
-    """吞吐/延迟阈值：一个数字（p50），或 p50/p75/p90/p99 的子集。"""
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return True
-    return (
-        isinstance(v, dict) and bool(v)
-        and all(k in _PROVIDER_PERCENTILES and isinstance(n, (int, float)) and not isinstance(n, bool)
-                for k, n in v.items())
-    )
-
-
-def _check_provider(value, i: int) -> None:
-    """provider：原样塞进请求体的 provider 字段（OpenRouter 的路由偏好）。这里只校验本项目
-    文档化的三项，其余键透传——OpenRouter 对未知键会 400，报错由它给更准的信息。"""
-    if value is None:
-        return
-    where = f"config.yaml 的 endpoints[{i}].provider"
-    if not isinstance(value, dict):
-        raise ValueError(f"{where} 不是映射: {value!r}")
-    sort = value.get("sort")
-    if sort is not None:
-        if isinstance(sort, str):
-            ok = sort in _PROVIDER_SORTS
-        else:
-            ok = isinstance(sort, dict) and sort.get("by") in _PROVIDER_SORTS
-        if not ok:
-            raise ValueError(f"{where}.sort 非法: {sort!r}（{ '/'.join(_PROVIDER_SORTS) }，或 {{by: ..., partition: ...}}）")
-    for key in ("preferred_min_throughput", "preferred_max_latency"):
-        if key in value and not _is_threshold(value[key]):
-            raise ValueError(
-                f"{where}.{key} 非法: {value[key]!r}（数字，或 {{p50/p75/p90/p99: 数字}}）"
-            )
-
-
-def endpoints(config: dict) -> list:
-    """返回校验后的端点列表。端点为空、缺 api_key/model/api_base 时直接报错（启动校验也走这里）。"""
-    out = []
-    for i, raw in enumerate(config.get("endpoints") or []):
-        if not isinstance(raw, dict):
-            raise ValueError(f"config.yaml 的 endpoints[{i}] 不是映射: {raw!r}")
-        ep = {k: raw[k] for k in _ENDPOINT_KEYS if k in raw}
-        for k in ("api_base", "model", "api_key"):
-            if not ep.get(k):
-                raise ValueError(f"config.yaml 的 endpoints[{i}] 缺少必填项 {k}")
-        ep.setdefault("display_name", ep["model"])
-        _check_effort_map(ep.get("reasoning_effort_map"), i)
-        _check_provider(ep.get("provider"), i)
-        out.append(ep)
-    if not out:
-        raise ValueError("config.yaml 没有配置任何端点（endpoints 为空）")
-    return out
-
-
-def resolve_endpoint_index(state_value, config: dict) -> int:
+def resolve_endpoint_index(state_value, settings: Settings) -> int:
     """解析会话实际使用的端点下标：会话值合法直接用，非法/缺失回退 0。"""
-    eps = endpoints(config)
-    if isinstance(state_value, int) and not isinstance(state_value, bool) and 0 <= state_value < len(eps):
+    if isinstance(state_value, int) and not isinstance(state_value, bool) \
+            and 0 <= state_value < len(settings.endpoints):
         return state_value
     return 0
 
 
-def _resolve_num(state_value, config: dict, key: str, integer: bool):
-    """数值型按会话覆盖：会话值合法直接用，否则回退全局；全局未设置返回 None（请求不带），非法直接报错。"""
-    if integer:
-        ok = lambda x: isinstance(x, int) and not isinstance(x, bool) and x >= 1
-    else:
-        ok = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
-    v = state_value if ok(state_value) else config.get(key)
-    if v is None:
-        return None
-    if not ok(v):
-        raise ValueError(f"config.yaml 的 {key} 非法: {v!r}")
-    return v
+def resolve_temperature(state_value, settings: Settings):
+    """会话覆盖优先，否则用全局；None = 请求不带该参数。"""
+    if isinstance(state_value, (int, float)) and not isinstance(state_value, bool):
+        return state_value
+    return settings.temperature
 
 
-def resolve_temperature(state_value, config: dict):
-    return _resolve_num(state_value, config, "temperature", integer=False)
+def resolve_max_tokens(state_value, settings: Settings):
+    if isinstance(state_value, int) and not isinstance(state_value, bool) and state_value >= 1:
+        return state_value
+    return settings.max_tokens
 
 
-def resolve_max_tokens(state_value, config: dict):
-    return _resolve_num(state_value, config, "max_tokens", integer=True)
+def build_turn(state: dict) -> TurnConfig:
+    """把 Settings + 会话状态 + 预设派生的工具白名单合成一次请求实际生效的配置。
 
-
-def effective_config(state: dict, config: dict) -> dict:
-    """合并出 llm 使用的扁平 config：全局键 + 选中端点键 + 会话生成参数覆盖。"""
-    merged = {k: v for k, v in config.items() if k != "endpoints" and k not in _ENDPOINT_KEYS}
-    merged.update(endpoints(config)[resolve_endpoint_index(state.get("endpoint"), config)])
-    merged["temperature"] = resolve_temperature(state.get("temperature"), config)
-    merged["max_tokens"] = resolve_max_tokens(state.get("max_tokens"), config)
-    # 会话标识（llm 读 chat_id）：X-Opencode-Session 头，以及端点开了 session_id 时的请求体 session_id
-    merged["chat_id"] = state.get("chat_id", "")
-    return merged
+    唯一的构造点：`server` 的三个入口、`build_input`、`llm` 都只认这里产出的 TurnConfig，
+    不再各自拼 dict、也不再各自兜默认值（默认值全在 app/config.py）。
+    """
+    settings = load_settings()
+    endpoint = settings.endpoints[resolve_endpoint_index(state.get("endpoint"), settings)]
+    preset = load_presets()[state["preset"]]
+    direct, bindings = preset_tools(preset)
+    return TurnConfig(
+        endpoint=endpoint,
+        temperature=resolve_temperature(state.get("temperature"), settings),
+        max_tokens=resolve_max_tokens(state.get("max_tokens"), settings),
+        reasoning_effort=resolve_reasoning_effort(state.get("reasoning_effort"), settings),
+        chat_id=state.get("chat_id", ""),
+        user_agent=settings.user_agent,
+        ptc=bool(preset.get("ptc")),
+        tools=tuple(direct),
+        bindings=tuple(bindings),
+        options_enabled=resolve_options_enabled(state.get("options_enabled"), settings),
+    )
 
 
 def _latest_session_state(user: str | None = None) -> dict | None:
@@ -864,38 +737,18 @@ def _latest_session_state(user: str | None = None) -> dict | None:
     return max(states, key=lambda s: s.get("created_at") or 0)
 
 
-# 思考强度五档；none = 禁用思考（请求带 "thinking": {"type": "disabled"}，见 llm.build_request）
-EFFORT_LEVELS = ("none", "low", "medium", "high", "max")
-
-
-def resolve_reasoning_effort(state_value, config: dict) -> str:
-    """解析实际生效的思考强度。
-
-    会话值合法直接用；非法或缺失时回退 config 默认值；config 未设置时用 low；
-    config 值非法直接报错（不静默兜底，避免发出与预期不符的请求）。
-    """
+def resolve_reasoning_effort(state_value, settings: Settings) -> str:
+    """解析实际生效的思考强度：会话值合法直接用，否则用全局默认（config 里写错在解析时就报错）。"""
     if state_value in EFFORT_LEVELS:
         return state_value
-    default = config.get("reasoning_effort")
-    if default is None:
-        return "low"
-    if default not in EFFORT_LEVELS:
-        raise ValueError(
-            f"config.yaml 的 reasoning_effort 非法: {default!r}（可选值: {', '.join(EFFORT_LEVELS)}）"
-        )
-    return default
+    return settings.reasoning_effort
 
 
-def resolve_options_enabled(state_value, config: dict) -> bool:
-    """解析是否生成选项：会话值合法直接用，否则回退 config 默认，最后默认开启。"""
+def resolve_options_enabled(state_value, settings: Settings) -> bool:
+    """解析是否生成选项：会话值合法直接用，否则用全局默认（缺省开启）。"""
     if isinstance(state_value, bool):
         return state_value
-    default = config.get("options_enabled")
-    if default is None:
-        return True
-    if not isinstance(default, bool):
-        raise ValueError(f"config.yaml 的 options_enabled 非法: {default!r}（应为 true/false）")
-    return default
+    return settings.options_enabled
 
 
 # ---------- session 存储 ----------
@@ -948,7 +801,7 @@ def create_session(user: str | None, name: str, preset: str, card: str, beginnin
         text = card_obj["beginnings"][beginning_index]
     d.mkdir(parents=True)
     (d / "history.jsonl").touch()
-    config = load_config()
+    settings = load_settings()
     # 模型端点与生成参数继承上一个会话（最近创建者，只在同一用户范围内找）；
     # 没有会话时回退端点 0 + config 默认值
     prev = _latest_session_state(user) or {}
@@ -965,12 +818,12 @@ def create_session(user: str | None, name: str, preset: str, card: str, beginnin
         "created_at": time.time(),
         # 每会话固定的 UUID v4,作为 X-Opencode-Session 请求头发送(opencode-go 风控)
         "chat_id": str(uuid.uuid4()),
-        "endpoint": resolve_endpoint_index(prev.get("endpoint"), config),
-        "temperature": resolve_temperature(prev.get("temperature"), config),
-        "max_tokens": resolve_max_tokens(prev.get("max_tokens"), config),
-        # 创建时快照思考强度与选项开关,之后前端可按会话覆盖(config 非法时此处直接报错)
-        "reasoning_effort": resolve_reasoning_effort(prev.get("reasoning_effort"), config),
-        "options_enabled": resolve_options_enabled(prev.get("options_enabled"), config),
+        "endpoint": resolve_endpoint_index(prev.get("endpoint"), settings),
+        "temperature": resolve_temperature(prev.get("temperature"), settings),
+        "max_tokens": resolve_max_tokens(prev.get("max_tokens"), settings),
+        # 创建时快照思考强度与选项开关,之后前端可按会话覆盖
+        "reasoning_effort": resolve_reasoning_effort(prev.get("reasoning_effort"), settings),
+        "options_enabled": resolve_options_enabled(prev.get("options_enabled"), settings),
     }
     save_state(state)
     return state
@@ -1139,19 +992,20 @@ def _build_input_chat_completions(state, history, draft, preset, env):
     return messages
 
 
-def build_input(state: dict, history: list, draft=None) -> list:
-    """拼装发送给模型的完整输入。根据会话生效的 api_type 返回 Responses input_items 或 Chat Completions messages。"""
-    config = effective_config(state, load_config())
-    api_type = config.get("api_type", "responses")
+def build_input(state: dict, history: list, draft, turn: TurnConfig) -> list:
+    """拼装发送给模型的完整输入。按本次生效的 api_type 返回 Responses input_items 或
+    Chat Completions messages —— turn 由 `build_turn()` 构造，和发给 llm 的是同一个对象，
+    保证「上下文形状」与「请求形状」不会各说各话。"""
     preset = load_presets()[state["preset"]]
     card = load_cards()[state["card"]]
     env = _preset_env(state, preset, card)
-    if api_type == "chat_completions":
+    if turn.endpoint.api_type == "chat_completions":
         return _build_input_chat_completions(state, history, draft, preset, env)
     return _build_input_responses(state, history, draft, preset, env)
 
 
-def build_options_input(state: dict, history: list, content: str, tool_calls: list, reasoning: str) -> list:
+def build_options_input(state: dict, history: list, content: str, tool_calls: list,
+                        reasoning: str, turn: TurnConfig) -> list:
     """拼装「选项请求」的输入：正文请求的输入 + 本轮的助手回复 + 预设的选项指令。
 
     history 是不含本轮的那段历史，本轮回复按 content/tool_calls/reasoning 现场拼出来，
@@ -1170,11 +1024,11 @@ def build_options_input(state: dict, history: list, content: str, tool_calls: li
         "reasoning": reasoning,
         "tool_calls": tool_calls,
     }
-    items = list(build_input(state, history + [entry]))
+    items = list(build_input(state, history + [entry], None, turn))
     preset = load_presets()[state["preset"]]
     card = load_cards()[state["card"]]
     instruction = options_instruction(preset, _preset_env(state, preset, card))
-    if effective_config(state, load_config()).get("api_type", "responses") == "chat_completions":
+    if turn.endpoint.api_type == "chat_completions":
         items.append({"role": "user", "content": instruction})
     else:
         items.append(_message_item("user", instruction))

@@ -103,10 +103,10 @@ class PresetOptionsInstructionTest(unittest.TestCase):
                 with (
                     mock.patch.object(core, "load_presets", return_value={"p": preset}),
                     mock.patch.object(core, "load_cards", return_value={"c": card}),
-                    mock.patch.object(core, "load_config", return_value={}),
-                    mock.patch.object(core, "effective_config", return_value={"api_type": api_type}),
                 ):
-                    items = core.build_options_input(state, [], "正文", [], "思考")
+                    items = core.build_options_input(
+                        state, [], "正文", [], "思考", tests.support.make_turn(api_type)
+                    )
                 self.assertEqual(items[-2]["role"], "assistant")
                 if api_type == "chat_completions":
                     self.assertEqual(items[-1], {"role": "user", "content": expected})
@@ -127,10 +127,10 @@ class PresetOptionsInstructionTest(unittest.TestCase):
         with (
             mock.patch.object(core, "load_presets", return_value={"p": preset}),
             mock.patch.object(core, "load_cards", return_value={"c": card}),
-            mock.patch.object(core, "load_config", return_value={}),
-            mock.patch.object(core, "effective_config", return_value={"api_type": "chat_completions"}),
         ):
-            items = core.build_options_input(state, [], "正文", [], "思考")
+            items = core.build_options_input(
+                state, [], "正文", [], "思考", tests.support.make_turn("chat_completions")
+            )
         self.assertEqual(items[-1], {"role": "user", "content": core.OPTIONS_INSTRUCTION})
 
 

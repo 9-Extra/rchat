@@ -9,12 +9,11 @@ from unittest import mock
 
 import tests.support  # noqa: F401  （把仓库根加进 sys.path）
 
-from app import core, tools, world
+from app import config, core, tools, world
 
-CONFIG = {
-    "endpoints": [{"api_base": "https://api.deepseek.com", "model": "m", "api_key": "endpoint-key"}],
-    "web_tools": {"api_key": "search-key", "count": 5},
-}
+_BASE = {"endpoints": [{"api_base": "https://api.deepseek.com", "model": "m", "api_key": "endpoint-key"}]}
+
+CONFIG = dict(_BASE, web_tools={"api_key": "search-key", "count": 5})
 
 SEARCH_RESPONSE = {
     "results": [
@@ -35,28 +34,37 @@ SEARCH_RESPONSE = {
 class WebToolConfigTest(unittest.TestCase):
 
     def test_defaults_and_validation(self):
-        cfg = core.web_tool_config({"web_tools": {"api_key": " k "}})
-        self.assertEqual(cfg["api_base"], core.WEB_TOOL_API_BASE)
-        self.assertEqual(cfg["api_key"], "k")
-        self.assertEqual(cfg["count"], core.WEB_TOOL_COUNT)
-        self.assertEqual(cfg["timeout"], float(core.WEB_TOOL_TIMEOUT))
+        cfg = config.Settings.from_mapping(dict(_BASE, web_tools={"api_key": " k "})).web_tools()
+        self.assertEqual(cfg.api_base, config.WEB_TOOL_API_BASE)
+        self.assertEqual(cfg.api_key, "k")
+        self.assertEqual(cfg.count, config.WEB_TOOL_COUNT)
+        self.assertEqual(cfg.timeout, float(config.WEB_TOOL_TIMEOUT))
         for bad, needle in (
             ({"web_tools": {}}, "web_tools.api_key"),
-            ({"endpoints": []}, "web_tools.api_key"),
             ({"web_tools": {"api_key": "k", "count": 99}}, "web_tools.count"),
             ({"web_tools": {"api_key": "k", "timeout": 0}}, "web_tools.timeout"),
             ({"web_tools": "x"}, "不是映射"),
         ):
             with self.subTest(bad=bad):
+                settings = config.Settings.from_mapping(dict(_BASE, **bad))
                 with self.assertRaises(ValueError) as ctx:
-                    core.web_tool_config(bad)
+                    settings.web_tools()
                 self.assertIn(needle, str(ctx.exception))
+
+    def test_missing_section_reports_missing_key(self):
+        """没写 web_tools 段不算配置错误，只在真调用工具时指明缺 api_key。"""
+        settings = config.Settings.from_mapping(_BASE)
+        self.assertFalse(settings.web_tools_declared)
+        with self.assertRaises(ValueError) as ctx:
+            settings.web_tools()
+        self.assertIn("web_tools.api_key", str(ctx.exception))
 
 
 class WebSearchTest(unittest.TestCase):
 
     def setUp(self):
-        patch = mock.patch.object(core, "load_config", lambda: copy.deepcopy(CONFIG))
+        self.settings = config.Settings.from_mapping(copy.deepcopy(CONFIG))
+        patch = mock.patch.object(core, "load_settings", lambda: self.settings)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -95,7 +103,7 @@ class WebSearchTest(unittest.TestCase):
         self.assertIn("count", tools.web_search("q", count=0))
 
     def test_missing_key_reports_config_error_instead_of_raising(self):
-        with mock.patch.object(core, "load_config", return_value={"endpoints": []}):
+        with mock.patch.object(core, "load_settings", lambda: tests.support.make_settings()):
             self.assertIn("web_tools.api_key", tools.web_search("q"))
 
     def test_api_failure_is_returned_as_text(self):
@@ -108,7 +116,8 @@ class WebSearchTest(unittest.TestCase):
 class WebFetchTest(unittest.TestCase):
 
     def setUp(self):
-        patch = mock.patch.object(core, "load_config", lambda: copy.deepcopy(CONFIG))
+        self.settings = config.Settings.from_mapping(copy.deepcopy(CONFIG))
+        patch = mock.patch.object(core, "load_settings", lambda: self.settings)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -136,7 +145,7 @@ class WebFetchTest(unittest.TestCase):
             self.assertIn("没有取到正文", tools.web_fetch("https://example.com/a"))
 
     def test_missing_key_reports_config_error_instead_of_raising(self):
-        with mock.patch.object(core, "load_config", return_value={"endpoints": []}):
+        with mock.patch.object(core, "load_settings", lambda: tests.support.make_settings()):
             self.assertIn("web_tools.api_key", tools.web_fetch("https://example.com/a"))
 
 

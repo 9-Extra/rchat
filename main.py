@@ -47,37 +47,36 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    # 启动即校验模型端点配置：没有可用端点时直接报错退出，而不是等首轮生成才失败
-    from app import auth, core
+    # 启动即校验整份配置（端点 / web_tools / auth / server）：任何一段写错都在这里报错退出，
+    # 而不是等首轮生成才失败。解析与校验统一在 app/config.py，默认值也只有那一处。
+    from app import core
 
     try:
-        eps = core.endpoints(core.load_config())
+        settings = core.load_settings()
     except ValueError as e:
         raise SystemExit(f"配置错误: {e}")
-    logging.info("已加载 %d 个模型端点，默认: %s", len(eps), eps[0]["display_name"])
+    logging.info(
+        "已加载 %d 个模型端点，默认: %s", len(settings.endpoints), settings.endpoints[0].display_name
+    )
 
     # 联网工具（web_search / web_fetch）配置：写了 web_tools 段就校验一遍，缺 key/非法值时
     # 直接报错退出；完全没写这一段不报错（不启用这两个工具的预设用不上它）
-    config = core.load_config()
-    if "web_tools" in config:
+    if settings.web_tools_declared:
         try:
-            core.web_tool_config(config)
+            settings.web_tools()
         except ValueError as e:
             raise SystemExit(f"配置错误: {e}")
         logging.info("已启用联网工具：web_search / web_fetch")
 
     # 鉴权配置同样启动即校验：开了鉴权却没有账号，等于谁都进不来（也提示别把用户名写错）
-    try:
-        auth_cfg = auth.auth_settings()
-    except ValueError as e:
-        raise SystemExit(f"配置错误: {e}")
-    if auth_cfg["enabled"]:
-        if not auth_cfg["users"]:
+    auth_cfg = settings.auth
+    if auth_cfg.enabled:
+        if not auth_cfg.users:
             raise SystemExit("配置错误: auth.enabled 为 true 但 auth.users 里没有任何账号")
         logging.info(
             "已启用用户名密码鉴权，账号: %s（登录态 %g 天）",
-            "、".join(auth_cfg["users"]),
-            auth_cfg["ttl"] / 86400,
+            "、".join(auth_cfg.users),
+            auth_cfg.ttl / 86400,
         )
     else:
         logging.info("未启用鉴权（auth.enabled: false）：任何能访问该端口的人都能读写全部会话")

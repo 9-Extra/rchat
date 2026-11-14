@@ -5,16 +5,16 @@
    某一轮不再调用工具即视为说完，回合结束。
 2. 选项：正文结束后用 generate_options 再发一次请求，让它只产出选项行（一行一条）。指令
    来自预设的 <preset_options> 块（未定义时回退到 core.OPTIONS_INSTRUCTION），格式要求由
-   预设作者按 parse_options 的固定协议写清楚。这次请求必须与正文请求共用同一份 config
+   预设作者按 parse_options 的固定协议写清楚。这次请求必须与正文请求共用同一份 TurnConfig
    （同 model / tools / thinking 配置、不加 response_format），否则端点侧的前缀缓存整体
    失效（实测：这三者任一变化，命中率从 98% 掉到 6%）。
 """
-import json
 import logging
 
 from openai import AsyncOpenAI
 
 from app import core
+from app.config import TurnConfig
 from app.core import get_tools
 
 logger = logging.getLogger("airp.llm")
@@ -35,39 +35,41 @@ _OPTIONS_RETRY_HINT = """
 """
 
 
-def _make_client(config: dict) -> AsyncOpenAI:
+def _make_client(turn: TurnConfig) -> AsyncOpenAI:
     """构造 OpenAI 客户端，按需附加风控要求的请求头。
 
     - user_agent：覆盖 SDK 默认的 "OpenAI/Python ..." UA（部分端点风控拒绝语言默认 UA）
     - x_opencode_session + chat_id：opencode-go 要求每个对话带固定的 UUID v4 会话头
       （同一对话所有请求同一个值，用于 GPU KV 缓存亲和调度）
     """
+    ep = turn.endpoint
     headers = {}
-    if config.get("user_agent"):
-        headers["User-Agent"] = config["user_agent"]
-    if config.get("x_opencode_session") and config.get("chat_id"):
-        headers["X-Opencode-Session"] = config["chat_id"]
+    if turn.user_agent:
+        headers["User-Agent"] = turn.user_agent
+    if ep.x_opencode_session and turn.chat_id:
+        headers["X-Opencode-Session"] = turn.chat_id
     return AsyncOpenAI(
-        api_key=config["api_key"],
-        base_url=config["api_base"].rstrip("/"),
+        api_key=ep.api_key,
+        base_url=ep.api_base,
         timeout=600.0,
         default_headers=headers or None,
     )
 
 
-def _mapped_effort(config: dict):
+def _mapped_effort(turn: TurnConfig):
     """该端点实际要发的 reasoning_effort：端点可配 reasoning_effort_map 给它改名。
 
     OpenRouter 的 effort 枚举只到 xhigh（另有 minimal），没有本项目的 max，配置里写
-    `reasoning_effort_map: {max: xhigh}` 就落在这里。只认端点自己那份 config，不影响别的端点。
+    `reasoning_effort_map: {max: xhigh}` 就落在这里。只认端点自己那份配置，不影响别的端点。
     """
-    effort = config.get("reasoning_effort")
-    if effort is None:
-        return None
-    return (config.get("reasoning_effort_map") or {}).get(effort, effort)
+    effort = turn.reasoning_effort
+    mapping = turn.endpoint.reasoning_effort_map
+    if not mapping:
+        return effort
+    return mapping.get(effort, effort)
 
 
-def _extra_body(config: dict, fields: dict):
+def _extra_body(turn: TurnConfig, fields: dict):
     """SDK 不认的字段只能经 extra_body 透传（直接当 kwarg 传会 TypeError），没有内容时返回 None。
 
     - provider：OpenRouter 的路由偏好（排序、最低吞吐），端点里配了才发
@@ -76,32 +78,26 @@ def _extra_body(config: dict, fields: dict):
     - fields：调用方按需附上的厂商私有参数（如禁用思考的 thinking.disabled）
     """
     extra = {}
-    if config.get("provider"):
-        extra["provider"] = config["provider"]
-    if config.get("session_id") and config.get("chat_id"):
-        extra["session_id"] = config["chat_id"]
+    if turn.endpoint.provider:
+        extra["provider"] = turn.endpoint.provider
+    if turn.endpoint.session_id and turn.chat_id:
+        extra["session_id"] = turn.chat_id
     extra.update(fields)
     return extra or None
 
 
-def build_request(input_items: list, config: dict) -> dict:
+def build_request(input_items: list, turn: TurnConfig) -> dict:
     """构造实际发送给模型的请求参数（/api/preview 也用它展示上下文）。
 
-    工具 schema 来自 config 里的预设工具配置（core.apply_preset_tools 写入的
-    ptc/tools/bindings）：ptc 模式只含 world_run，普通模式是白名单里的直接工具。
-    选项请求（generate_options）也走这个函数：同一份 config 才能命中前缀缓存。
+    工具 schema 来自 turn 里的预设工具配置（core.build_turn 写入的 ptc/tools/bindings）：
+    ptc 模式只含 world_run，普通模式是白名单里的直接工具。
+    选项请求（generate_options）也走这个函数：同一份 turn 才能命中前缀缓存。
     """
-    api_type = config.get("api_type", "responses")
-    ptc = bool(config.get("ptc"))
-    direct = config.get("tools")
-    if not isinstance(direct, list):
-        raise ValueError(
-            f"config 缺少启用的工具名单 tools: {direct!r}（应由 core.apply_preset_tools 写入）"
-        )
-    schemas = get_tools(api_type, ptc, direct, config.get("bindings") or [])
+    api_type = turn.endpoint.api_type
+    schemas = get_tools(api_type, turn.ptc, turn.tools, turn.bindings)
     if api_type == "chat_completions":
         payload = {
-            "model": config["model"],
+            "model": turn.endpoint.model,
             "messages": input_items,
             "stream": True,
         }
@@ -109,11 +105,11 @@ def build_request(input_items: list, config: dict) -> dict:
         if schemas:
             payload["tools"] = schemas
             payload["tool_choice"] = "auto"
-        if config.get("temperature") is not None:
-            payload["temperature"] = config["temperature"]
-        if config.get("max_tokens") is not None:
-            payload["max_tokens"] = config["max_tokens"]
-        effort = _mapped_effort(config)
+        if turn.temperature is not None:
+            payload["temperature"] = turn.temperature
+        if turn.max_tokens is not None:
+            payload["max_tokens"] = turn.max_tokens
+        effort = _mapped_effort(turn)
         fields = {}
         if effort == "none":
             # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
@@ -122,21 +118,21 @@ def build_request(input_items: list, config: dict) -> dict:
             fields["thinking"] = {"type": "disabled"}
         elif effort is not None:
             payload["reasoning_effort"] = effort
-        extra = _extra_body(config, fields)
+        extra = _extra_body(turn, fields)
         if extra:
             payload["extra_body"] = extra
         return payload
 
-    payload = {"model": config["model"], "input": input_items}
+    payload = {"model": turn.endpoint.model, "input": input_items}
     # 白名单为空时整个工具字段都不发（空 tools 数组会被部分端点拒绝）
     if schemas:
         payload["tools"] = schemas
         payload["tool_choice"] = "auto"
-    if config.get("temperature") is not None:
-        payload["temperature"] = config["temperature"]
-    if config.get("max_tokens") is not None:
-        payload["max_output_tokens"] = config["max_tokens"]
-    effort = _mapped_effort(config)
+    if turn.temperature is not None:
+        payload["temperature"] = turn.temperature
+    if turn.max_tokens is not None:
+        payload["max_output_tokens"] = turn.max_tokens
+    effort = _mapped_effort(turn)
     fields = {}
     if effort == "none":
         # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
@@ -145,14 +141,14 @@ def build_request(input_items: list, config: dict) -> dict:
         fields["thinking"] = {"type": "disabled"}
     elif effort is not None:
         payload["reasoning"] = {"effort": effort}
-    extra = _extra_body(config, fields)
+    extra = _extra_body(turn, fields)
     if extra:
         payload["extra_body"] = extra
     return payload
 
 
-async def stream_body(input_items: list, config: dict, run_tool):
-    """根据 config['api_type'] 选择 Responses API 或 Chat Completions API 流式跑正文。
+async def stream_body(input_items: list, turn: TurnConfig, run_tool):
+    """按 turn.endpoint.api_type 选择 Responses API 或 Chat Completions API 流式跑正文。
 
     两种模式对外 yield 的事件格式一致（选项不在这里，见 generate_options）：
       {"type": "reasoning", "delta": str}
@@ -160,12 +156,11 @@ async def stream_body(input_items: list, config: dict, run_tool):
       {"type": "tool", "name": str, "arguments": str, "result": str, "reasoning": str}
       {"type": "done", "content": str, "reasoning": str}
     """
-    api_type = config.get("api_type", "responses")
-    if api_type == "chat_completions":
-        async for event in _stream_body_chat_completions(input_items, config, run_tool):
+    if turn.endpoint.api_type == "chat_completions":
+        async for event in _stream_body_chat_completions(input_items, turn, run_tool):
             yield event
         return
-    async for event in _stream_body_responses(input_items, config, run_tool):
+    async for event in _stream_body_responses(input_items, turn, run_tool):
         yield event
 
 
@@ -189,7 +184,7 @@ def _note_reasoning(reasonings: dict, round_output: list, item_id) -> None:
         round_output.append({"kind": "reasoning", "ref": item_id})
 
 
-async def _stream_body_responses(input_items: list, config: dict, run_tool):
+async def _stream_body_responses(input_items: list, turn: TurnConfig, run_tool):
     """Responses API 流式调用实现（内含工具循环，某一轮没有工具调用即回合结束）。"""
     # 思维链按模型实际产生的那一项回放，位置照原样；但 deepseek-flash 的 /responses 还要求
     # 「每个 function_call 前都有各自的一份 reasoning_text」，缺了直接 400 —— 实测一轮里两个
@@ -199,7 +194,7 @@ async def _stream_body_responses(input_items: list, config: dict, run_tool):
     # 约束是对的，但同一段长文本会被重复喂回去好几遍。
     last_reasoning = ""  # 本回合最近一轮的非空思考，仅用于前端展示与收尾事件的兜底
     PLACEHOLDER = " "
-    async with _make_client(config) as client:
+    async with _make_client(turn) as client:
         content = ""  # 整个回合累积的正文(跨轮次,全部对用户可见)
         for _ in range(MAX_ROUNDS):
             round_reasoning = ""  # 本轮所有 reasoning 项的文本拼接（展示用）
@@ -209,7 +204,7 @@ async def _stream_body_responses(input_items: list, config: dict, run_tool):
             texts = {}  # message item_id -> 本轮该消息项累积的文本
             round_output = []
             cut = ""  # 本轮为什么没跑完（response.incomplete，如 max_output_tokens）
-            stream = await client.responses.create(**build_request(input_items, config), stream=True)
+            stream = await client.responses.create(**build_request(input_items, turn), stream=True)
             async for event in stream:
                 etype = event.type
                 if etype == "response.reasoning_text.delta":
@@ -341,18 +336,18 @@ def _delta_reasoning(delta) -> str:
     return "".join(parts)
 
 
-async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
+async def _stream_body_chat_completions(messages: list, turn: TurnConfig, run_tool):
     """Chat Completions API 流式调用实现（内含工具循环，某一轮没有工具调用即回合结束）。"""
     last_reasoning = ""
     PLACEHOLDER = " "
-    async with _make_client(config) as client:
+    async with _make_client(turn) as client:
         content = ""  # 整个回合累积的正文（跨轮次）
         for _ in range(MAX_ROUNDS):
             round_reasoning = ""
             round_text = ""  # 本轮新增的正文（回合级累积的是 content）
             calls = []  # 本轮工具调用：[{"id", "type", "name", "arguments"}]
             finish_reason = ""  # 本轮上游给的结束原因（length = 被输出上限截断）
-            stream = await client.chat.completions.create(**build_request(messages, config))
+            stream = await client.chat.completions.create(**build_request(messages, turn))
             async for chunk in stream:
                 choice = chunk.choices[0] if chunk.choices else None
                 if choice is None:
@@ -424,27 +419,27 @@ async def _stream_body_chat_completions(messages: list, config: dict, run_tool):
         raise RuntimeError(f"工具循环超过 {MAX_ROUNDS} 轮仍未结束回复,已中止")
 
 
-async def generate_options(input_items: list, config: dict) -> tuple:
+async def generate_options(input_items: list, turn: TurnConfig) -> tuple:
     """正文结束后的选项请求：用与正文请求**完全相同**的参数再问一次，只要选项列表。
 
     返回 (options, 错误文本, 原始输出)。解析失败就追加一句提醒重试一次；仍失败则选项为空、
     错误文本非空，由调用方落盘成 options_error（正文不受影响）；原始输出非空时由调用方
     落盘成 options_raw，供前端查看模型这次到底产出了什么。
 
-    沿用同一份 config 是硬要求：实测 deepseek 官方端点上 tools 数组、thinking /
+    沿用同一份 turn 是硬要求：实测 deepseek 官方端点上 tools 数组、thinking /
     reasoning_effort 三者任一与正文请求不一致，前缀缓存命中率就从 98% 掉到 6%。
     response_format 同样会打断（且该端点不支持 json_schema），所以格式约束写在预设的
     <preset_options> 里（未定义时用 core.OPTIONS_INSTRUCTION），靠解析兜底。
     """
-    async with _make_client(config) as client:
+    async with _make_client(turn) as client:
         error = ""
         attempts: list[tuple[int, str]] = []
         for attempt in range(2):
             items = list(input_items)
             if attempt:
-                items.append(_followup_item(config, _OPTIONS_RETRY_HINT))
+                items.append(_followup_item(turn, _OPTIONS_RETRY_HINT))
             try:
-                text, problem = await _request_options_once(client, items, config)
+                text, problem = await _request_options_once(client, items, turn)
             except Exception as e:
                 error = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
                 logger.warning("选项请求失败(第 %d 次): %s", attempt + 1, error)
@@ -476,9 +471,9 @@ def _format_raw_attempts(attempts: list) -> str:
     return "\n\n".join(p for p in parts if p).strip()
 
 
-def _followup_item(config: dict, text: str) -> dict:
+def _followup_item(turn: TurnConfig, text: str) -> dict:
     """按 api_type 构造追加在末尾的 user 消息（只是续写，不影响前缀缓存）。"""
-    if config.get("api_type", "responses") == "chat_completions":
+    if turn.endpoint.api_type == "chat_completions":
         return {"role": "user", "content": text}
     return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
 
@@ -511,16 +506,16 @@ def _usage_note(usage) -> str:
     return " ".join(parts)
 
 
-async def _request_options_once(client, input_items: list, config: dict) -> tuple:
+async def _request_options_once(client, input_items: list, turn: TurnConfig) -> tuple:
     """发一次非流式的选项请求，返回 (模型输出文本, 说明)。
 
     说明非空表示这次输出不可能是选项列表（模型调了工具、或被输出上限截断成空），
     调用方不再拿它去解析、直接把说明当错误。文本始终是模型这次的真实产出，供排查用。
     """
-    api_type = config.get("api_type", "responses")
-    payload = build_request(input_items, config)
+    api_type = turn.endpoint.api_type
+    payload = build_request(input_items, turn)
     payload.pop("stream", None)  # 要完整输出，用非流式一次拿到
-    limit = min(config.get("max_tokens") or OPTIONS_MAX_TOKENS, OPTIONS_MAX_TOKENS)
+    limit = min(turn.max_tokens or OPTIONS_MAX_TOKENS, OPTIONS_MAX_TOKENS)
     if api_type == "chat_completions":
         payload["max_tokens"] = limit
         resp = await client.chat.completions.create(**payload)

@@ -22,7 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import auth, core, server, tools, world  # noqa: E402
+from app import auth, config, core, server, tools, world  # noqa: E402
 
 # 用例里有故意触发的错误（错误密码、假模型失败、宽限超时），日志不用刷屏
 logging.disable(logging.CRITICAL)
@@ -48,6 +48,37 @@ TEST_CONFIG = {
 TEST_USERS = {"alice": "alice-pass", "bob": "bob-pass"}
 
 
+def make_settings(auth_enabled: bool = False, **overrides) -> config.Settings:
+    """按 TEST_CONFIG 造一份 Settings（测试不读磁盘上的 config.yaml）。
+
+    overrides 顶层键覆盖（endpoints / temperature / web_tools ...），鉴权单独给开关——
+    和真实配置走同一个解析器，所以「默认值只有一处」这条也被测试覆盖到了。
+    """
+    raw = copy.deepcopy(TEST_CONFIG)
+    raw.update(copy.deepcopy(overrides))
+    raw["auth"] = {"enabled": auth_enabled, "users": TEST_USERS if auth_enabled else {}}
+    return config.Settings.from_mapping(raw)
+
+
+def make_turn(api_type: str = "chat_completions", **overrides) -> config.TurnConfig:
+    """造一个 TurnConfig（llm 的用例用）。默认对齐 TEST_CONFIG 的端点与生成参数。"""
+    ep = dict(TEST_CONFIG["endpoints"][0], api_type=api_type)
+    fields = dict(
+        endpoint=config.parse_endpoint(ep, 0),
+        temperature=TEST_CONFIG["temperature"],
+        max_tokens=TEST_CONFIG["max_tokens"],
+        reasoning_effort=TEST_CONFIG["reasoning_effort"],
+        chat_id="",
+        user_agent=None,
+        ptc=False,
+        tools=("read_file",),
+        bindings=(),
+        options_enabled=False,
+    )
+    fields.update(overrides)
+    return config.TurnConfig(**fields)
+
+
 class FakeLLM:
     """假的模型输出：按分片流式吐正文，可选先来一次 world_run 工具调用。
 
@@ -64,7 +95,7 @@ class FakeLLM:
         self.fail = fail
         self.calls = 0
 
-    async def __call__(self, input_items, config, run_tool):
+    async def __call__(self, input_items, turn, run_tool):
         self.calls += 1
         if self.fail:
             raise RuntimeError("假模型故意失败")
@@ -86,7 +117,7 @@ class FakeLLM:
         yield {"type": "done", "content": content, "reasoning": "".join(self.reasoning)}
 
 
-async def fake_generate_options(options_input, config):
+async def fake_generate_options(options_input, turn):
     """假的选项请求：固定返回两条。"""
     await asyncio.sleep(0)
     return ["先去公会看看", "直接出城"], None, ""
@@ -100,10 +131,12 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
         self.sessions_dir = pathlib.Path(self._tmp.name) / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
+        self.settings = make_settings(self.auth_enabled)
+
         patches = [
             mock.patch.object(core, "SESSIONS_DIR", self.sessions_dir),
-            mock.patch.object(core, "load_config", lambda: copy.deepcopy(TEST_CONFIG)),
-            mock.patch.object(auth, "auth_settings", self._auth_settings),
+            # 唯一的配置接缝：server/auth/tools/core 全都经 core.load_settings() 取配置
+            mock.patch.object(core, "load_settings", lambda: self.settings),
             mock.patch.object(server, "generate_options", fake_generate_options),
         ]
         for p in patches:
@@ -129,16 +162,8 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.addCleanup(self.client.aclose)
 
-    # 鉴权默认关（本地模式）；需要鉴权的用例把它打开
+    # 鉴权默认关（本地模式）；需要鉴权的用例把类属性改成 True
     auth_enabled = False
-
-    def _auth_settings(self, config=None):
-        return {
-            "enabled": self.auth_enabled,
-            "users": TEST_USERS if self.auth_enabled else {},
-            "ttl": 30 * 86400,
-            "cookie_secure": False,
-        }
 
     # ---------- 小工具 ----------
 

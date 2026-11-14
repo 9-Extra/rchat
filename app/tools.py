@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 
-from app import core, world
+from app import config, core, world
 
 logger = logging.getLogger("airp.tools")
 
@@ -342,15 +342,15 @@ def _api_error(resp) -> str:
     return "，".join(p for p in (f"HTTP {resp.status_code}", hint, message) if p)
 
 
-def _web_api(params: dict, path: str, payload: dict) -> dict:
+def _web_api(params: config.WebTools, path: str, payload: dict) -> dict:
     """POST 一次 Search/Fetch 接口，返回解析后的 JSON；失败抛 RuntimeError（文本可直接给模型）。"""
-    url = params["api_base"] + path
+    url = params.api_base + path
     headers = {
-        "Authorization": f"Bearer {params['api_key']}",
+        "Authorization": f"Bearer {params.api_key}",
         "Content-Type": "application/json",
     }
     try:
-        with httpx.Client(timeout=params["timeout"]) as client:
+        with httpx.Client(timeout=params.timeout) as client:
             resp = client.post(url, json=payload, headers=headers)
     except httpx.HTTPError as e:
         raise RuntimeError(f"请求 {url} 失败：{type(e).__name__}: {e}")
@@ -404,7 +404,7 @@ def web_search(query, count=None, need_content: bool = False, ori_question=None)
     那一段的默认条数。need_content=True 时每条结果附上正文（截断到 WEB_SEARCH_CONTENT_CHARS）。
     """
     try:
-        params = core.web_tool_config(core.load_config())
+        params = core.load_settings().web_tools()
     except Exception as e:
         return f"错误：{e}"
     if not isinstance(query, str) or not query.strip():
@@ -413,7 +413,7 @@ def web_search(query, count=None, need_content: bool = False, ori_question=None)
     if len(query) > WEB_QUERY_MAX:
         return f"错误：query 太长（{len(query)} 字符），最多 {WEB_QUERY_MAX} 个字符"
     if count is None:
-        count = params["count"]
+        count = params.count
     if isinstance(count, float) and count.is_integer():
         count = int(count)
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= WEB_COUNT_MAX:
@@ -435,7 +435,7 @@ def web_search(query, count=None, need_content: bool = False, ori_question=None)
 def web_fetch(url) -> str:
     """调 DeepSeek Fetch 接口抓一个网页，返回 Markdown 正文（错误也以文本返回）。"""
     try:
-        params = core.web_tool_config(core.load_config())
+        params = core.load_settings().web_tools()
     except Exception as e:
         return f"错误：{e}"
     if not isinstance(url, str) or not url.strip():

@@ -14,7 +14,7 @@
 - auth.enabled 为假时整套逻辑不生效（当前用户为 None），会话键不带用户名前缀，
   行为与改造前完全一致——本地开发不受影响。
 - 密码在 config.yaml 里是明文（这个文件本来就存着 API key，且不入库、建议 chmod 600）。
-  账户增删改改完保存即生效，不需要重启（load_config 按 mtime 缓存）。
+  账户增删改改完保存即生效，不需要重启（app/config.py 按文件 mtime 缓存 Settings）。
 - 会话表在内存里，同时落一份 auth_sessions.json（不入库），重启后不必重新登录；
   服务端可单方面吊销（改密码不会自动吊销——要踢人就删掉该文件里的条目或重启）。
 - 登录失败按「用户名 + 来源」限速，防在线爆破。
@@ -25,14 +25,13 @@ import logging
 import secrets
 import time
 
-from app import core
+from app import config, core
 
 logger = logging.getLogger("airp.auth")
 
 COOKIE_NAME = "airp_session"
 SESSIONS_FILE = core.ROOT / "auth_sessions.json"
 
-DEFAULT_TTL_DAYS = 30
 # 登录失败限速：窗口内失败次数达到上限就拒绝（按 用户名 + 来源 IP 计）
 FAIL_WINDOW = 300.0
 FAIL_MAX = 5
@@ -44,29 +43,9 @@ _fails: dict = {}
 _loaded = False
 
 
-def auth_settings(config: dict | None = None) -> dict:
-    """解析并校验 config.yaml 的 auth 段。配置非法直接报错（不静默兜底）。"""
-    config = core.load_config() if config is None else config
-    raw = config.get("auth") or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"config.yaml 的 auth 不是映射: {raw!r}")
-    users = raw.get("users") or {}
-    if not isinstance(users, dict):
-        raise ValueError(f"config.yaml 的 auth.users 不是映射: {users!r}")
-    for name, password in users.items():
-        if not isinstance(name, str) or not name.strip() or "/" in name:
-            raise ValueError(f"config.yaml 的 auth.users 用户名非法: {name!r}（不能为空、不能含 /）")
-        if not isinstance(password, str) or not password:
-            raise ValueError(f"config.yaml 的 auth.users.{name} 的密码必须是非空字符串")
-    ttl = raw.get("session_ttl_days", DEFAULT_TTL_DAYS)
-    if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
-        raise ValueError(f"config.yaml 的 auth.session_ttl_days 非法: {ttl!r}")
-    return {
-        "enabled": bool(raw.get("enabled")),
-        "users": users,
-        "ttl": float(ttl) * 86400,
-        "cookie_secure": bool(raw.get("cookie_secure", False)),
-    }
+def auth_settings() -> config.AuthSettings:
+    """config.yaml 的 auth 段（解析与校验都在 app/config.py，按文件 mtime 缓存）。"""
+    return core.load_settings().auth
 
 
 def _save_sessions() -> None:
@@ -110,7 +89,7 @@ def session_user(token: str | None) -> str | None:
         return None
     user = entry.get("user")
     # 账号从 config.yaml 删掉后，已发的 cookie 立刻失效
-    if not isinstance(user, str) or user not in auth_settings()["users"]:
+    if not isinstance(user, str) or user not in auth_settings().users:
         _sessions.pop(token, None)
         _save_sessions()
         return None
@@ -120,7 +99,7 @@ def session_user(token: str | None) -> str | None:
 def login(username: str, password: str, client: str = "") -> tuple:
     """校验用户名密码并开一个会话，返回 (token, 错误信息)；失败时 token 为 None。"""
     cfg = auth_settings()
-    if not cfg["enabled"]:
+    if not cfg.enabled:
         return None, "服务端未启用鉴权"
     key = f"{username}\n{client}"
     now = time.time()
@@ -128,7 +107,7 @@ def login(username: str, password: str, client: str = "") -> tuple:
     if len(fails) >= FAIL_MAX:
         _fails[key] = fails
         return None, f"登录失败次数过多，请 {int(FAIL_WINDOW // 60)} 分钟后再试"
-    stored = cfg["users"].get(username)
+    stored = cfg.users.get(username)
     ok = isinstance(stored, str) and hmac.compare_digest(
         stored.encode("utf-8"), password.encode("utf-8")
     )
@@ -146,7 +125,7 @@ def login(username: str, password: str, client: str = "") -> tuple:
     for t in [t for t, v in _sessions.items() if v.get("exp", 0) <= now]:
         _sessions.pop(t, None)
     token = secrets.token_urlsafe(32)
-    _sessions[token] = {"user": username, "exp": now + cfg["ttl"]}
+    _sessions[token] = {"user": username, "exp": now + cfg.ttl}
     _save_sessions()
     return token, ""
 

@@ -25,8 +25,7 @@ from app import core, llm, tools
 from tests.support import TEST_CARD, TEST_PRESET
 
 # 一轮两个调用 = 两次请求；这里只要 read_file（直接工具路径，用例不碰 world）
-BASE_CONFIG = dict(tests.support.TEST_CONFIG["endpoints"][0])
-BASE_CONFIG.update(tools=["read_file"], ptc=False, reasoning_effort="low")
+# 配置对象由 support.make_turn() 造：与线上同一个 dataclass，不再手工拼 dict。
 
 USER_ITEM = [{"role": "user", "content": "看看"}]
 USER_INPUT_ITEM = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "看看"}]}]
@@ -106,16 +105,16 @@ class _Collect:
         self.calls.append((name, arguments))
         return f"结果 {len(self.calls)}"
 
-    async def drive(self, config, replay, input_items=None):
+    async def drive(self, turn, replay, input_items=None):
         client = mock.MagicMock()
         client.chat.completions.create = mock.AsyncMock(side_effect=replay)
         client.responses.create = mock.AsyncMock(side_effect=replay)
         cm = mock.MagicMock()
         cm.__aenter__ = mock.AsyncMock(return_value=client)
         cm.__aexit__ = mock.AsyncMock(return_value=False)
-        with mock.patch.object(llm, "_make_client", lambda cfg: cm):
+        with mock.patch.object(llm, "_make_client", lambda turn: cm):
             async for event in llm.stream_body(
-                input_items if input_items is not None else USER_ITEM, config, self.run_tool
+                input_items if input_items is not None else USER_ITEM, turn, self.run_tool
             ):
                 self.events.append(event)
 
@@ -146,7 +145,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
             [_chunk({"content": "看完了。", "reasoning_content": "可以回话了。"}, finish_reason="stop")],
         )
         col = _Collect()
-        await col.drive(dict(BASE_CONFIG, api_type="chat_completions"), replay)
+        await col.drive(tests.support.make_turn("chat_completions"), replay)
 
         self.assertEqual(
             col.calls, [("read_file", '{"file_path": "a.py"}'), ("read_file", '{"file_path": "b.py"}')]
@@ -168,7 +167,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
         """被输出上限压空：报错要带上 finish_reason，别让人去猜。"""
         col = _Collect()
         with self.assertRaises(RuntimeError) as ctx:
-            await col.drive(dict(BASE_CONFIG, api_type="chat_completions"),
+            await col.drive(tests.support.make_turn("chat_completions"),
                             _Replay([_chunk({}, finish_reason="length")]))
         self.assertIn("finish_reason=length", str(ctx.exception))
 
@@ -176,7 +175,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
         """上游没给结束原因时，退回原来的说法，不硬编一句可能错的解释。"""
         col = _Collect()
         with self.assertRaises(RuntimeError) as ctx:
-            await col.drive(dict(BASE_CONFIG, api_type="chat_completions"), _Replay([_chunk({})]))
+            await col.drive(tests.support.make_turn("chat_completions"), _Replay([_chunk({})]))
         self.assertEqual(str(ctx.exception), "模型未输出任何内容")
 
     # ---------------- responses ----------------
@@ -208,7 +207,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
         col = _Collect()
-        await col.drive(dict(BASE_CONFIG, api_type="responses"), replay, input_items=USER_INPUT_ITEM)
+        await col.drive(tests.support.make_turn("responses"), replay, input_items=USER_INPUT_ITEM)
 
         self.assertEqual(
             col.calls, [("read_file", '{"file_path": "a.py"}'), ("read_file", '{"file_path": "b.py"}')]
@@ -233,7 +232,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
         incomplete = Obj(status="incomplete", incomplete_details=Obj(reason="max_output_tokens"))
         col = _Collect()
         with self.assertRaises(RuntimeError) as ctx:
-            await col.drive(dict(BASE_CONFIG, api_type="responses"),
+            await col.drive(tests.support.make_turn("responses"),
                             _Replay([_ev("response.incomplete", response=incomplete)]),
                             input_items=USER_INPUT_ITEM)
         self.assertIn("max_output_tokens", str(ctx.exception))

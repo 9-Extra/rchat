@@ -36,11 +36,11 @@ async def auth_gate(request: Request, call_next):
     except ValueError as e:
         return JSONResponse({"detail": f"config.yaml 的 auth 配置非法：{e}"}, status_code=500)
     user = (
-        auth.session_user(request.cookies.get(auth.COOKIE_NAME)) if cfg["enabled"] else None
+        auth.session_user(request.cookies.get(auth.COOKIE_NAME)) if cfg.enabled else None
     )
     request.state.user = user
     path = request.url.path
-    if user is None and cfg["enabled"]:
+    if user is None and cfg.enabled:
         if path.startswith("/api/"):
             if path not in PUBLIC_PATHS:
                 return JSONResponse({"detail": "未登录或登录已过期"}, status_code=401)
@@ -105,10 +105,10 @@ def login(req: LoginReq, request: Request, response: Response):
     response.set_cookie(
         auth.COOKIE_NAME,
         token,
-        max_age=int(cfg["ttl"]),
+        max_age=int(cfg.ttl),
         httponly=True,
         samesite="lax",
-        secure=cfg["cookie_secure"],
+        secure=cfg.cookie_secure,
         path="/",
     )
     logger.info("登录成功：%s（来源 %s）", username, client or "未知")
@@ -126,7 +126,7 @@ def logout(request: Request, response: Response):
 def me(request: Request):
     """前端启动时问一次：要不要显示登录页、当前是谁。"""
     try:
-        enabled = auth.auth_settings()["enabled"]
+        enabled = auth.auth_settings().enabled
     except ValueError:
         enabled = True
     return {"user": current_user(request), "auth_enabled": enabled}
@@ -188,11 +188,11 @@ def get_sessions(user: str | None = Depends(current_user)):
 def get_endpoints():
     """前端模型下拉用：config.yaml 里定义的端点列表（不含 api_key）。"""
     try:
-        eps = core.endpoints(core.load_config())
+        eps = core.load_settings().endpoints
     except ValueError as e:
         raise HTTPException(400, str(e))
     return [
-        {"index": i, "display_name": ep["display_name"], "model": ep["model"]}
+        {"index": i, "display_name": ep.display_name, "model": ep.model}
         for i, ep in enumerate(eps)
     ]
 
@@ -222,16 +222,16 @@ def get_session(name: str, user: str | None = Depends(current_user)):
     try:
         state = core.load_state(key)
         state["history"] = core.load_history(key)
-        config = core.load_config()
+        settings = core.load_settings()
         # 返回实际生效值（会话值非法/缺失时回退默认），供前端选中/填显当前配置
         state["reasoning_effort"] = core.resolve_reasoning_effort(
-            state.get("reasoning_effort"), config
+            state.get("reasoning_effort"), settings
         )
-        state["endpoint"] = core.resolve_endpoint_index(state.get("endpoint"), config)
-        state["temperature"] = core.resolve_temperature(state.get("temperature"), config)
-        state["max_tokens"] = core.resolve_max_tokens(state.get("max_tokens"), config)
+        state["endpoint"] = core.resolve_endpoint_index(state.get("endpoint"), settings)
+        state["temperature"] = core.resolve_temperature(state.get("temperature"), settings)
+        state["max_tokens"] = core.resolve_max_tokens(state.get("max_tokens"), settings)
         state["options_enabled"] = core.resolve_options_enabled(
-            state.get("options_enabled"), config
+            state.get("options_enabled"), settings
         )
         # 正在进行的一轮生成：用户输入已在开局时落盘，前端靠 mode/user_input 还原界面
         # （regenerate 时被替换掉的旧 AI 块已从磁盘删掉），再接 /stream 续看
@@ -324,7 +324,7 @@ async def set_endpoint(name: str, req: SetEndpoint, user: str | None = Depends(c
     async with _lock_for(key):
         _busy(key)
         try:
-            eps = core.endpoints(core.load_config())
+            eps = core.load_settings().endpoints
         except ValueError as e:
             raise HTTPException(400, str(e))
         if not (0 <= req.index < len(eps)):
@@ -467,19 +467,14 @@ def preview(req: Preview, user: str | None = Depends(current_user)):
     state = core.load_state(key)
     history = core.load_history(key)
     try:
-        input_items = core.build_input(state, history, draft=req.input or None)
-        # 合并选中端点与会话生成参数覆盖，预览展示实际生效的请求参数
-        config = core.effective_config(state, core.load_config())
-        # 预设决定的生成模式与工具白名单（ptc / tools / bindings）
-        core.apply_preset_tools(config, state)
-        config["reasoning_effort"] = core.resolve_reasoning_effort(
-            state.get("reasoning_effort"), config
-        )
+        # 预览展示的就是真实生成会用的那一份 TurnConfig（同一处构造，不会与线上漂移）
+        turn = core.build_turn(state)
+        input_items = core.build_input(state, history, req.input or None, turn)
     except ValueError as e:
         # 预设宏执行失败：用户侧错误，返回 400 而非 500
         raise HTTPException(400, str(e))
-    # 展示实际发送给 Responses API 的请求参数
-    return build_request(input_items, config)
+    # 展示实际发送给模型的请求参数
+    return build_request(input_items, turn)
 
 
 # ---------- 流式对话 ----------
@@ -500,13 +495,8 @@ _generation_sem_obj: asyncio.Semaphore | None = None
 def _generation_sem() -> asyncio.Semaphore:
     global _generation_sem_obj
     if _generation_sem_obj is None:
-        size = 4
-        try:
-            raw = (core.load_config().get("server") or {}).get("max_concurrent_generations")
-            if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
-                size = raw
-        except (ValueError, AttributeError, TypeError):
-            pass  # 配置不合法就用缺省值；main.py 启动时已经校验过一遍
+        # 配置非法在 Settings 构造时就报错了，这里拿到的一定是 ≥1 的整数
+        size = core.load_settings().server.max_concurrent_generations
         _generation_sem_obj = asyncio.Semaphore(size)
     return _generation_sem_obj
 
@@ -616,15 +606,10 @@ def _prepare(name: str, mode: str, user_input: str | None) -> dict:
         # 先把用户块落盘：之后无论被打断、出错还是进程重启，这句输入都不会丢
         history.append({"role": "user", "content": draft})
         core.save_history(name, history)
-    input_items = core.build_input(state, history_wo_user, draft=draft)
-    # 合并选中端点与会话生成参数覆盖，得到 llm 使用的扁平 config（会话标识 chat_id 在其中）
-    config = core.effective_config(state, core.load_config())
-    # PTC 实验模式与工具白名单由预设 frontmatter 决定（ptc / tools）
-    core.apply_preset_tools(config, state)
-    # 思考强度按会话覆盖（会话值非法/缺失时回退 config 默认；非法默认在此报错）
-    config["reasoning_effort"] = core.resolve_reasoning_effort(
-        state.get("reasoning_effort"), config
-    )
+    # 本轮实际生效的配置：Settings + 会话覆盖 + 预设派生的工具白名单，全项目只在这一处构造。
+    # 放在拼装输入之前，是因为上下文形状（messages / input_items）由它决定。
+    turn = core.build_turn(state)
+    input_items = core.build_input(state, history_wo_user, draft, turn)
     return {
         "name": name,
         "mode": mode,
@@ -633,9 +618,10 @@ def _prepare(name: str, mode: str, user_input: str | None) -> dict:
         "history": history,
         "draft": draft,
         "input_items": input_items,
-        "config": config,
+        # 本轮实际生效的配置（端点/温度/上限/思考强度/工具白名单），正文与选项共用同一份
+        "turn": turn,
         # 正文落盘后要不要再发一次选项请求（会话开关，见 core.resolve_options_enabled）
-        "options_enabled": core.resolve_options_enabled(state.get("options_enabled"), config),
+        "options_enabled": turn.options_enabled,
     }
 
 
@@ -665,7 +651,7 @@ async def _run(gen: dict, prep: dict) -> None:
         options_raw = ""
         async def run_tool(tool_name, arguments):
             return await tools.execute_tool(name, tool_name, arguments)
-        async for event in stream_body(prep["input_items"], prep["config"], run_tool):
+        async for event in stream_body(prep["input_items"], prep["turn"], run_tool):
             if event["type"] == "done":
                 done = event
             elif event["type"] == "content":
@@ -691,10 +677,11 @@ async def _run(gen: dict, prep: dict) -> None:
             _emit(gen, {"type": "options_start"})
             try:
                 options_input = core.build_options_input(
-                    prep["state"], history, done["content"], tool_calls, done.get("reasoning", "")
+                    prep["state"], history, done["content"], tool_calls,
+                    done.get("reasoning", ""), prep["turn"],
                 )
                 options, options_error, options_raw = await generate_options(
-                    options_input, prep["config"]
+                    options_input, prep["turn"]
                 )
             except Exception as e:
                 logger.exception("会话 %s 选项阶段失败", name)
@@ -788,20 +775,17 @@ def _prepare_options(name: str) -> dict:
     if not history or history[-1]["role"] != "assistant":
         raise ValueError("最后一轮不是 AI 块，没有可以重新生成选项的对象")
     entry = history[-1]
-    config = core.effective_config(state, core.load_config())
-    core.apply_preset_tools(config, state)
-    config["reasoning_effort"] = core.resolve_reasoning_effort(
-        state.get("reasoning_effort"), config
-    )
+    turn = core.build_turn(state)
     return {
         "name": name,
-        "config": config,
+        "turn": turn,
         "input_items": core.build_options_input(
             state,
             history[:-1],
             entry.get("content", ""),
             entry.get("tool_calls", []),
             entry.get("reasoning", ""),
+            turn,
         ),
     }
 
@@ -816,7 +800,7 @@ async def _run_options(gen: dict, prep: dict) -> None:
         acquired = True
         _emit(gen, {"type": "options_start"})
         options, options_error, options_raw = await generate_options(
-            prep["input_items"], prep["config"]
+            prep["input_items"], prep["turn"]
         )
         history = core.load_history(name)
         if not history or history[-1]["role"] != "assistant":
