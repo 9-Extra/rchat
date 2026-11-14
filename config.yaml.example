@@ -18,7 +18,7 @@ endpoints:
   #   # OpenRouter 的 provider 路由，原样进请求体的 provider 字段
   #   provider:
   #     preferred_min_throughput: 30      # 低于 30 tok/s 的上游移到末尾（软约束，不硬排除）
-  #     # sort: "throughput"              # 想按速度而非价格选上游时再加，注意它会关掉的负载均衡
+  #     # sort: "throughput"              # 想按速度而非价格选上游时再加，注意它会关掉默认的负载均衡
   #   session_id: true                    # 把本会话的 chat_id 当请求体 session_id 发出去：
   #                                       # OpenRouter 靠它做粘性路由与上游缓存亲和，命中前缀缓存更稳
   # - display_name: "另一个端点"
