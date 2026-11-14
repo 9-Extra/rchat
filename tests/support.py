@@ -111,7 +111,8 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
             p.start()
 
         # 全局状态清干净，免得上一个用例的会话状态串味
-        for reg in (server._active, server._locks, world._runtimes, auth._sessions, auth._fails):
+        for reg in (server._active, server._session_errors, server._locks,
+                    world._runtimes, auth._sessions, auth._fails):
             reg.clear()
         self.addCleanup(self._tmp.cleanup)
 

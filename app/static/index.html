@@ -50,6 +50,8 @@
   #sessionList li.active { background: #2b3a55; color: #cfe0ff; }
   #sessionList li .sname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #sessionList li .turns { flex: none; font-size: 11px; color: var(--dim); }
+  #sessionList li .gen { flex: none; font-size: 11px; color: var(--ai); }
+  #sessionList li .err { flex: none; font-size: 11px; color: var(--danger); }
   #sessionList li.active .turns { color: #9db6e4; }
   #sessionList li .del { display: none; padding: 0 6px; font-size: 13px; line-height: 1.4; color: var(--dim); }
   #sessionList li .del:hover { color: var(--danger); }
@@ -64,6 +66,9 @@
   #settingsBtn { display: none; }
   #topBar { display: none; }
   #chat { flex: 1; overflow-y: auto; padding: 22px 24px 30px; }
+  #errorBar { display: none; align-items: center; gap: 10px; padding: 8px 18px; border-bottom: 1px solid #4a2b2b; background: #2a1c1c; color: #f0b0b0; font-size: 13px; }
+  #errorBar .msg { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+  #errorBar button { flex: none; font-size: 12px; padding: 2px 10px; }
 
   .block { max-width: 840px; margin: 0 auto 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; position: relative; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
   .block.ai { border-left: 3px solid var(--ai); }
@@ -249,6 +254,7 @@
         <button id="previewBtn">预览上下文</button>
       </div>
     </div>
+    <div id="errorBar" style="display:none"></div>
     <div id="chat"><div id="emptyHint">请选择或新建一个会话</div></div>
     <div id="composer" style="display:none">
       <div id="composerInner">
@@ -281,21 +287,28 @@
 </div>
 
 <script>
-let cur = null;          // 当前 session 完整数据
+let cur = null;          // 当前 session 快照（服务端权威；前端只读，不要手改 history）
+let streamSeq = 0;       // 每条流开一次 +1；切会话时 +1 让旧流的所有后续操作失效
+let selectSeq = 0;       // 每次切会话 +1；旧会话的 GET 回来晚了不覆盖新选择
+let selecting = false;   // 正在拉目标会话快照；期间禁用输入，避免往旧会话发下一轮
 let streaming = false;
+let finalizing = false;  // 流已结束、正在拉快照并就地定稿
+let reconnecting = false; // 断线后正在退避重连（不能发新轮；切会话会 detach）
 let activeReader = null; // 进行中的流读取器，用于打断
 let stickBottom = true;  // 用户是否停留在聊天底部
+let overlay = null;      // 生成中的临时覆盖层（live 用户/AI 块 + 本轮流状态），不是记录
 const $ = id => document.getElementById(id);
 
-// 贴底时自动下滚；用户上滚后不再打扰
+// 贴底时自动下滚；用户上滚后不再打扰。只在流式跟随和主动进入会话时调用。
 function scrollBottom(force) {
   const c = $('chat');
   if (force || stickBottom) c.scrollTop = c.scrollHeight;
 }
-$('chat').addEventListener('scroll', () => {
+function syncStick() {
   const c = $('chat');
   stickBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 40;
-});
+}
+$('chat').addEventListener('scroll', syncStick);
 
 function syncToggle() {
   $('toggleSide').textContent = $('sidebar').classList.contains('collapsed') ? '»' : '«';
@@ -371,39 +384,92 @@ function rememberSession(id) {
 
 async function loadSessions() {
   const list = await api('/api/sessions');
-  // 列表项显示角色卡名（卡内定义的名字）+ 已运行轮数；会话名放 title 里备查
-  $('sessionList').innerHTML = list.map(s =>
-    `<li data-i="${esc(s.id)}" data-n="${esc(s.name)}" title="${esc(s.name)}" class="${cur && cur.id === s.id ? 'active' : ''}">` +
-    `<span class="sname">${esc(s.card_name || s.name)}</span>` +
-    `<span class="turns">${s.turns} 轮</span>` +
-    `<button class="del" title="删除会话">×</button></li>`).join('');
-  document.querySelectorAll('#sessionList li').forEach(li => {
-    li.onclick = () => selectSession(li.dataset.i);
+  // 列表项显示角色卡名（卡内定义的名字）+ 已运行轮数；会话名放 title 里备查。
+  // 生成中/出错是服务端状态：切走的会话在后台跑，靠它让用户知道去哪看。
+  $('sessionList').innerHTML = list.map(s => {
+    const st = s.generating
+      ? '<span class="gen">生成中</span>'
+      : s.last_error ? '<span class="err" title="最近一次操作出错">出错</span>' : '';
+    return `<li data-i="${esc(s.id)}" data-n="${esc(s.name)}" title="${esc(s.name)}" class="${cur && cur.id === s.id ? 'active' : ''}">` +
+      `<span class="sname">${esc(s.card_name || s.name)}</span>` +
+      `<span class="turns">${s.turns} 轮</span>${st}` +
+      `<button class="del" title="删除会话">×</button></li>`;
+  }).join('');
+  const lis = document.querySelectorAll('#sessionList li');
+  for (let k = 0; k < lis.length; k++) {
+    const li = lis[k];
+    li.onclick = () => selectSession(li.getAttribute('data-i'));
     li.querySelector('.del').onclick = async e => {
       e.stopPropagation();
-      if (!confirm(`删除会话「${li.dataset.n}」？此操作不可恢复。`)) return;
-      await api('/api/sessions/' + encodeURIComponent(li.dataset.i), { method: 'DELETE' });
-      if (cur && cur.id === li.dataset.i) {
+      if (!confirm(`删除会话「${li.getAttribute('data-n')}」？此操作不可恢复。`)) return;
+      await api('/api/sessions/' + encodeURIComponent(li.getAttribute('data-i')), { method: 'DELETE' });
+      if (cur && cur.id === li.getAttribute('data-i')) {
         cur = null;
         rememberSession(null);
         $('toolbar').style.display = 'none';
         $('composer').style.display = 'none';
         $('chat').innerHTML = '<div id="emptyHint">请选择或新建一个会话</div>';
+        syncErrorBar();
       }
       loadSessions();
     };
-  });
+  }
   return list;
 }
 
+// 切走当前会话：只停本地转发，不碰服务端的生成 task。旧流的 seq 立即失效，
+// 之后到达的事件/对账不会写进新会话的 DOM。还没收到任何事件的流先别急着 cancel：
+// POST 响应头可能比服务端注册 _active 更早到，立刻取消有窗口会把整轮一起取消。
+function detachStream() {
+  if (!streaming && !finalizing && !reconnecting && !overlay) return;
+  const ov = overlay;
+  const reader = activeReader;
+  streamSeq++;
+  streaming = false;
+  finalizing = false;
+  reconnecting = false;
+  reconnectTries = 0;
+  overlay = null;
+  activeReader = null;
+  if (ov && ov.scheduled) {
+    cancelAnimationFrame(ov.frame);
+    ov.scheduled = false;
+  }
+  if (reader && (!ov || ov.heard)) {
+    try { reader.cancel(); } catch (e) {}
+  }
+  updateComposer();
+}
+
 async function selectSession(id) {
-  cur = await api('/api/sessions/' + encodeURIComponent(id));
+  // 每次点击都算一次新的选择：先断旧流（服务端继续跑），再拉快照。
+  // 重复点当前会话等于「刷新并重连接上」，不会漏掉后台那半轮。
+  const seq = ++selectSeq;
+  selecting = true;
+  updateComposer();
+  detachStream();
+  let s;
+  try {
+    s = await api('/api/sessions/' + encodeURIComponent(id));
+  } catch (e) {
+    if (seq === selectSeq) {
+      selecting = false;
+      updateComposer();
+      alert(e.message);
+    }
+    return;
+  }
+  if (seq !== selectSeq) return;  // 期间又点了别的会话，selecting 由后一次负责清
+  cur = s;
   rememberSession(cur.id);
   stickBottom = true;
-  render();
+  reconnectTries = 0;
+  renderAll(true);
+  selecting = false;
+  updateComposer();
   loadSessions();
-  // 后端这一轮还在跑（刷新/换设备后回到同一会话）：接上它继续看
-  if (cur.generating) attachTurn();
+  // 后端这一轮还在跑（刷新/换设备/刚从别的会话切回来）：接上它继续看
+  if (cur.generating) attachTurn(cur);
   // 在手机上选好会话后自动收起抽屉
   if (window.innerWidth <= 640) {
     $('sidebar').classList.add('collapsed');
@@ -412,12 +478,52 @@ async function selectSession(id) {
 }
 
 // ---------- 渲染 ----------
-function render() {
+// 每个块有稳定 key：beginning / user:<i> / assistant:<i>。同一会话内只用 reconcileSession
+// 做增量 patch，不重建没变的节点——滚动位置、展开的 details、文本选区、编辑中的 textarea
+// 才不会被数据刷新一起冲掉。
+
+function blockKey(e, i) {
+  return (e.role === 'assistant' ? 'assistant:' : 'user:') + i;
+}
+
+function syncErrorBar() {
+  const bar = $('errorBar');
+  if (!bar) return;
+  if (!cur || !cur.last_error) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  bar.style.display = 'flex';
+  bar.innerHTML = `<span class="msg">〔最近一次操作出错〕${esc(cur.last_error.message)}</span>`;
+  const sid = cur.id;
+  const btn = document.createElement('button');
+  btn.textContent = '知道了';
+  btn.onclick = async () => {
+    try {
+      await api(`/api/sessions/${encodeURIComponent(sid)}/dismiss_error`, { method: 'POST' });
+    } catch (e) {}
+    if (cur && cur.id === sid) {
+      cur.last_error = null;
+      syncErrorBar();
+    }
+    loadSessions().catch(() => {});
+  };
+  bar.appendChild(btn);
+}
+
+function syncChrome() {
   $('emptyHint')?.remove();
   $('toolbar').style.display = 'flex';
   $('composer').style.display = 'block';
   $('sessName').innerHTML = esc(cur.name) +
     `<span class="cardpart">（角色卡：${esc(cur.card_name || cur.card)}）</span>`;
+  syncErrorBar();
+}
+
+// 整页重建：只用于「切换会话」这种显式跳转；toBottom 决定是否显示最新。
+function renderAll(toBottom) {
+  syncChrome();
   renderPresetSelect();
   renderEndpointSelect();
   // 后端在 GET 会话时已解析出实际生效值
@@ -429,11 +535,61 @@ function render() {
   chat.innerHTML = '';
   // 开局块：永远是对话界面第一个块
   chat.appendChild(makeBeginningBlock());
-  cur.history.forEach((e, i) => {
-    chat.appendChild(e.role === 'assistant' ? makeAIBlock(e, i) : makeUserBlock(e, i));
-  });
-  scrollBottom();
+  cur.history.forEach((e, i) => chat.appendChild(makeBlock(e, i)));
+  if (toBottom) {
+    stickBottom = true;
+    scrollBottom(true);
+  } else {
+    syncStick();
+  }
   updateComposer();
+}
+
+// 同会话数据刷新：按 key 增删/更新块，保持节点身份和滚动位置。
+// 生成中的 .live 块不归这里管（由 finalizeTurn / attachTurn 单独接管）。
+function reconcileSession() {
+  if (!cur) return;
+  syncChrome();
+  const chat = $('chat');
+  const desired = [{ key: 'beginning', make: makeBeginningBlock, update: updateBeginningBlock }];
+  cur.history.forEach((e, i) => desired.push({
+    key: blockKey(e, i),
+    make: () => makeBlock(e, i),
+    update: node => updateBlock(node, e, i),
+  }));
+  const existing = new Map();
+  const keyed = chat.querySelectorAll('[data-key]');
+  for (let k = 0; k < keyed.length; k++) {
+    const key = keyed[k].getAttribute('data-key');
+    if (key) existing.set(key, keyed[k]);
+  }
+  let prev = null;
+  for (const item of desired) {
+    let node = existing.get(item.key);
+    if (node) {
+      existing.delete(item.key);
+      if (item.update) item.update(node);
+    } else {
+      node = item.make();
+    }
+    // 只有缺失/错位时才移动节点，避免无谓地打断选区或滚动锚定
+    const ref = prev ? prev.nextSibling : chat.firstChild;
+    if (node !== ref) chat.insertBefore(node, ref);
+    prev = node;
+  }
+  // 历史被截断（回滚）后多出来的已提交块删掉；live 块留给生成流程
+  for (const node of existing.values()) {
+    if (!node.classList.contains('live')) node.remove();
+  }
+  syncStick();
+  updateComposer();
+}
+
+// 数据变了之后重新拉一次权威快照，再增量 patch；绝不手改 cur.history
+async function refreshSession() {
+  const s = await api('/api/sessions/' + enc());
+  cur = s;
+  reconcileSession();
 }
 
 function renderPresetSelect() {
@@ -451,6 +607,7 @@ function renderEndpointSelect() {
 }
 
 function updateComposer() {
+  if (!cur) return;
   // 空历史 = 等待点击「开始」；最后一块是 AI = 等待用户输入；
   // 最后一块是用户块 = 这一轮还没写出来（生成被打断在落盘前、或进程重启过），点「继续」补回来
   const last = cur.history[cur.history.length - 1];
@@ -458,8 +615,15 @@ function updateComposer() {
   const waiting = !started || last.role === 'assistant';
   const resumable = started && last.role === 'user';
   const btn = $('send');
+  if (selecting) {
+    btn.textContent = '切换中…';
+    btn.disabled = true;
+    btn.classList.remove('interrupting');
+    $('input').disabled = true;
+    return;
+  }
   // cur.generating：后端这一轮还在跑（本页刷新回来、或别的页面/设备发起的）
-  const busy = streaming || !!cur.generating;
+  const busy = streaming || finalizing || reconnecting || !!cur.generating;
   if (busy) {
     btn.textContent = '打断';
     btn.disabled = false;
@@ -519,22 +683,53 @@ function optionsRawDetails(raw) {
 
 // AI 块的选项区只留一份（占位/按钮/错误提示互斥），换形态前清掉旧的
 function setOptionsArea(div, node) {
-  div.querySelectorAll('.options, .options-pending, .options-error').forEach(el => el.remove());
+  const old = div.querySelectorAll('.options, .options-pending, .options-error');
+  for (let k = old.length - 1; k >= 0; k--) old[k].remove();
   if (node) div.appendChild(node);
+}
+
+// 块内唯一的 class（tag / content / errnote / options 都不会嵌套同名）
+function directChild(div, cls) {
+  return div.querySelector('.' + cls);
+}
+
+function findBlock(key) {
+  const nodes = $('chat').querySelectorAll('[data-key]');
+  for (let k = 0; k < nodes.length; k++) {
+    if (nodes[k].getAttribute('data-key') === key) return nodes[k];
+  }
+  return null;
+}
+
+function liveAITag() {
+  const nodes = $('chat').querySelectorAll('.live');
+  for (let k = 0; k < nodes.length; k++) {
+    if (nodes[k].classList.contains('ai')) return directChild(nodes[k], 'tag');
+  }
+  return null;
 }
 
 function makeBeginningBlock() {
   const div = document.createElement('div');
   div.className = 'block beginning';
+  div.setAttribute('data-key', 'beginning');
+  div._text = cur.beginning_text;
   div.innerHTML = `<div class="tag">开局</div><div class="content markdown">${renderMarkdown(cur.beginning_text || '（空开局）')}</div>`;
   const ops = document.createElement('div');
   ops.className = 'ops';
   ops.appendChild(makeOpsBtn('修改', () => editBlock(div, cur.beginning_text, async text => {
     await api(`/api/sessions/${enc()}/beginning`, post({ text }));
-    cur.beginning_text = text; render();
+    await refreshSession();
   })));
   div.appendChild(ops);
   return div;
+}
+
+function updateBeginningBlock(div) {
+  if (div._text === cur.beginning_text) return;
+  div._text = cur.beginning_text;
+  directChild(div, 'content').innerHTML =
+    renderMarkdown(cur.beginning_text || '（空开局）');
 }
 
 // 工具调用块（与思考块一样默认折叠）：参数尽量按 JSON 美化，调用结果拼在同一块里
@@ -561,8 +756,17 @@ function aiMiddleHTML(e) {
   return html;
 }
 
-function makeAIBlock(e, i) {
-  const div = document.createElement('div');
+// 落盘内容的签名：变了才重建这个块，没变的块连碰都不碰
+function entrySig(e) {
+  return JSON.stringify(e);
+}
+
+function makeBlock(e, i) {
+  return e.role === 'assistant' ? makeAIBlock(e, i) : makeUserBlock(e, i);
+}
+
+// AI 块的正文/思考/选项/错误条整体重填（只在该块数据真的变了时调用）
+function fillAIBlock(div, e, i) {
   div.className = 'block ai';
   div.innerHTML = `<div class="tag">${e.error ? '出错' : 'AI'}</div>` +
     aiMiddleHTML(e) +
@@ -570,11 +774,29 @@ function makeAIBlock(e, i) {
     `<div class="content markdown">${renderMarkdown(e.content)}</div>`;
   if (e.options && e.options.length) div.appendChild(optionsDiv(e.options));
   if (e.options_error) div.appendChild(optionsErrorDiv(e.options_error, e.options_raw));
+  fillAIOps(div, e, i);
+  div._sig = entrySig(e);
+}
+
+function makeAIBlock(e, i) {
+  const div = document.createElement('div');
+  div.setAttribute('data-key', 'assistant:' + i);
+  fillAIBlock(div, e, i);
+  return div;
+}
+
+function aiOpsSig(i) {
+  return i + '|' + (i === cur.history.length - 1 ? 1 : 0) + '|' + (cur.options_enabled ? 1 : 0);
+}
+
+function fillAIOps(div, e, i) {
+  const old = div.querySelectorAll('.ops');
+  for (let k = old.length - 1; k >= 0; k--) old[k].remove();
   const ops = document.createElement('div');
   ops.className = 'ops';
   ops.appendChild(makeOpsBtn('修改', () => editBlock(div, e.content, async text => {
     await api(`/api/sessions/${enc()}/edit_ai`, post({ index: i, content: text, options: e.options || [] }));
-    cur.history[i].content = text; render();
+    await refreshSession();
   })));
   // 只允许最后一个 AI 块重新输出
   if (i === cur.history.length - 1) {
@@ -584,21 +806,29 @@ function makeAIBlock(e, i) {
       ops.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
   }
   div.appendChild(ops);
-  return div;
+  div._opsSig = aiOpsSig(i);
 }
 
 function makeUserBlock(e, i) {
   const div = document.createElement('div');
   div.className = 'block user';
+  div.setAttribute('data-key', 'user:' + i);
+  div._content = e.content;
   div.innerHTML = `<div class="tag">你</div><div class="content">${esc(e.content)}</div>`;
+  fillUserOps(div, i);
+  return div;
+}
+
+function fillUserOps(div, i) {
+  const old = div.querySelectorAll('.ops');
+  for (let k = old.length - 1; k >= 0; k--) old[k].remove();
   const ops = document.createElement('div');
   ops.className = 'ops';
   ops.appendChild(makeOpsBtn('回滚', async () => {
     const r = await api(`/api/sessions/${enc()}/rollback`, post({ index: i }));
     $('input').value = r.input;
     autoGrow();
-    cur = await api('/api/sessions/' + enc());
-    render();
+    await refreshSession();
   }));
   // 分支：以该用户块为断点复制出一个新会话（原会话不动），并切换过去
   ops.appendChild(makeOpsBtn('分支', async () => {
@@ -606,7 +836,21 @@ function makeUserBlock(e, i) {
     await selectSession(s.id);
   }));
   div.appendChild(ops);
-  return div;
+  div._userOpsI = i;
+}
+
+// 数据刷新时增删/更新一个已有块；节点身份保持不变
+function updateBlock(node, e, i) {
+  if (e.role === 'assistant') {
+    if (node._sig !== entrySig(e)) fillAIBlock(node, e, i);
+    else if (node._opsSig !== aiOpsSig(i)) fillAIOps(node, e, i);
+  } else {
+    if (node._content !== e.content) {
+      node._content = e.content;
+      directChild(node, 'content').textContent = e.content;
+    }
+    if (node._userOpsI !== i) fillUserOps(node, i);
+  }
 }
 
 // 把块内容切换为编辑态
@@ -631,23 +875,84 @@ const post = obj => ({ method: 'POST', headers: { 'Content-Type': 'application/j
 // 连续重连次数：接上（或正常收尾）后归零，用来在长时间断网时放弃等待
 let reconnectTries = 0;
 
+function removeLiveNodes(except) {
+  const live = $('chat').querySelectorAll('.live');
+  for (let k = live.length - 1; k >= 0; k--) {
+    if (live[k] !== except) live[k].remove();
+  }
+}
+
+// 错误说明条：和 makeAIBlock 里的 .errnote 保持同一种形态
+function syncErrorNote(div, message) {
+  const content = directChild(div, 'content');
+  let note = directChild(div, 'errnote');
+  if (!message) {
+    if (note) note.remove();
+    return;
+  }
+  if (!note) {
+    note = document.createElement('div');
+    note.className = 'errnote';
+    div.insertBefore(note, content);
+  }
+  note.textContent = `〔生成出错〕${message}`;
+}
+
+// 用落盘 entry 对账选项区；形态没变就保留原节点（options-raw 的展开状态不丢）
+function restoreOptionsArea(div, e) {
+  const node = directChild(div, 'options') ||
+    directChild(div, 'options-error') ||
+    directChild(div, 'options-pending');
+  if (e && e.options && e.options.length) {
+    if (node && node.classList.contains('options')) return;
+    setOptionsArea(div, optionsDiv(e.options));
+  } else if (e && e.options_error) {
+    if (node && node.classList.contains('options-error')) return;
+    setOptionsArea(div, optionsErrorDiv(e.options_error, e.options_raw));
+  } else {
+    setOptionsArea(div, null);
+  }
+}
+
+function paintNow(ov) {
+  if (!ov) return;
+  const pending = ov.scheduled;
+  if (pending) {
+    cancelAnimationFrame(ov.frame);
+    ov.scheduled = false;
+  }
+  if (!ov.contentDiv) return;
+  if (!pending && ov.painted === ov.partial) return;  // 已经画完了，别再重刷
+  ov.contentDiv.innerHTML = renderMarkdown(ov.partial);
+  ov.painted = ov.partial;
+}
+
 async function streamInto(url, opts, userText, reuseAI) {
+  const sid = cur.id;
+  const seq = ++streamSeq;
   streaming = true; updateComposer();
+  // 新一轮开始时服务端会清掉上一次失败；错误条先收起（若这一轮又失败，收尾会再显示）
+  if (cur.last_error) { cur.last_error = null; syncErrorBar(); }
+  // 上一次流若在放弃重连时留下了 live 块，开新流前先清掉，避免旧块永远挂在下面
+  removeLiveNodes(reuseAI || undefined);
   const chat = $('chat');
-  // 用户输入块立即显示；断线重连会丢掉本次尝试画出的块重画，用户块由调用方每轮重新传入
+  // 用户输入块立即显示；它只是临时 overlay，落盘后由 finalizeTurn 转正
+  let userDiv = null;
   if (userText != null) {
-    const u = document.createElement('div');
-    u.className = 'block user live';
-    u.innerHTML = `<div class="tag">你</div><div class="content">${esc(userText)}</div>`;
-    chat.appendChild(u);
+    userDiv = document.createElement('div');
+    userDiv.className = 'block user live';
+    userDiv._content = userText;
+    userDiv.innerHTML = `<div class="tag">你</div><div class="content">${esc(userText)}</div>`;
+    chat.appendChild(userDiv);
   }
   let div;
   if (reuseAI) {
     // 只重生成选项：正文已落盘，复用最后一个 AI 块（流里只有选项事件，正文保持不动）
     div = reuseAI;
     div.classList.add('live');
-    div.querySelector('.tag').textContent = 'AI（生成选项中…）';
-    div.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    directChild(div, 'tag').textContent = 'AI（生成选项中…）';
+    const btns = div.querySelectorAll('button');
+    for (let k = 0; k < btns.length; k++) btns[k].disabled = true;
   } else {
     div = document.createElement('div');
     div.className = 'block ai live';
@@ -655,34 +960,52 @@ async function streamInto(url, opts, userText, reuseAI) {
       <div class="content"></div>`;
     chat.appendChild(div);
   }
-  scrollBottom();
-  const contentDiv = div.querySelector('.content');
+  // 每条流一份 overlay；切走后旧流继续读到第一个事件就断开，不再碰全局 UI
+  const ov = {
+    sid, seq, userDiv, aiDiv: div, reuseAI: !!reuseAI,
+    contentDiv: directChild(div, 'content'),
+    partial: '', painted: '', scheduled: false, frame: 0, saved: false, heard: false,
+  };
+  overlay = ov;
+  // 流内滚动绑在当前这条流上：切走以后旧流不能再滚新会话
+  function scrollStream() {
+    if (seq !== streamSeq) return;
+    if (stickBottom) chat.scrollTop = chat.scrollHeight;
+  }
+  scrollStream();
+  const contentDiv = ov.contentDiv;
   contentDiv.classList.add('markdown');
   // 当前思考块:工具调用会切分思考,下一段思考另起新块(思考→工具→思考→…→正文)
   let thinkDiv = null;
-  let partialContent = '';
-  let renderScheduled = false;
+
   function flushContent() {
-    contentDiv.innerHTML = renderMarkdown(partialContent);
-    renderScheduled = false;
-    scrollBottom();
+    if (seq !== streamSeq) return;
+    ov.contentDiv.innerHTML = renderMarkdown(ov.partial);
+    ov.painted = ov.partial;
+    ov.scheduled = false;
+    scrollStream();
   }
   function appendContent(delta) {
-    partialContent += delta;
-    if (!renderScheduled) {
-      renderScheduled = true;
-      requestAnimationFrame(flushContent);
+    if (seq !== streamSeq) return;
+    ov.partial += delta;
+    if (!ov.scheduled) {
+      ov.scheduled = true;
+      ov.frame = requestAnimationFrame(flushContent);
     }
   }
+
+  let reader = null;
   try {
     const resp = await fetch(url, opts);
     // 会话过期/被踢：不当作"断线重连"，直接回登录页
     if (resp.status === 401) { showLogin('登录已过期，请重新登录'); return; }
-    activeReader = resp.body.getReader();
+    reader = resp.body.getReader();
+    // fetch 可能在切会话之后才返回：别把旧 reader 写成全局，否则会顶掉新流的打断
+    if (seq === streamSeq) activeReader = reader;
     const dec = new TextDecoder();
     let buf = '';
     for (;;) {
-      const { done, value } = await activeReader.read();
+      const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
       let cut;
@@ -691,117 +1014,252 @@ async function streamInto(url, opts, userText, reuseAI) {
         const line = raw.split('\n').find(l => l.startsWith('data:'));
         if (!line) continue;
         const ev = JSON.parse(line.slice(5));
+        if (seq !== streamSeq) {
+          // 已切走：这一轮不再进 UI。等第一个事件确认服务端已注册 _active 后再断开
+          // 本地读——POST 响应头可能比注册更早到，立刻取消有窗口会把整轮一起取消。
+          if (!ov.heard) {
+            ov.heard = true;
+            try { await reader.cancel(); } catch (e) {}
+          }
+          break;
+        }
+        ov.heard = true;
+        // 这一轮开始后服务端会清掉旧错误；UI 同步把旧错误条收掉
+        if (cur && cur.last_error) {
+          cur.last_error = null;
+          syncErrorBar();
+        }
         if (ev.type === 'reasoning') {
           if (!thinkDiv) {
             contentDiv.insertAdjacentHTML('beforebegin',
               '<details class="thinking"><summary>思考</summary><div></div></details>');
             thinkDiv = contentDiv.previousElementSibling.querySelector('div');
           }
-          thinkDiv.textContent += ev.delta; scrollBottom();
+          thinkDiv.textContent += ev.delta; scrollStream();
         }
         else if (ev.type === 'content') { appendContent(ev.delta); }
         // 工具调用块随流逐个出现（事件在工具执行完后到达，参数与结果一起拼入）
         else if (ev.type === 'tool') {
           contentDiv.insertAdjacentHTML('beforebegin', toolDetailsHTML(ev));
           thinkDiv = null;
-          scrollBottom();
+          scrollStream();
         }
+        // 助手块已落盘：整轮结束时优先就地定稿，不再整页重建
+        else if (ev.type === 'saved') { ov.saved = true; }
         // 正文之后的选项请求：先淡色占位，拿到后换成按钮；失败换成提示+重试
         else if (ev.type === 'options_start') {
           const p = document.createElement('div');
           p.className = 'options-pending';
           p.textContent = '生成选项中…';
           setOptionsArea(div, p);
-          scrollBottom();
+          scrollStream();
         }
         else if (ev.type === 'options') {
           setOptionsArea(div, optionsDiv(ev.options));
-          scrollBottom();
+          scrollStream();
         }
         else if (ev.type === 'options_error') {
           setOptionsArea(div, optionsErrorDiv(ev.message, ev.raw));
-          scrollBottom();
+          scrollStream();
         }
         else if (ev.type === 'error') {
           // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块。
-          // 半截输出已落盘时保留已流出的正文，错误说明另起一行（刷新后按 history 重渲染）
+          // 半截输出已落盘时保留已流出的正文，错误说明用 .errnote 另起一行。
           if (ev.popup) alert(ev.message);
           // 只重掷选项时正文不动，错误只弹窗提示
           if (!reuseAI) {
-            div.querySelector('.tag').textContent = '出错';
-            if (ev.persisted && contentDiv.textContent)
-              contentDiv.textContent += `\n\n〔生成出错〕${ev.message}`;
-            else
-              contentDiv.textContent = ev.message;
+            directChild(div, 'tag').textContent = '出错';
+            if (ev.persisted) syncErrorNote(div, ev.message);
+            else contentDiv.textContent = ev.message;
           }
         }
       }
+      if (seq !== streamSeq) break;
     }
   } catch (err) {
+    if (seq !== streamSeq) return;  // 已切走：不重连，也不对账
     if (!streaming) { /* 用户打断，属于正常路径 */ }
     else {
-      // 连接断了：生成是会话级后台任务，后端那一轮照跑，重连接上继续看
+      // 连接断了：生成是会话级后台任务，后端那一轮照跑，重连接上继续看。
+      // reconnecting 期间保持 busy，别让用户在这个窗口里发下一轮。
       streaming = false;
-      await reconnectTurn(userText);
+      activeReader = null;
+      overlay = null;
+      reconnecting = true;
+      try {
+        await reconnectTurn(seq, sid);
+      } finally {
+        if (seq === streamSeq) {
+          reconnecting = false;
+          updateComposer();
+        }
+      }
       return;
     }
   }
+  if (seq !== streamSeq) return;
   activeReader = null;
-  streaming = false;
   reconnectTries = 0;
-  cur = await api('/api/sessions/' + enc());
-  render();
+  // 拉快照 + 就地定稿期间继续保持 busy，避免用户抢在当前轮对账前发下一轮
+  finalizing = true;
+  try {
+    await finalizeFromServer(seq, sid, ov);
+  } finally {
+    if (seq === streamSeq) {
+      finalizing = false;
+      streaming = false;
+      updateComposer();
+    }
+  }
 }
 
-// 断线后重连续看：后端还在生成就重放整轮接上，这一轮已结束就按 history 收尾
-async function reconnectTurn(userText) {
+// 正常结束/打断后拉一次权威快照：saved 就地定稿，否则按快照重建缺的块
+async function finalizeFromServer(seq, sid, ov) {
+  if (seq !== streamSeq || !cur || cur.id !== sid) return;
+  let s;
+  try {
+    s = await api('/api/sessions/' + encodeURIComponent(sid));
+  } catch (e) {
+    if (seq !== streamSeq) return;
+    if (ov && ov.reuseAI) {
+      // 正文本来就没动，别把「生成选项中…」和禁用按钮留在页面上
+      ov.aiDiv.classList.remove('live');
+      directChild(ov.aiDiv, 'tag').textContent = 'AI';
+      const btns = ov.aiDiv.querySelectorAll('button');
+      for (let k = 0; k < btns.length; k++) btns[k].disabled = false;
+      if (overlay === ov) overlay = null;
+    } else {
+      const tag = liveAITag();
+      if (tag) tag.textContent = '已结束（同步失败，刷新可恢复）';
+    }
+    updateComposer();
+    return;
+  }
+  if (seq !== streamSeq || !cur || cur.id !== sid) return;
+  finalizeTurn(s, ov, seq);
+}
+
+function finalizeTurn(s, ov, seq) {
+  if (seq !== streamSeq || !cur || cur.id !== s.id) return;
+  cur = s;
+  const h = s.history;
+  const last = h[h.length - 1];
+  if (ov) {
+    if (ov.reuseAI && last && last.role === 'assistant') {
+      // 只重掷选项：正文/思考/工具都不动，只恢复标签、选项区和按钮
+      const div = ov.aiDiv;
+      div.classList.remove('live');
+      directChild(div, 'tag').textContent = 'AI';
+      restoreOptionsArea(div, last);
+      fillAIOps(div, last, h.length - 1);
+      const btns = div.querySelectorAll('button');
+      for (let k = 0; k < btns.length; k++) btns[k].disabled = false;
+      div._sig = entrySig(last);
+    } else if (!ov.reuseAI && ov.saved && last && last.role === 'assistant') {
+      const i = h.length - 1;
+      const div = ov.aiDiv;
+      paintNow(ov);
+      div.classList.remove('live');
+      div.setAttribute('data-key', 'assistant:' + i);
+      directChild(div, 'tag').textContent = last.error ? '出错' : 'AI';
+      if (last.content !== ov.painted) {
+        ov.contentDiv.innerHTML = renderMarkdown(last.content);
+        ov.painted = last.content;
+      }
+      syncErrorNote(div, last.error);
+      restoreOptionsArea(div, last);
+      fillAIOps(div, last, i);
+      div._sig = entrySig(last);
+      if (ov.userDiv) {
+        ov.userDiv.classList.remove('live');
+        ov.userDiv.setAttribute('data-key', 'user:' + (i - 1));
+        fillUserOps(ov.userDiv, i - 1);
+      }
+    } else {
+      // 没有落盘的助手块（弹窗错误/失败前就断了）：丢掉 overlay，按快照补齐
+      removeLiveNodes();
+    }
+  }
+  if (overlay === ov) overlay = null;
+  reconcileSession();
+  syncStick();
+  loadSessions().catch(() => {});
+}
+
+// 这一轮已在服务端结束：丢掉 live 覆盖层，按快照对账（不重建没变的块）
+function finishFromSnapshot(s) {
+  if (!cur || cur.id !== s.id) return;
+  cur = s;
+  overlay = null;
+  removeLiveNodes();
+  reconcileSession();
+  updateComposer();
+  loadSessions().catch(() => {});
+}
+
+// 断线后重连续看：后端还在生成就重放整轮接上，这一轮已结束就按快照对账。
+// seq/sid 保证切到别的会话后，旧流的重连不会把新会话顶掉。
+async function reconnectTurn(seq, sid) {
+  if (seq !== streamSeq || !cur || cur.id !== sid) return;
   let s = null;
-  try { s = await api('/api/sessions/' + enc()); } catch (e) {}
-  if (s && !s.generating) { cur = s; reconnectTries = 0; render(); return; }
+  try { s = await api('/api/sessions/' + encodeURIComponent(sid)); } catch (e) {}
+  if (seq !== streamSeq || !cur || cur.id !== sid) return;
+  if (s && !s.generating) {
+    reconnectTries = 0;
+    finishFromSnapshot(s);
+    return;
+  }
   if (++reconnectTries > 12) {
     // 网络长时间不通：把半截内容留在屏幕上，刷新或切回前台会重新接上
-    const tag = $('chat').querySelector('.live.ai .tag');
+    const tag = liveAITag();
     if (tag) tag.textContent = '连接中断（刷新页面可接上）';
+    overlay = null;
     updateComposer();
     return;
   }
   await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** reconnectTries, 5000)));
-  // 只重掷选项的这一轮：正文已落盘，复用最后一个 AI 块（它带着 .live，先摘掉，
-  // 免得被下面那句当成"这次尝试画出的块"删掉、让正文闪空一下）
-  let reuseAI = null;
-  if (s && s.generating && s.generating.mode === 'options') {
-    const ai = $('chat').querySelectorAll('.block.ai');
-    if (ai.length) { reuseAI = ai[ai.length - 1]; reuseAI.classList.remove('live'); }
-  }
-  // 丢掉这次尝试画出的块，从 /stream 重放整轮
-  $('chat').querySelectorAll('.live').forEach(el => el.remove());
-  await streamInto(`/api/sessions/${enc()}/stream`, {}, userText, reuseAI);
+  if (seq !== streamSeq || !cur || cur.id !== sid) return;
+  await attachTurn(s, seq);
 }
 
-// 页面加载/回到前台时接上后端正在进行的这一轮（刷新、锁屏、掉线都能续看）
-async function attachTurn() {
-  const g = cur.generating;
-  if (!g || streaming) return;
-  const last = cur.history[cur.history.length - 1];
-  // regenerate 的旧 AI 块后端已经删了：只有末尾仍是 AI 块时才要从屏幕上摘掉它
-  if (g.mode === 'regenerate' && last && last.role === 'assistant') {
-    const blocks = $('chat').querySelectorAll('.block.ai');
-    if (blocks.length) blocks[blocks.length - 1].remove();
+// 接上后端正在进行的这一轮（页面加载、断线重连、切回前台共用）：
+// 先按快照对账已提交历史，再挂上 overlay 重放本轮流。
+async function attachTurn(fresh, seq) {
+  if (seq != null && seq !== streamSeq) return;
+  if (selecting || streaming || finalizing || !cur) return;
+  const sid = cur.id;
+  let s = fresh;
+  if (!s) {
+    try { s = await api('/api/sessions/' + encodeURIComponent(sid)); }
+    catch (e) { await reconnectTurn(seq, sid); return; }
   }
-  reconnectTries = 0;
-  // options（只重掷选项）：正文已落盘、与输入无关，别删最后一个 AI 块，复用它接选项事件
+  if (seq != null && seq !== streamSeq) return;
+  if (!cur || cur.id !== sid || s.id !== sid || streaming || finalizing) return;
+  cur = s;
+  overlay = null;
+  removeLiveNodes();
+  reconcileSession();
+  const g = s.generating;
+  if (!g) { updateComposer(); return; }
+  const last = s.history[s.history.length - 1];
+  // options（只重掷选项）：正文已落盘，复用最后一个 AI 块接选项事件
   let reuseAI = null;
   if (g.mode === 'options') {
-    const blocks = $('chat').querySelectorAll('.block.ai');
-    if (blocks.length) reuseAI = blocks[blocks.length - 1];
+    reuseAI = cur.history.length
+      ? findBlock('assistant:' + (cur.history.length - 1))
+      : null;
+    if (!reuseAI) { updateComposer(); return; }
   }
   // 这一轮的用户输入后端开局就已落盘（history 末尾就是它，界面已按 history 画好），
   // 只有末尾不是用户块时才需要现场补画一个
-  const needUserText = g.mode === 'chat' && !(last && last.role === 'user');
-  await streamInto(`/api/sessions/${enc()}/stream`, {}, needUserText ? g.user_input : null, reuseAI);
+  const userText = g.mode === 'chat' && !(last && last.role === 'user') ? g.user_input : null;
+  // 新流用 streaming 表示 busy；旧的 reconnect finally 因 seq 变化不会再清它
+  reconnecting = false;
+  await streamInto(`/api/sessions/${encodeURIComponent(sid)}/stream`, {}, userText, reuseAI);
 }
 
 async function interrupt() {
+  if (finalizing) return;  // 已经结束、正在对账，没有可打断的流
   // 先通知后端取消生成并落盘半截输出，再断开本地流
   try { await api(`/api/sessions/${enc()}/interrupt`, { method: 'POST' }); } catch (e) {}
   streaming = false;
@@ -810,36 +1268,43 @@ async function interrupt() {
 
 function send() {
   const text = $('input').value.trim();
-  if (!text || streaming || cur.generating) return;
+  if (!text || selecting || streaming || finalizing || reconnecting || cur.generating) return;
   $('input').value = '';
   autoGrow();
   if (!cur.history.length) return; // 首轮用「开始」
+  reconnectTries = 0;
   streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }), text);
 }
 
 function regenerate() {
-  if (streaming || cur.generating) return;
+  if (selecting || streaming || finalizing || reconnecting || cur.generating) return;
+  reconnectTries = 0;
   // 立即移除旧的最后一个 AI 块，避免新旧两块同时显示；末尾是用户块时（上一轮没写出来）
   // 没有要替换的 AI 块，别误删更早的那个
   const last = cur.history[cur.history.length - 1];
   if (last && last.role === 'assistant') {
-    const blocks = $('chat').querySelectorAll('.block.ai');
-    if (blocks.length) blocks[blocks.length - 1].remove();
+    const node = findBlock('assistant:' + (cur.history.length - 1));
+    if (node) node.remove();
   }
   streamInto(`/api/sessions/${enc()}/regenerate`, { method: 'POST' });
 }
 
 // 只重掷最后一轮的选项（正文不动，不新增块）：复用最后一个 AI 块接选项阶段的流
 function regenerateOptions() {
-  if (streaming || cur.generating) return;
-  const blocks = $('chat').querySelectorAll('.block.ai');
-  if (!blocks.length) return;
-  streamInto(`/api/sessions/${enc()}/regenerate_options`, { method: 'POST' }, null, blocks[blocks.length - 1]);
+  if (selecting || streaming || finalizing || reconnecting || cur.generating) return;
+  reconnectTries = 0;
+  const last = cur.history[cur.history.length - 1];
+  if (!last || last.role !== 'assistant') return;
+  const div = findBlock('assistant:' + (cur.history.length - 1));
+  if (!div) return;
+  streamInto(`/api/sessions/${enc()}/regenerate_options`, { method: 'POST' }, null, div);
 }
 
 $('send').onclick = () => {
-  if (streaming || cur.generating) { interrupt(); return; }
+  if (selecting || finalizing) return;
+  if (streaming || reconnecting || cur.generating) { interrupt(); return; }
   const last = cur.history[cur.history.length - 1];
+  reconnectTries = 0;
   if (!last) streamInto(`/api/sessions/${enc()}/start`, { method: 'POST' });
   else if (last.role === 'user') regenerate();  // 末尾是用户块：把这一轮补出来
   else send();
@@ -920,13 +1385,25 @@ $('mCreate').onclick = async () => {
   } catch (e) { alert(e.message); }
 };
 
-// 手机上锁屏/切走再回来：这一轮可能还在跑，没接上就重新接（长断网放弃后也靠它恢复）
+// 手机上锁屏/切走再回来：这一轮可能还在跑，没接上就重新接（长断网放弃后也靠它恢复）。
+// 顺便对账一次快照：别的标签页改了历史时，这里按 key 增量更新，不整页重建。
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || streaming || !cur) return;
+  if (document.visibilityState !== 'visible' || selecting || streaming || finalizing || reconnecting || !cur) return;
+  const sid = cur.id;
+  const sseq = selectSeq;
   try {
-    const s = await api('/api/sessions/' + enc());
-    if (s.generating) { cur = s; render(); attachTurn(); }
-    else if (cur.generating) { cur = s; render(); }
+    const s = await api('/api/sessions/' + encodeURIComponent(sid));
+    // 期间已经切到别的会话（包括正在等 GET 的新选择）：这次刷新不能接管
+    if (sseq !== selectSeq || !cur || cur.id !== sid) return;
+    if (s.generating) {
+      reconnectTries = 0;
+      await attachTurn(s);
+    } else if (overlay || cur.generating) {
+      finishFromSnapshot(s);
+    } else {
+      cur = s;
+      reconcileSession();
+    }
   } catch (e) {}
 });
 
@@ -934,9 +1411,16 @@ document.addEventListener('visibilitychange', async () => {
 
 function showLogin(message) {
   // 掉线重连/流式读到一半被踢：先把本地流收掉，别让后台读继续跑
+  streamSeq++;  // 让所有在途的流/重连/对账失效
+  selectSeq++;
+  selecting = false;
   streaming = false;
+  finalizing = false;
+  reconnecting = false;
+  overlay = null;
   if (activeReader) { try { activeReader.cancel(); } catch (e) {} activeReader = null; }
   cur = null;
+  syncErrorBar();
   $('sessionList').innerHTML = '';
   $('toolbar').style.display = 'none';
   $('composer').style.display = 'none';
@@ -1006,6 +1490,15 @@ async function boot() {
     rememberSession(null);
   }
 }
+
+// 侧栏状态轮询：切走的会话在后台生成，靠它更新「生成中」/「出错」/轮数。
+// 只在可见且已选中会话时跑；列表接口本身很小。
+let sessionsPolling = false;
+setInterval(async () => {
+  if (sessionsPolling || document.visibilityState !== 'visible' || !cur) return;
+  sessionsPolling = true;
+  try { await loadSessions(); } catch (e) {} finally { sessionsPolling = false; }
+}, 5000);
 
 boot();
 </script>

@@ -13,3 +13,6 @@ auth_sessions.json
 !/games/龙娘x猫娘.md
 !/games/久远之旅*
 
+# 本机临时 SFTP 密码
+/.sftp-pass
+

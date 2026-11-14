@@ -12,7 +12,7 @@ uv run -m main
 
 启动时除端点外还校验 `auth` 段：开了鉴权却一个账号都没有直接报错退出。
 
-**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 59 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑、3.12 的 `Path.read_text` 不认 `newline` 时 edit_file 仍要能跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
+**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 62 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑、3.12 的 `Path.read_text` 不认 `newline` 时 edit_file 仍要能跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
 
 **测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 
@@ -146,9 +146,12 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 - **用户输入在开局时就落盘**（`_prepare` 里追加 user 块并 `save_history`，`_persist` 只补助手块）：进程被 kill / 部署重启 / OOM 都不会丢掉用户刚打的那句。请求拼装用的是「追加前的那段历史 + draft」，所以预设的 `<preset_user_input>` 模板仍只作用于这一轮、落盘保留原文。顺带的好处：选项请求的输入（`build_options_input(state, history, ...)`）现在严格等于「正文请求的输入 + 本轮助手回复」，前缀缓存不会再在用户那一句上断开。
 - 末尾是 user 块（上一轮没写出来）= 可恢复状态：前端发送按钮变成「继续」（走 `/regenerate`，把那句用户输入取出来重发），`updateComposer` / `regenerate` 都按这个判定走了分支。
 - 客户端断开（刷新、掉线、锁屏）只中断这次转发，生成照旧跑完并落盘。页面加载时看 `GET /api/sessions/{name}` 的 `generating`（`{mode, user_input}`，没在跑则 null，mode 可能是 `options`；被替换掉的旧 AI 块靠它还原），前端据此接上 `/stream` 重放整轮（幂等，可多客户端同时接），断了退避重连。`attachTurn` 只在「末尾不是 user 块」时才现场补画用户块，否则会画两遍。
+- **前端渲染按块 key 增量对账**（B+）：`cur.history` 是只读快照，同会话刷新（结束一轮、回滚、编辑、断线接上、切前台）只走 `reconcileSession()`，按 `beginning` / `user:<i>` / `assistant:<i>` 增删/更新节点，没变的块连碰都不碰；整页 `renderAll()` 只用于切换会话并显式滚到底。一轮结束时优先用 `saved` 事件把流式块就地定稿（不重建、不调用 `scrollBottom`）；没有 `saved`（弹窗错误、断线漏读）才丢掉 overlay、按快照补齐。所以回复完成不会自动跳到底部，滚动位置、展开的 details、选区和编辑中的 textarea 都会保留。断线/切前台时先按快照对账已提交历史，再挂 overlay 重放。
+- **多会话切换与后台生成**：页面一次只看一个会话，但切走不会打断服务端那一轮。`detachStream()` 只断开本地转发并让旧流的 `seq` 失效，不调用 `/interrupt`；切回来 `GET` 快照 + `attachTurn` 从事件缓冲重放整轮。每条流有 `sid`/`seq`，结束对账、重连、流内滚动都先校验，旧流不会写进新会话。多个会话可以在服务端同时生成（总并发见 `server.max_concurrent_generations`）。切走时如果旧流还没收到任何事件，先不 cancel，等第一个事件确认 `_active` 已注册再断，避免把 POST 那一轮取消掉。
+- **侧栏/会话页状态**：`GET /api/sessions` 每项带 `generating`（mode/null）和 `last_error`（`{message, at}`/null），`GET /api/sessions/{name}` 也带 `last_error`；`_session_errors` 是进程内的最近失败表，任意一轮开始 / `POST /api/sessions/{name}/dismiss_error` / 删会话时清，重启即空。前端侧栏显示「生成中」/「出错」，会话页顶部有错误条（带「知道了」），每 5s 拉一次列表更新后台状态和轮数。
 - `_gen_of` 判定「正在生成」，生成中再次 POST 只返回一个 popup 错误；`/interrupt` 取消任务。
 - **生成与改会话互斥**：`_busy(key)` 让回滚 / 编辑 AI 块 / 换预设 / 改参数 / fork / 删除直接返回 409（`_prepare` 会重写 history、`_persist` 会重写 world，并发只会互相覆盖）。这些端点**都是 `async def`**，和 `_generate` 共用 `server._lock_for(会话键)`：`_generate` 在锁里完成「查 `_active` + `_prepare` + 注册」，所以「检查」与「注册」之间没有窗口——原来同步端点跑在工作线程池里，`_busy` 过了、`_active` 还没写上的那几毫秒里，回滚会被随后那一轮的 `save_history` 覆盖回去。锁只在注册阶段持有，**流式转发不持锁**（否则一次生成会把端点锁几分钟）；改会话端点的锁体里也不许有 await（会让出控制权），`_lock_check` 式的结构检查保证这一点。
-- 事件类型：`reasoning` / `content` / `tool` / `done`（正文完成，不带 options）/ `options_start` / `options` / `options_error` / `error`。
+- 事件类型：`reasoning` / `content` / `tool` / `done`（正文完成，不带 options）/ `options_start` / `options` / `options_error` / `saved`（助手块已落盘，前端据此就地定稿）/ `error`。
 - 失败不丢半截结果：后端/API 错误照打断的先例落盘（正文或「（生成失败，无正文输出）」占位、已执行的 tool_calls、tail 思维链），entry 上加 `error`（前端以「出错」标签 + 错误条显示），已执行的工具调用改动一并 commit 保持叙事与状态一致。仅当尚未开始流式输出时才只 abort 世界状态。
 
 ## 会话存储与操作

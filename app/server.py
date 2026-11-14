@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -173,8 +174,13 @@ def get_sessions(user: str | None = Depends(current_user)):
     """
     sessions = core.list_sessions(user)
     for s in sessions:
+        key = _key(user, s["id"])
         s["card_name"] = s.get("card_name") or s.get("card") or ""
-        s["turns"] = core.count_turns(_key(user, s["id"]))
+        s["turns"] = core.count_turns(key)
+        # 侧栏状态：正在生成 / 最近一次失败（失败事件可能不落盘，前端切走期间看不到）
+        gen = _gen_of(key)
+        s["generating"] = gen["mode"] if gen else None
+        s["last_error"] = _session_error_of(key)
     return sessions
 
 
@@ -233,11 +239,25 @@ def get_session(name: str, user: str | None = Depends(current_user)):
         state["generating"] = (
             {"mode": gen["mode"], "user_input": gen["user_input"]} if gen else None
         )
+        state["last_error"] = _session_error_of(key)
         return state
     except FileNotFoundError:
         raise HTTPException(404, "session 不存在")
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/sessions/{name}/dismiss_error")
+async def dismiss_error(name: str, user: str | None = Depends(current_user)):
+    """用户点了「知道了」：清掉侧栏/会话页的最近失败状态（不改历史）。"""
+    key = _key(user, name)
+    try:
+        core.load_state(key)
+    except FileNotFoundError:
+        raise HTTPException(404, "session 不存在")
+    async with _lock_for(key):
+        _clear_session_error(key)
+    return {"ok": True}
 
 
 @app.delete("/api/sessions/{name}")
@@ -252,6 +272,7 @@ async def delete_session(name: str, user: str | None = Depends(current_user)):
         except FileNotFoundError:
             raise HTTPException(404, "session 不存在")
         world.drop(key)
+        _clear_session_error(key)
     return {"ok": True}
 
 
@@ -467,6 +488,10 @@ def preview(req: Preview, user: str | None = Depends(current_user)):
 # 键是带用户作用域的会话键（_key 的结果），所以不同用户的同名会话互不干扰。
 _active: dict = {}
 
+# 进程内的「最近一次失败」：popup 类错误没有落盘 entry，切走/换设备后前端看不到，
+# 所以侧栏和会话页从服务端读它。重启即清空；删会话/开新一轮会清掉。
+_session_errors: dict = {}
+
 # 全服务器同时在跑的生成上限（config.yaml 的 server.max_concurrent_generations，缺省 4）：
 # 多人同时按下去时排队，而不是一起把上游打到 429。第一次用到时建好，改配置需重启生效。
 _generation_sem_obj: asyncio.Semaphore | None = None
@@ -494,6 +519,18 @@ def _gen_of(name: str) -> dict | None:
     """该会话当前正在进行的生成；没在跑（或刚结束）时为 None。"""
     gen = _active.get(name)
     return None if gen is None or gen["finished"] else gen
+
+
+def _session_error_of(name: str) -> dict | None:
+    return _session_errors.get(name)
+
+
+def _set_session_error(name: str, message: str) -> None:
+    _session_errors[name] = {"message": message, "at": time.time()}
+
+
+def _clear_session_error(name: str) -> None:
+    _session_errors.pop(name, None)
 
 
 def _emit(gen: dict, event: dict) -> None:
@@ -683,6 +720,8 @@ async def _run(gen: dict, prep: dict) -> None:
         )
         # 世界状态随历史提交,快照键为落盘后的历史长度
         world.commit_turn(name, len(history))
+        # 助手块已落盘：前端据此把流式块就地定稿（没有这个事件时按快照重建）
+        _emit(gen, {"type": "saved", "index": len(history) - 1})
     except asyncio.CancelledError:
         # 用户打断：半截输出落盘，由用户手动回滚或修改
         if streaming_started:
@@ -699,11 +738,13 @@ async def _run(gen: dict, prep: dict) -> None:
             )
             # 半截回合已进历史,其世界状态改动一并提交,保持叙事与状态一致
             world.commit_turn(name, len(history))
+            _emit(gen, {"type": "saved", "index": len(history) - 1})
         else:
             world.abort_turn(name)
     except ValueError as e:
         # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
         world.abort_turn(name)
+        _set_session_error(name, str(e))
         logger.warning("会话 %s 用户侧错误: %s", name, e)
         _emit(gen, {"type": "error", "message": str(e), "popup": True})
     except Exception as e:
@@ -712,6 +753,7 @@ async def _run(gen: dict, prep: dict) -> None:
         # 调用改动一并提交，保持叙事与世界状态一致。尚未开始流式输出时无内容可
         # 落盘，只丢弃未提交的世界状态改动。
         logger.exception("会话 %s 生成失败", name)
+        _set_session_error(name, str(e))
         if streaming_started:
             _persist(
                 name,
@@ -726,6 +768,7 @@ async def _run(gen: dict, prep: dict) -> None:
                 error=str(e),
             )
             world.commit_turn(name, len(history))
+            _emit(gen, {"type": "saved", "index": len(history) - 1})
         else:
             world.abort_turn(name)
         _emit(gen, {"type": "error", "message": str(e), "persisted": streaming_started})
@@ -793,7 +836,9 @@ async def _run_options(gen: dict, prep: dict) -> None:
         raise  # 用户打断：选项没生成出来，历史保持原样
     except Exception as e:
         logger.exception("会话 %s 重新生成选项失败", name)
-        _emit(gen, {"type": "error", "message": f"重新生成选项失败：{e}", "popup": True})
+        message = f"重新生成选项失败：{e}"
+        _set_session_error(name, message)
+        _emit(gen, {"type": "error", "message": message, "popup": True})
     finally:
         gen["finished"] = True
         gen["wake"].set()
@@ -819,6 +864,8 @@ async def _generate(name: str, mode: str, user_input: str | None):
         if _gen_of(name) is not None:
             error = "该会话已有生成在进行中"
         else:
+            # 开始任何一轮都先清掉「最近一次失败」；这一轮再失败会重新写入
+            _clear_session_error(name)
             try:
                 prep = (
                     _prepare_options(name) if mode == "options"
@@ -828,6 +875,7 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 # 用户侧错误（会话状态、预设宏执行失败）：前端弹窗提示，不是后端内部错误
                 if mode != "options":
                     world.abort_turn(name)
+                _set_session_error(name, str(e))
                 logger.warning("会话 %s 用户侧错误: %s", name, e)
                 error = str(e)
             else:

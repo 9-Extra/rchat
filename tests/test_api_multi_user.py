@@ -171,6 +171,9 @@ class TurnFlowTest(AppTestCase):
         kinds = [e["type"] for e in events]
         self.assertIn("content", kinds)
         self.assertIn("done", kinds)
+        # 落盘信号必须在本轮结束前发出，前端靠它决定「就地定稿」而不是整页重建
+        self.assertEqual(kinds.count("saved"), 1)
+        self.assertGreater(kinds.index("saved"), kinds.index("done"))
 
         state = await self.get_session()
         self.assertEqual([e["role"] for e in state["history"]], ["assistant"])
@@ -212,8 +215,11 @@ class TurnFlowTest(AppTestCase):
         code, events = await self.turn("/start")
         self.assertEqual(code, 200)
         self.assertTrue([e for e in events if e["type"] == "error"])
+        self.assertIn("saved", [e["type"] for e in events],
+                      "失败也要发落盘信号，前端才能就地定稿而不是丢掉 live 块")
         entry = (await self.get_session())["history"][0]
         self.assertIn("error", entry, "失败也要落盘（带 error 标记），不能丢半截")
+        self.assertEqual((await self.get_session())["last_error"]["message"], "假模型故意失败")
 
     async def test_user_input_is_persisted_before_generation(self):
         """生成中途进程被杀也不能丢用户输入：开局时就写进 history。"""
@@ -258,6 +264,54 @@ class TurnFlowTest(AppTestCase):
         self.assertEqual((await self.client.delete(f"/api/sessions/{fork_id}")).status_code, 200)
         self.assertEqual((await self.client.delete("/api/sessions/s1")).status_code, 200)
         self.assertEqual((await self.client.get("/api/sessions/s1")).status_code, 404)
+
+    async def test_session_list_reports_generating(self):
+        await self.new_session()
+        from app import server
+        key = self.key(None)
+        server._active[key] = {"finished": False, "mode": "chat", "user_input": "输入"}
+        self.addCleanup(server._active.pop, key, None)
+        rows = (await self.client.get("/api/sessions")).json()
+        self.assertEqual(rows[0]["generating"], "chat")
+        self.assertEqual((await self.get_session())["generating"]["mode"], "chat")
+
+    async def test_last_error_is_reported_and_cleared(self):
+        await self.new_session()
+        with mock.patch.object(core, "build_input", side_effect=ValueError("宏坏了")):
+            code, events = await self.turn("/start")
+        self.assertEqual(code, 200)
+        self.assertTrue([e for e in events if e["type"] == "error"])
+        state = await self.get_session()
+        self.assertEqual(state["last_error"]["message"], "宏坏了")
+        self.assertIsNone(state["generating"])
+        row = (await self.client.get("/api/sessions")).json()[0]
+        self.assertEqual(row["last_error"]["message"], "宏坏了")
+
+        r = await self.client.post("/api/sessions/s1/dismiss_error")
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone((await self.get_session())["last_error"])
+
+        # 开新一轮会清掉上一轮的错误；这一轮成功后也不该再出现
+        with mock.patch.object(core, "build_input", side_effect=ValueError("再来一次")):
+            await self.turn("/start")
+        self.assertEqual((await self.get_session())["last_error"]["message"], "再来一次")
+        await self.turn("/start")
+        state = await self.get_session()
+        self.assertIsNone(state["last_error"])
+        self.assertEqual([e["role"] for e in state["history"]], ["assistant"])
+
+    async def test_regen_options_error_is_reported_and_cleared(self):
+        await self.new_session()
+        await self.turn("/start")
+        from app import server
+        with mock.patch.object(server, "generate_options", side_effect=RuntimeError("选项接口炸了")):
+            code, events = await self.turn("/regenerate_options")
+        self.assertEqual(code, 200)
+        state = await self.get_session()
+        self.assertIn("选项接口炸了", state["last_error"]["message"])
+        # 重新生成成功会清掉上一次失败
+        await self.turn("/regenerate_options")
+        self.assertIsNone((await self.get_session())["last_error"])
 
     async def test_world_run_tool_call(self):
         await self.new_session()
