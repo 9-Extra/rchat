@@ -10,9 +10,9 @@ uv run -m main
 
 默认 25530 端口、双栈、自动开浏览器。`--host`（默认 `::`）指定监听地址，服务器上建议 `--host 127.0.0.1` 只让反代访问（socket 家族按 `getaddrinfo` 解析结果选，给 IPv4 字面量时用 AF_INET）。`--keep-awake`（默认开）在运行期间调 Windows 的 `SetThreadExecutionState` 阻止系统空闲睡眠/休眠，`--no-keep-awake` 关闭；非 Windows 平台自动忽略。uvicorn 开了 `proxy_headers`，反代日志/限速拿到的是真实客户端地址。
 
-启动时除端点外还校验 `auth` 段：开了鉴权却一个账号都没有直接报错退出。
+启动时校验**整份** `config.yaml`（端点 / `web_tools` / `auth` / `server`），任何一段写错都直接报错退出，不会带病运行；开了鉴权却一个账号都没有同样退出。
 
-**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 62 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑、3.12 的 `Path.read_text` 不认 `newline` 时 edit_file 仍要能跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
+**改完代码先跑仓库里的测试**：`uv run python -m unittest discover -s tests -t .`（`tests/` 里 68 个用例，纯 stdlib unittest、进程内 ASGI、假模型，离线可跑，也不会碰真 `sessions/`）。里面既有行为用例，也有几个「守住认知」的用例（旧临时名并发写必失败、裸 `to_thread` 取消后线程还在跑、3.12 的 `Path.read_text` 不认 `newline` 时 edit_file 仍要能跑）——它们复现不了会 skip，不算假红。人工联调仍用下面这条起真服务：
 
 **测试一律用 `uv run -m main --port 25531 --no-browser --no-keep-awake`**，避免和用户的实例冲突。
 
@@ -37,17 +37,30 @@ auth:
 
 ## 配置（config.yaml）
 
-- `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"responses"` 默认 / `"chat_completions"`）、`x_opencode_session`、`reasoning_effort_map`（发给该端点前给思考强度改名，如 OpenRouter 写 `{max: xhigh}`，它的枚举只到 xhigh）、`provider`（原样塞进请求体的 `provider` 字段，OpenRouter 的路由偏好，如 `{preferred_min_throughput: 30}`＝默认负载均衡不变、只把低于 30 tok/s 的上游降到末尾；`sort` 与两个 `preferred_*` 阈值在启动时校验，其余键透传）、`session_id`（true 时把本会话的 `chat_id` 当**请求体** `session_id` 发出去——OpenRouter 靠它做粘性路由与上游缓存亲和，正文与选项请求才更容易落到同一个上游、命中同一份前缀缓存）。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
+- `endpoints`：模型端点列表，前端按会话切换；启动时校验，为空直接报错退出。每项必填 `api_base` / `model` / `api_key`，可选 `display_name`（缺省用 model）、`api_type`（`"chat_completions"` 默认 / `"responses"`）、`x_opencode_session`、`reasoning_effort_map`（发给该端点前给思考强度改名，如 OpenRouter 写 `{max: xhigh}`，它的枚举只到 xhigh）、`provider`（原样塞进请求体的 `provider` 字段，OpenRouter 的路由偏好，如 `{preferred_min_throughput: 30}`＝默认负载均衡不变、只把低于 30 tok/s 的上游降到末尾；`sort` 与两个 `preferred_*` 阈值在启动时校验，其余键透传）、`session_id`（true 时把本会话的 `chat_id` 当**请求体** `session_id` 发出去——OpenRouter 靠它做粘性路由与上游缓存亲和，正文与选项请求才更容易落到同一个上游、命中同一份前缀缓存）。**端点身份 = 列表下标**，重排列表会改变旧会话的指向。
 - 全局键：`temperature` / `max_tokens` / `reasoning_effort` / `options_enabled` / `user_agent`（覆盖 SDK 默认 UA）。
-- `web_tools`：联网工具（`web_search` / `web_fetch`）的**独立**配置，与模型端点无关——打的是 DeepSeek 的 `/v1/tools/search` 与 `/v1/tools/fetch`。`api_base`（缺省 `https://api.deepseek.com`）/ `api_key`（就是 DeepSeek API Key，从端点复制即可，**必填**，否则调用时以错误文本返回）/ `timeout`（秒，缺省 60）/ `count`（`web_search` 缺省条数，1~50，缺省 10）。写了这一段启动时校验，没写不报错（不启用这两个工具的预设用不上它，见 `core.web_tool_config`）。
-- `server.max_concurrent_generations`（缺省 4）：全服务器同时在跑的生成上限，多出来的排队等槽位（`server._generation_sem`，`_run` / `_run_options` 各占一个）。第一次用到时建成，改了要重启才生效。
+- **配置默认值只在一处定义，下游不做 fallback**：默认值全在 `app/config.py`（如 `DEFAULT_API_TYPE`、`API_TYPES`、`EFFORT_LEVELS`、`WEB_TOOL_*`、`DEFAULT_MAX_CONCURRENT_GENERATIONS`）。`Settings` 构造时补全 + 校验（`api_type` 拼错直接报错，不静默换请求形状），`TurnConfig` 由 `core.build_turn()` 一次构造，`llm` / `build_input` 只做属性访问。加新键时照这个来：缺省值归 `app/config.py`，别在 `llm` 里写 `config.get(key, 默认值)`。
+- `web_tools`：联网工具（`web_search` / `web_fetch`）的**独立**配置，与模型端点无关——打的是 DeepSeek 的 `/v1/tools/search` 与 `/v1/tools/fetch`。`api_base`（缺省 `https://api.deepseek.com`）/ `api_key`（就是 DeepSeek API Key，从端点复制即可，**必填**，否则调用时以错误文本返回）/ `timeout`（秒，缺省 60）/ `count`（`web_search` 缺省条数，1~50，缺省 10）。写了这一段启动时校验，没写不报错（不启用这两个工具的预设用不上它）——这是唯一**延迟校验**的一段，见 `Settings.web_tools()`。
+- `server.max_concurrent_generations`（缺省 4，必须是 ≥1 的整数，写错启动即报错）：全服务器同时在跑的生成上限，多出来的排队等槽位（`server._generation_sem`，`_run` / `_run_options` 各占一个）。第一次用到时建成，改了要重启才生效。
 - `auth.*`：见「多用户与鉴权」。
 - 可按会话覆盖（存 state.json）：`temperature` / `max_tokens` / `reasoning_effort` / `endpoint` / `options_enabled`，前端可改（`POST /api/sessions/{name}/params`、`/endpoint`、`/reasoning_effort`、`/options`）。新会话继承 created_at 最大的那个会话的这几项（**同一用户内**），无会话时用端点 0 + config 默认；会话值非法/缺失回退 config 默认，config 值非法直接报错；fork 自动继承。
 - `reasoning_effort` 五档 `none`/`low`/`medium`/`high`/`max`，不设置按 `low`；`none` = 禁用思考（请求带 `"thinking": {"type": "disabled"}`，这个参数名 OpenAI SDK 不认，只能经 `extra_body` 透传：直接当 kwarg 传会 TypeError，一行都发不出去）。
 - `options_enabled`（缺省 true）：正文之后要不要再发一次选项请求，见「选项生成」。
 - `x_opencode_session`：`true` 时每个会话的请求都带固定的 `X-Opencode-Session: <UUID v4>` 头（opencode-go 风控 / GPU KV 缓存亲和）。UUID 存在 state.json 的 `chat_id`，创建时生成，fork 换新值。
 
-生成/预览前 server 用 `core.effective_config(state, config)` 合并出扁平 config 交给 llm（llm 不感知多端点）。`api_type` 只影响上下文拼装、工具 schema 与流式实现，落盘的 `history.jsonl` 格式不变。
+### 配置模型（app/config.py）
+
+两层 frozen dataclass，把三种生命周期分开，不再用一个可变 dict 串到底：
+
+| 对象 | 是什么 | 何时构造 |
+|---|---|---|
+| `Settings` | config.yaml 的完整快照（endpoints / temperature / max_tokens / reasoning_effort / options_enabled / user_agent / auth / server / web_tools_raw） | `Settings.load()`，按文件 mtime 缓存，全进程共用 |
+| `TurnConfig` | 一次请求实际生效的值：选中端点 + 会话覆盖 + 预设派生的 `ptc/tools/bindings` + `chat_id` | `core.build_turn(state)`，每次请求一次 |
+
+- **唯一的构造点**：`server` 的三个入口（预览 / 正文 `_prepare` / 只重掷选项 `_prepare_options`）都调 `core.build_turn(state)`，把同一个 `TurnConfig` 同时交给 `core.build_input()` 与 `llm.stream_body()` / `generate_options()`——上下文形状与请求形状不可能各说各话。
+- **字段天然存在**：默认值只在 `app/config.py` 定义一次，`TurnConfig` 的属性直接读（`turn.endpoint.api_type`、`turn.temperature`）；`None` 有明确语义（温度/输出上限 None = 请求不带该字段），不是「没配置兜一下」。
+- **配置改错会立刻报错**：`Settings.load()` 每次按 mtime 重解析，写错端点/auth/server 时请求返回 400/500 并带具体键名；改回正确值自动恢复（不缓存失败结果）。`web_tools` 例外——没写不算错，缺 `api_key` 只在真调联网工具时以文本返回给模型。
+- `api_type` 只影响上下文拼装、工具 schema 与流式实现，落盘的 `history.jsonl` 格式不变。
 
 ## 预设与角色卡
 
@@ -77,7 +90,7 @@ auth:
 </preset_options>
 ```
 
-选项请求必须与正文请求共用同一份 config（同 model / tools / thinking，且不加 `response_format`）；指令在请求末尾，替换它不影响前缀缓存。
+选项请求必须与正文请求共用同一份 `TurnConfig`（同 model / tools / thinking，且不加 `response_format`）；指令在请求末尾，替换它不影响前缀缓存。
 
 预设 frontmatter 的 `tools` 是工具白名单：列什么就只有什么（顺序即 schema 顺序），未定义时用 `world_run` + `read_file`。可选 `world_run` / `read_file` / `write_file` / `edit_file` / `bash` / `web_search` / `web_fetch`；未知名字（含历史上的 `respond`）在生成/预览时抛 ValueError。`core.respond_tool_text` 渲染的任务提示词按白名单裁剪：没启用的工具不出现，启用 write_file/edit_file/bash/web_search/web_fetch 会附上用法段。PTC 模式下 schema 只有 world_run，这个列表决定它程序内的绑定函数。
 
@@ -95,7 +108,7 @@ schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正�
 - **web_search**：联网搜索（DeepSeek Search 接口，`POST <api_base>/v1/tools/search`）。参数 `query`（1~128 字符，透传 `site:` / `-site:` / `-关键词` / `"精确短语"` / `lang:zh,en` / `after:` / `before:` 语法）、`count`（1~50，缺省取 config 的 `web_tools.count`）、`need_content`（是否附正文）、`ori_question`。结果按条格式化：标题 / 链接 / 站点·日期·权威性 / 摘要（`summary`，缺失时用 `snippet`）/ 正文（`need_content` 时，每条截到 1500 字符）；整段返回文本上限 16000 字符，无结果时返回「没有匹配的结果」（不算错误）。
 - **web_fetch**：抓单个网页（`POST <api_base>/v1/tools/fetch`），返回 `<url>/<title>/<content>`，正文是 Markdown、上限 24000 字符。url 必须是含主机名的 http/https，不能带用户名密码（本地先校验，无效 URL 不发请求）。
 
-两个联网工具的配置在 `config.yaml` 的 `web_tools` 段（与端点独立，key 就是 DeepSeek 的 key）：`core.web_tool_config` 负责解析与校验，缺 key 时**以错误文本返回**给模型（不抛异常、不中断本轮），并记一条 WARNING。HTTP 非 200 时把状态码、含义（401/402/403/404/429/5xx）与接口的 `error.message` 拼成一句话返回。同步 httpx 客户端 → `execute_tool` 用 `asyncio.to_thread` 调用（world 内的绑定是同步调用）。它们不依赖角色卡目录，所以在 `_session_card_dir` 之前分发。
+两个联网工具的配置在 `config.yaml` 的 `web_tools` 段（与端点独立，key 就是 DeepSeek 的 key）：`Settings.web_tools()` 负责解析与校验，缺 key 时**以错误文本返回**给模型（不抛异常、不中断本轮），并记一条 WARNING。HTTP 非 200 时把状态码、含义（401/402/403/404/429/5xx）与接口的 `error.message` 拼成一句话返回。同步 httpx 客户端 → `execute_tool` 用 `asyncio.to_thread` 调用（world 内的绑定是同步调用）。它们不依赖角色卡目录，所以在 `_session_card_dir` 之前分发。
 
 文件类工具的相对路径基准与 bash 的工作目录都是**当前会话角色卡所在目录**（`games/<世界包>/`），也接受绝对路径；取不到卡目录时报错。`tools.execute_tool` 先按会话预设解析白名单，未启用的工具名返回带「本会话启用的直接工具」清单的错误文本。直接调 bash 走 `asyncio.to_thread`（不卡事件循环），world_run 内的 bash 绑定是同步执行（长命令卡住服务端）。工具的文件/shell 副作用不参与 world_run 的出错回滚（回滚只覆盖 state 与函数/常量）。
 
@@ -108,7 +121,7 @@ schema 在 `app/core.py`，启用与否由预设 `tools` 白名单决定。正�
 分两段，都是普通请求（`app/llm.py`）：
 
 1. **正文**（`stream_body`）：工具循环。模型可多次调用白名单内的工具（PTC 下是 world_run 内的绑定），结果追加进输入继续请求；**某一轮不再调用任何工具即视为说完**，回合结束（yield `done`，只含 content 与 reasoning）。全程没有内容、或超过 `MAX_ROUNDS`(25) 轮，都报错。
-2. **选项**（`generate_options`）：正文完成后，若 `options_enabled` 为真，再用同一份 config 发一次非流式请求，只要选项列表。
+2. **选项**（`generate_options`）：正文完成后，若 `options_enabled` 为真，再用同一份 `TurnConfig` 发一次非流式请求，只要选项列表。
 
 history 条目：`{role, content, options, reasoning, tool_calls?}`，另有 `error` / `options_error` / `options_raw` 三个失败标记（回放时都不进模型上下文）。
 
@@ -129,7 +142,7 @@ deepseek-flash 的 `/responses` 要求**每个 `function_call` 前都有各自�
 
 - **输入**：`core.build_options_input(state, history, content, tool_calls, reasoning)` = 正文请求的输入 + 本轮助手回复 + 预设 `<preset_options>` 渲染出的 user 指令（未定义时用 `core.OPTIONS_INSTRUCTION`；块内容/格式规范见「预设与角色卡」）。
 - **输出格式**：一行一条、每行以「- 」开头（模型因此不必转义选项里的引号；此前用 JSON 时「引号未转义」和「括号配错」两类语法错都实际发生过）。没有合适选项时输出单独一行「无」。
-- **缓存约束（实测 deepseek 官方端点）**：必须与正文请求共用同一份 config——同 model、同 tools、同 thinking / reasoning_effort，且**不加 `response_format`**。任一项不一致，前缀缓存命中率从 98% 掉到 6%；作为「正文请求的严格续写」它自身只在末尾多几十个 token（命中约 96%）。所以别给选项请求单独压低思考，也别用 `response_format`（该端点不支持 json_schema，`json_object` 同样往 prompt 头部插说明、打断前缀）。
+- **缓存约束（实测 deepseek 官方端点）**：必须与正文请求共用同一份 `TurnConfig`——同 model、同 tools、同 thinking / reasoning_effort，且**不加 `response_format`**。任一项不一致，前缀缓存命中率从 98% 掉到 6%；作为「正文请求的严格续写」它自身只在末尾多几十个 token（命中约 96%）。所以别给选项请求单独压低思考，也别用 `response_format`（该端点不支持 json_schema，`json_object` 同样往 prompt 头部插说明、打断前缀）。
 - **解析与兜底**（`core.parse_options`）：按行扫，只认 `_OPTION_LINE_RE` 匹配的选项行（行首 `-` / `*` / `•` / `·`，或 `1.` `2、` `3)` 这类编号）——前言、后记、代码围栏、空行一律丢弃，**不做宽松兜底**（把杂行当选项会在页面上多出假按钮）；一行都没有时抛 ValueError；单独一行「无」表示这轮没有合适选项、返回空列表。失败追加一条提醒重发一次（`_OPTIONS_RETRY_HINT`，追加在末尾不影响前缀），仍失败则选项为空、错误写进 entry 的 `options_error`（前端给提示 +「重新生成选项」；与表示整轮失败的 `error` 区分）。正文不受影响。
 - **失败现场**：两次都失败时，模型每次输出的原文（第 1/2 次分别标注，空输出记成「（空输出）」）经 `generate_options` 的第三个返回值落盘为 entry 的 `options_raw`，前端在错误行下折叠显示；整段原文同时进 WARNING 日志。模型调工具或被输出上限压空时 `_request_options_once` 不返回文本而直接给出说明（含 `finish_reason` / `status`+`reason`、工具调用的名字与参数），这条说明就是错误文本本身。
 - 选项请求的 usage 以 INFO 一行打进日志（含缓存命中数与其中的思考 token 数，`llm._usage_note`）。
