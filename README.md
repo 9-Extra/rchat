@@ -10,6 +10,8 @@
 
 # 用法
 
+运行环境要求 **Python 3.14+**（`uv` 会按 `pyproject.toml` 自动准备解释器，不用手动装）。
+
 1. 配置 API key：复制 `config.yaml.example` 为 `config.yaml`，将 `api_key` 替换为你的真实 key。
 2. 启动服务器：
    ```bash

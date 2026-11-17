@@ -52,8 +52,10 @@ auth:
 sudo useradd -r -s /usr/sbin/nologin -d /srv/rchat rchat
 sudo mkdir -p /srv/rchat && sudo chown rchat:rchat /srv/rchat
 # 把项目放进去，然后装依赖（两种都行，见第 5 节）
-cd /srv/rchat && sudo -u rchat uv sync                       # 有 uv，以 uv.lock 为准
-# 或： python3 -m venv .venv && .venv/bin/pip install -i <国内镜像> -r deploy/requirements.txt
+cd /srv/rchat && sudo -u rchat uv sync                       # 有 uv，以 uv.lock 为准（uv 会自己下 3.14）
+# 或： python3.14 -m venv .venv && .venv/bin/pip install -i <国内镜像> -r deploy/requirements.txt
+#     （项目要求 Python 3.14+，系统自带的 python3 一般太旧：Ubuntu 24.04 是 3.12、Debian 12 是 3.11）
+#     从旧版本升上来的机器：pip 建的 .venv 必须删掉重建；`uv sync` 会按 requires-python 自己换解释器
 sudo chmod 600 /srv/rchat/config.yaml
 
 sudo cp deploy/rchat.service /etc/systemd/system/rchat.service
@@ -123,8 +125,12 @@ uvicorn 侧已经开了 `proxy_headers`，日志与登录限速用的是真实�
 
 - **pypi.org 连不上**（IPv4/IPv6 都超时），`pip` 必须走国内镜像：
   `-i https://pypi.tuna.tsinghua.edu.cn/simple`（阿里/腾讯镜像也通）。apt 源同理。
-- **uv 的安装脚本（astral.sh）连不上** → 用 `python3 -m venv` + `pip -r deploy/requirements.txt`
-  这条路，版本与本地一致，systemd 照样能跑。apt 里 `python3-venv`/`python3-pip` 要先装。
+- **uv 的安装脚本（astral.sh）连不上** → 先从 GitHub release 手动下 `uv` 二进制（或用
+  `pip install uv`），`uv python install 3.14` 由它拉解释器，仍然最省事。完全不能用 uv 时，
+  得先自己弄到一个 **3.14** 解释器（官方预编译包 / deadsnakes / 源码编译），再
+  `python3.14 -m venv .venv` + `pip -r deploy/requirements.txt`；系统自带的 python3
+  （Ubuntu 24.04 是 3.12、Debian 12 是 3.11）**不够**，装上了也跑不起来。
+  apt 里 `python3-venv`/`python3-pip` 要对应那个 3.14 解释器。
 - **模型端点出网要单独确认**：实测同一台机器上 `api.deepseek.com`、`api.kimi.com` 通，
   `openrouter.ai`、`opencode.ai` 不通。装完先 `curl -s -o /dev/null -w '%{http_code}'`
   试一遍你要用的 `api_base`；不通的端点直接从 `config.yaml` 里去掉，否则用户选中它

@@ -29,6 +29,13 @@ def keep_awake(enabled: bool) -> bool:
 
 
 def main() -> None:
+    # pyproject 已声明 requires-python，这里只是给「直接 python -m main」一句人话，
+    # 免得到运行时才撞上 3.14 才有的 API（如 Path.read_text(newline=)）。
+    if sys.version_info < (3, 14):
+        raise SystemExit(
+            f"本项目要求 Python 3.14+，当前是 {sys.version_info.major}.{sys.version_info.minor}；"
+            "请用 `uv run -m main` 启动（会按 pyproject.toml 自动选解释器）。"
+        )
     parser = argparse.ArgumentParser(description="AIRP 后端")
     parser.add_argument(
         "--host",

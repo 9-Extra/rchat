@@ -1,10 +1,8 @@
 """文件工具（read_file / write_file / edit_file）的逐字匹配与换行处理。
 
-守住的坑：`Path.read_text` 的 `newline` 参数是 **Python 3.13** 才加的，而 pyproject
-声明 `requires-python = ">=3.10"`。旧实现 `read_text(encoding="utf-8", newline="")`
-在 3.10~3.12（Debian 12 的系统 python3 就是 3.11）上直接 TypeError，edit_file
-一调就废——read_file/write_file 没事，所以只在稍微旧一点的环境里暴露。
-下面处理 CRLF 的用例在那些版本上一律拿到 `错误：TypeError...`，会红。
+守住的行为：模型看到的是归一化后的 LF，磁盘上可能是 CRLF，两边都要能对上；
+替换完成后原文件的换行风格不变。项目要求 Python ≥3.14，`Path.read_text/write_text`
+的 `newline=` 可以直接用，不需要退回 `open`。
 """
 import pathlib
 import tempfile
@@ -53,20 +51,11 @@ class EditFileTest(unittest.TestCase):
         self.assert_ok(tools.edit_file(str(self.path), "x", "y", True))
         self.assertEqual(self.path.read_bytes(), b"y\ny\ny\n")
 
-    def test_edit_does_not_need_read_text_newline(self):
-        """模拟 3.10~3.12：`Path.read_text` 不认 newline 关键字也能改文件。"""
-        self.path.write_bytes("a\r\nb\r\n".encode("utf-8"))
-        real = pathlib.Path.read_text
-
-        def old_signature(self, encoding=None, errors=None):
-            return real(self, encoding, errors)
-
-        pathlib.Path.read_text = old_signature
-        try:
-            self.assert_ok(tools.edit_file(str(self.path), "a\nb\n", "A\nB\n"))
-        finally:
-            pathlib.Path.read_text = real
-        self.assertEqual(self.path.read_bytes(), b"A\r\nB\r\n")
+    def test_edit_mixed_line_endings(self):
+        """文件里混用 LF / CRLF 时，统一按 LF 匹配，写回时仍用原文件的主风格。"""
+        self.path.write_bytes(b"a\r\nb\nc\r\n")
+        self.assert_ok(tools.edit_file(str(self.path), "b\nc\n", "B\nC\n"))
+        self.assertEqual(self.path.read_bytes(), b"a\r\nB\r\nC\r\n")
 
     def test_relative_path_uses_base_dir(self):
         (self.dir / "sub").mkdir()
