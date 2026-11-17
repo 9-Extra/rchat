@@ -25,11 +25,11 @@
 |---|---|
 | `main.py` | 参数、启动期 config 校验、uvicorn、keep-awake |
 | `app/config.py` | `Settings`（config.yaml 快照，按 mtime 缓存）与 `TurnConfig`（一次请求实际生效的值）；**默认值只在这里定义** |
-| `app/core.py` | 预设解析与宏渲染、工具 schema 与白名单、`build_input` 上下文拼装、会话与落盘（`create_session` / `session_key` / `_atomic_write_text`） |
+| `app/core.py` | 预设解析与宏渲染、工具 schema 与白名单、`build_input` 上下文拼装、会话与落盘（`create_session` / `session_key` / `_atomic_write_text`）、压缩切点 `compact_cut` |
 | `app/llm.py` | 正文工具循环与选项请求，两种 `api_type` 的实现 |
 | `app/server.py` | 端点、SSE 转发、会话锁与并发槽位、鉴权中间件 |
 | `app/tools.py` | 工具分发；文件工具、bash、联网工具 |
-| `app/world.py` | world_run 的持久 exec 命名空间、快照、PTC 绑定 |
+| `app/world.py` | world_run 的持久 exec 命名空间、快照（含压缩后的平移）、PTC 绑定 |
 | `app/auth.py` | 账号校验、登录态、登录限速 |
 | `app/static/index.html` | 全部前端 |
 | `preset/` `games/` | 预设与角色卡；`GM-safe.md` / `GM-ptc.md` 是可提交示例 |
@@ -59,11 +59,22 @@
 - `world_run` 无超时保护：必须经 `asyncio.to_thread` 执行；取消时用 `asyncio.shield` + `wait_for(WORLD_RUN_CANCEL_GRACE)` 等它跑完再抛。线程杀不掉，抢先取消会让 `abort_turn` / `commit_turn` 和还在改 `state` 的线程撞车。
 - PTC 绑定函数是**同步**的（在模型代码里直接调用）。绑定名是保留名，模型的顶层 def / 全大写常量不能覆盖；切预设时由 `_reconcile_bindings` 原地替换并保留 state 与函数定义。
 - 取某长度的世界快照必须用 `world._snapshot_at` 回退到「不晚于它的最近一条」。直接 `snapshots.get(str(n))` 会让开局前 / 未碰过 world 的轮次静默拿到最新状态，回滚失效。
-- 新增一个工具要同步改五处：`core` 的 schema 与 `TOOL_NAMES` 白名单、`core.respond_tool_text` 的说明文字、`tools.execute_tool` 分发、`world._bindings_for`（PTC）、前端的工具块展示。
+- 新增一个工具要同步改四处：`core` 的 schema 与 `TOOL_NAMES` 白名单、`tools.execute_tool` 分发、`world._bindings_for`（PTC）、前端的工具块展示。工具的用法说明写在 schema 的 `description` 里（预设不再有 `{{respond_tool}}` 这种渲染入口）。
+
+### 上下文压缩（/compact）
+- **压缩后 history 就是上下文**，不是「history 原样留着 + 另存一份 summary」。摘要块是一条普通的 `{role: "assistant", content, compacted: true}`：`build_input` / 预览页 / 回滚 / 分支全都不需要知道压缩的存在。想加新状态前先问「能不能只靠 history 表达」。
+- **切点必须落在 user 块上**（`core.compact_cut`），且只在 `history[-1]` 是 assistant 时才允许压缩。末尾是 user 块 = 上一轮还没写出来，压下去会把玩家刚打的字一起吞掉。
+- **`world` 快照的 key 是历史长度，压缩后必须平移**（`world.remap_after_compact`，`new = old - cut + 1`，并补一条 key=1 的边界快照）。不做的后果不是「回滚不准」而是「下一轮 `_prepare` 的 `world.sync(name, len(history))` 把世界状态静默回滚到开局，再下一轮 `commit_turn` 的 prune 把之后的快照全删掉」。
+- 摘要请求与选项请求同构：同一份 `TurnConfig`、同一个输入前缀的严格续写、非流式、只单独改输出上限。压缩期间用 `_active[mode="compact"]` 占位，锁内只做「查 + 注册」，LLM 调用在锁外，写盘前重新取锁并校验长度。
+- 落盘顺序是「先摘要、再 fork、后改写」：摘要失败什么都不留；fork 在改写前，所以改写途中崩了还有完整副本。`core.fork_session` 支持任意 index，但 `/fork` 端点只放行用户块——位置约束属于面向用户的入口。
+- 摘要块不能重掷：`_prepare` 的 regenerate 分支看到 `compacted` 就报错。`keep_turns=0` 时历史只剩摘要块，pop 掉它会 `world.sync(name, 0)` 清空世界状态。
+- **摘要块成为最后一轮时（`keep_turns=0`，即 `cut == len(history)`），选项跟着搬到摘要块上**：压缩前末块已有 `options` 就直接沿用（同一段剧情的延续，重问一遍只换个措辞、白花一次请求），没有且开关打开才补问一次。补问失败记进 `options_error`，压缩本身照常完成。保留原文时末块还是原来那一轮，它的 `options` 原样留着，别拿摘要块去覆盖。`_prepare_options` 不认 `compacted`，所以摘要块天然支持「重新生成选项」，但前端只在它是末块时才给按钮。
 
 ### 前端
 - 同会话刷新只走 `reconcileSession()` 按块 key 增量对账；整页 `renderAll()` 只在**切换会话**时用（且显式滚到底）。一轮结束优先用 `saved` 事件就地定稿，别重建 DOM——否则滚动位置、展开的 details、选区、编辑中的 textarea 都会丢。
+- **唯一的例外是压缩**：摘要块替换整段历史，所有块的 key 都变了，`reconcileSession` 会把整棵树对错位，必须走 `selectSession` 整页重建。
 - 每条流有 `sid` / `seq`，重连、对账、滚动前先校验，旧流不许写进新会话。
+- 斜杠指令（`/compact`）在前端解析，不进 `/chat`——后端不该在正文路径里认命令。以后加「压缩」按钮复用同一个 `runCompact`。
 
 ## 踩过的坑（改到相关代码前先看）
 
@@ -79,11 +90,15 @@
 | 新建会话后前端找不到它 | 裸会话名里带 `/` 会被当成作用域前缀，会话落进 `sessions/<前半截>/`。归一化只在 `create_session`。 |
 | 旧会话指向了另一个模型 | 端点身份 = `endpoints` **列表下标**，重排列表就会改掉所有旧会话的指向。 |
 | `_runtimes` / `_locks` 只增不减 | 已知边界（删会话才释放），靠 systemd `MemoryMax` 兜底。别当 bug 反复「修」；真要淘汰只能在轮次边界做。 |
+| 压缩后世界状态跳回开局 | 快照 key 是历史长度，压缩把长度改短却没平移。`world.remap_after_compact` 是唯一入口，别手写 `snapshots.json`。 |
+| 压缩后前端整片块错位 | 索引全变了还走 `reconcileSession`。压缩完成必须 `selectSession` 整页重建。 |
+| 点「重新输出」把前情删光了 | `keep_turns=0` 时历史只剩摘要块，regenerate 会 pop 掉它并从空历史重开（还会 `sync(0)` 清空世界状态）。已由 `_prepare` 的 `compacted` 检查挡住，前端也不给按钮。 |
+| 压缩时模型把世界状态复述进摘要 | 摘要块里自动附加的 `【本轮state快照】` / `【world_run 内已定义的函数与常量】` 段落会被下一次压缩当成输入再摘一遍（不能从输入里剔除——那会破坏前缀缓存）。靠 `COMPACT_INSTRUCTION` 里那条「state 与函数由系统自动附上、不用写进摘要」约束，新自动段落要同步加进去。 |
 
 ## 预设 / 角色卡 / 选项（作者契约）
 
 - 代码只处理三类标记：`<preset_section role="system|user|assistant">`、`<preset_user_input>`、`<preset_options>`。其它 XML 标签都是预设的**内部文本**，原样发给模型。不要给新标记加语义，除非确实要改协议。
-- `{{...}}` 按 Python 表达式 eval（`core.render_template`）。固定宏 `game_setting` / `game_beginning` / `user_setting` / `respond_tool`，环境里另有 `random` / `time` / `math` / `datetime`（`preset_user_input` 块额外有 `user_input`）。严格模式：未知变量或求值出错直接 ValueError，不静默兜底。预设是本机可信文件，不是安全边界。
+- `{{...}}` 按 Python 表达式 eval（`core.render_template`）。固定宏 `game_setting` / `game_beginning` / `user_setting`，环境里另有 `random` / `time` / `math` / `datetime`（`preset_user_input` 块额外有 `user_input`）。严格模式：未知变量或求值出错直接 ValueError，不静默兜底。预设是本机可信文件，不是安全边界。
 - `<preset_options>` 是选项请求的**完整指令**，格式要求必须由预设作者自己写清：一行一条、行首 `- `（半角短横线）、无合适选项只输出单独一行「无」、不要前言 / 后记 / 代码围栏 / JSON。代码不会在块外再补任何格式要求。块要放在 `preset_section` 外，多个块取第一个；未定义时回退 `core.OPTIONS_INSTRUCTION`。
 - 预设 frontmatter 的 `tools` 是白名单：顺序即 schema 顺序，未写默认 `world_run` + `read_file`，未知名字（含历史的 `respond`）直接 ValueError。`ptc: true` 时 schema 只剩 `world_run`，其余工具降级为程序内同步绑定。
 

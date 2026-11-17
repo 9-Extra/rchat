@@ -26,11 +26,16 @@ endpoints:
   #   model: "..."
   #   api_key: "..."
 
-# 以下为全局配置；temperature / max_tokens / reasoning_effort 前端可按会话覆盖
+# 以下为全局配置；temperature / max_tokens / reasoning_effort / compact_keep_turns 前端可按会话覆盖
 temperature: 0.7         # 默认不设置时请求不带该参数
 max_tokens: 100000       # 默认不设置时请求不带该参数
 reasoning_effort: "medium"  # 思考强度默认值：none/low/medium/high/max（none=禁用思考）；不设置时按 low 处理
 # user_agent: "rchat/0.1"  # 覆盖 SDK 默认 UA（opencode-go 等端点风控拒绝语言默认 UA）
+
+# 上下文压缩（在输入框敲 /compact，可带补充要求）：把历史压成一条摘要块，只动 history，
+# 不动预设/角色卡，也不动 world state（快照下标会跟着平移）。压缩前会 fork 一份完整旧历史
+# 到侧栏。compact_keep_turns 是压缩时保留最近几轮原文不压，0 = 全部压成摘要（实验用）。
+compact_keep_turns: 3
 
 # 联网工具（web_search / web_fetch）：打的是 DeepSeek 的 Search / Fetch 接口，与模型端点
 # 各自独立配置。api_key 就是 DeepSeek API Key，直接把端点上那个 key 复制过来即可。

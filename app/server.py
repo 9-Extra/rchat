@@ -10,7 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from pydantic import BaseModel
 
 from app import auth, core, tools, world
-from app.llm import build_request, generate_options, stream_body
+from app.config import COMPACT_KEEP_TURNS_MAX
+from app.llm import build_request, generate_options, generate_summary, stream_body
 
 logger = logging.getLogger("airp")
 
@@ -233,6 +234,9 @@ def get_session(name: str, user: str | None = Depends(current_user)):
         state["options_enabled"] = core.resolve_options_enabled(
             state.get("options_enabled"), settings
         )
+        state["compact_keep_turns"] = core.resolve_compact_keep_turns(
+            state.get("compact_keep_turns"), settings
+        )
         # 正在进行的一轮生成：用户输入已在开局时落盘，前端靠 mode/user_input 还原界面
         # （regenerate 时被替换掉的旧 AI 块已从磁盘删掉），再接 /stream 续看
         gen = _gen_of(key)
@@ -339,6 +343,8 @@ class SetParams(BaseModel):
     # 传 null 清除覆盖（回退全局默认）；未传的键不动
     temperature: float | None = None
     max_tokens: int | None = None
+    # 压缩时保留最近几轮原文；0 合法（全部压成摘要）
+    compact_keep_turns: int | None = None
 
 
 @app.post("/api/sessions/{name}/params")
@@ -361,6 +367,17 @@ async def set_params(name: str, req: SetParams, user: str | None = Depends(curre
                 state["max_tokens"] = req.max_tokens
             else:
                 raise HTTPException(400, f"max_tokens 必须是正整数: {req.max_tokens}")
+        if "compact_keep_turns" in req.model_fields_set:
+            if req.compact_keep_turns is None:
+                state.pop("compact_keep_turns", None)
+            elif 0 <= req.compact_keep_turns <= COMPACT_KEEP_TURNS_MAX:
+                state["compact_keep_turns"] = req.compact_keep_turns
+            else:
+                raise HTTPException(
+                    400,
+                    f"compact_keep_turns 必须在 0-{COMPACT_KEEP_TURNS_MAX} 之间: "
+                    f"{req.compact_keep_turns}",
+                )
         core.save_state(state)
     return state
 
@@ -444,6 +461,11 @@ async def fork(name: str, req: Fork, user: str | None = Depends(current_user)):
     key = _key(user, name)
     async with _lock_for(key):
         _busy(key)
+        # 「只能从用户块分支」是面向用户的约束，放在这里：core.fork_session 本身支持任意
+        # 位置（压缩前留完整副本要 fork 到历史末尾）
+        history = core.load_history(key)
+        if not (0 <= req.index < len(history)) or history[req.index].get("role") != "user":
+            raise HTTPException(400, "fork 目标不是用户块")
         try:
             state = core.fork_session(key, req.index)
         except ValueError as e:
@@ -593,6 +615,9 @@ def _prepare(name: str, mode: str, user_input: str | None) -> dict:
         draft = user_input
     else:  # regenerate：丢弃最后一个 AI 块，用它回复的用户输入重新生成
         if history and history[-1]["role"] == "assistant":
+            # 压缩后的摘要块不能重掷：把它 pop 掉再重发，等于删掉整个前情、从空历史重开
+            if history[-1].get("compacted"):
+                raise ValueError("摘要块是压缩后的前情起点，不能重新生成")
             history.pop()
         if history and history[-1]["role"] == "user":
             draft = history.pop()["content"]
@@ -936,4 +961,213 @@ def regenerate_options(name: str, user: str | None = Depends(current_user)):
     """只重新生成最后一轮的选项：正文不动，也不重新跑正文请求。"""
     return StreamingResponse(
         _generate(_key(user, name), "options", None), media_type="text/event-stream"
+    )
+
+
+# ---------- 上下文压缩 ----------
+# 全手动（前端解析 /compact 后调这里）。它只重写 history：预设段落与角色卡是每次
+# build_input 现拼的，缩不到；world 的 state 与函数也一样不改，只是快照下标要跟着
+# 平移（见 world.remap_after_compact）。
+#
+# 压缩后的 history = [摘要块] + 保留的最近若干轮，摘要块是一条**普通的 assistant 块**：
+# 前端按普通块渲染，玩家看到的就是模型真实拿到的上下文。compacted 标记只用来做三件事：
+# 不算进轮数、不许重掷、隐藏「重新输出」。
+
+
+class CompactReq(BaseModel):
+    # /compact 后面的补充要求（可空），作为压缩指令的前缀交给模型
+    instruction: str = ""
+
+
+def _prepare_compact(name: str, extra: str) -> dict:
+    """压缩前的全部准备与校验；用户侧错误以 ValueError 抛出，且不改任何东西。"""
+    state = core.load_state(name)
+    history = core.load_history(name)
+    if not history:
+        raise ValueError("会话还没有内容，没什么可压缩的")
+    if history[-1].get("role") != "assistant":
+        # 末尾是用户块 = 上一轮还没写出来（可恢复状态），这时压会把玩家刚打的字一起吞掉
+        raise ValueError("上一轮还没写完，等它结束再压缩")
+    turn = core.build_turn(state)
+    cut = core.compact_cut(history, turn.compact_keep_turns)
+    if cut <= 0:
+        raise ValueError(
+            f"没有可压缩的内容：保留最近 {turn.compact_keep_turns} 轮原文后，前面已经没有历史了"
+        )
+    return {
+        "name": name,
+        "state": state,
+        "turn": turn,
+        "history": history,
+        "cut": cut,
+        # 与正文请求共用同一份 turn、且是它的严格续写，前缀缓存能整段命中
+        "input_items": core.build_compact_input(state, history, turn, extra),
+    }
+
+
+def _summary_content(text: str, dump: str) -> str:
+    """摘要块的正文：模型写的摘要 + 由代码附加的 world 快照。
+
+    单独抽出来是因为「摘要块的正文」有两个消费者：写进 history 的那一份，和（keep_turns=0
+    时）紧接着为它请求选项的那一次请求。两处必须逐字一致，否则选项请求的前缀和下一轮正文
+    请求的前缀对不上，缓存白丢。
+    """
+    return f"【前情摘要】\n{text}\n\n{dump}"
+
+
+def _summary_entry(text: str, dump: str, archive: str, dropped: int,
+                   options: list, options_error: str, options_raw: str) -> dict:
+    """压缩后的摘要块。role=assistant + content，就是一条能直接进 build_input 的普通块。
+
+    world 状态与代码源码紧跟在摘要后面（dump 由代码生成，不花模型输出），这样模型压缩
+    后仍然知道自己 state 里有什么、有哪些函数可以调用——否则它会丢掉全部账本记忆。
+    """
+    return {
+        "role": "assistant",
+        "content": _summary_content(text, dump),
+        "options": options,
+        "compacted": True,
+        "compacted_at": time.time(),
+        # 被摘要替换掉的 history 条数，仅用于展示
+        "compacted_from": dropped,
+        # 压缩前完整历史的会话 id（普通会话，留在侧栏，可点开继续看）
+        "archive": archive,
+        **({"options_error": options_error, "options_raw": options_raw} if options_error else {}),
+    }
+
+
+async def _run_compact(gen: dict, prep: dict) -> None:
+    """压缩的生产者：先问摘要（长 await，不持锁），拿到之后才动磁盘。
+
+    落盘顺序：fork 完整旧历史 → 改写原会话 history → 平移 world 快照。fork 放在改写
+    之前，所以改写途中任何失败都还有一份完整副本可回到。摘要块独占新历史时，压缩前末块
+    的选项会搬到摘要块上；没有选项才补问一次（失败不影响压缩，只记在块上）。
+    """
+    name = prep["name"]
+    acquired = False
+    try:
+        sem = _generation_sem()
+        await sem.acquire()
+        acquired = True
+        _emit(
+            gen,
+            {"type": "compact_start", "entries": len(prep["history"]), "cut": prep["cut"]},
+        )
+        text, error = await generate_summary(prep["input_items"], prep["turn"])
+        if error:
+            raise ValueError(f"压缩失败：{error}")
+        dump = world.dump_text(name)
+        # keep_turns=0 时摘要块就是新历史的最后一轮，选项跟着它走：压缩前那一轮已经问出过
+        # 选项就直接沿用——那是同一段剧情的延续，重问一遍只会换个措辞、白花一次请求；没有
+        # 才补问一次（走正文结束后那同一个选项请求，同一份 turn，前缀正好是下一次正文请求
+        # 的前缀，缓存不浪费）。保留原文时不带选项：末块还是原来那一轮，它的 options 原样留着。
+        summary_is_last = prep["cut"] >= len(prep["history"])
+        carried = list(prep["history"][-1].get("options") or []) if summary_is_last else []
+        options, options_error, options_raw = carried, "", ""
+        if summary_is_last and not carried and prep["turn"].options_enabled:
+            try:
+                options, options_error, options_raw = await generate_options(
+                    core.build_options_input(
+                        prep["state"], [], _summary_content(text, dump), [], "", prep["turn"]
+                    ),
+                    prep["turn"],
+                )
+            except Exception as e:
+                # 选项只是附赠：失败就记在摘要块上，压缩本身照常完成
+                logger.exception("会话 %s 压缩后的选项阶段失败", name)
+                options, options_error, options_raw = [], (
+                    str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+                ), ""
+        async with _lock_for(name):
+            # 注册在 _active 里，改会话的端点都被 _busy 挡着，这里只是兜底
+            history = core.load_history(name)
+            if len(history) != len(prep["history"]):
+                raise RuntimeError("压缩期间会话历史被改动，已放弃本次压缩")
+            cut = prep["cut"]
+            archive_state = core.fork_session(name, len(history), suffix="precompact")
+            # 世界状态按末尾长度复制（_snapshot_at 会取到不晚于它的最近一条）
+            world.fork(name, core.session_key(archive_state.get("owner"), archive_state["id"]),
+                       len(history))
+            new_history = [
+                _summary_entry(
+                    text, dump, archive_state["id"], cut, options, options_error, options_raw
+                )
+            ] + history[cut:]
+            core.save_history(name, new_history)
+            # 历史长度变了：快照 key 必须平移到新坐标系，否则下一轮 _prepare 的
+            # world.sync(name, len(history)) 会把世界状态静默回滚到开局
+            world.remap_after_compact(name, cut, len(new_history))
+        _emit(
+            gen,
+            {
+                "type": "compacted",
+                "archive": archive_state["id"],
+                "before": len(history),
+                "after": len(new_history),
+                "dropped": cut,
+                "summary_chars": len(text),
+            },
+        )
+    except asyncio.CancelledError:
+        # 用户打断：还没写盘就是什么都不改，直接退出（写盘是同步的，取消只会在请求处生效）
+        raise
+    except ValueError as e:
+        _set_session_error(name, str(e))
+        logger.warning("会话 %s 压缩失败: %s", name, e)
+        _emit(gen, {"type": "error", "message": str(e), "popup": True})
+    except Exception as e:
+        logger.exception("会话 %s 压缩失败", name)
+        _set_session_error(name, str(e))
+        _emit(gen, {"type": "error", "message": f"压缩失败：{e}", "popup": True})
+    finally:
+        gen["finished"] = True
+        gen["wake"].set()
+        if _active.get(name) is gen:
+            _active.pop(name, None)
+        if acquired:
+            sem.release()
+
+
+async def _compact_stream(name: str, extra: str):
+    """压缩入口：与 _generate 同一套「锁内注册 → 后台任务 → 转发事件」。
+
+    锁内不做任何 await（摘要请求在后台任务里），所以压缩期间这个会话的其它改动会被
+    _busy 以 409 挡掉，而不是排队等到锁释放。
+    """
+    gen = None
+    error: str | None = None
+    async with _lock_for(name):
+        if _gen_of(name) is not None:
+            error = "该会话已有任务在进行中"
+        else:
+            _clear_session_error(name)
+            try:
+                prep = _prepare_compact(name, extra)
+            except ValueError as e:
+                _set_session_error(name, str(e))
+                logger.warning("会话 %s 压缩前置检查失败: %s", name, e)
+                error = str(e)
+            else:
+                gen = {
+                    "task": None,
+                    "events": [],
+                    "wake": asyncio.Event(),
+                    "finished": False,
+                    "mode": "compact",
+                    "user_input": None,
+                }
+                gen["task"] = asyncio.create_task(_run_compact(gen, prep))
+                _active[name] = gen
+    if gen is None:
+        yield _sse({"type": "error", "message": error, "popup": True})
+        return
+    async for chunk in _tail(gen):
+        yield chunk
+
+
+@app.post("/api/sessions/{name}/compact")
+def compact(name: str, req: CompactReq, user: str | None = Depends(current_user)):
+    """把会话历史压成一份摘要块（手动触发）。压缩前会 fork 一份完整旧历史到侧栏。"""
+    return StreamingResponse(
+        _compact_stream(_key(user, name), req.instruction), media_type="text/event-stream"
     )

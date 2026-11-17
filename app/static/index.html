@@ -251,6 +251,7 @@
         <label>选项 <input type="checkbox" id="optionsToggle"></label>
         <label>温度 <input type="number" id="tempInput" min="0" max="2" step="0.1"></label>
         <label>上限 <input type="number" id="maxTokensInput" min="1" step="1000"></label>
+        <label title="压缩时保留最近几轮原文不动；0 = 全部压成摘要">压缩保留 <input type="number" id="keepTurnsInput" min="0" step="1"></label>
         <button id="previewBtn">预览上下文</button>
       </div>
     </div>
@@ -293,6 +294,7 @@ let selectSeq = 0;       // 每次切会话 +1；旧会话的 GET 回来晚了�
 let selecting = false;   // 正在拉目标会话快照；期间禁用输入，避免往旧会话发下一轮
 let streaming = false;
 let finalizing = false;  // 流已结束、正在拉快照并就地定稿
+let compacting = false;  // 正在做上下文压缩（/compact），界面按「压缩中」处理
 let reconnecting = false; // 断线后正在退避重连（不能发新轮；切会话会 detach）
 let activeReader = null; // 进行中的流读取器，用于打断
 let stickBottom = true;  // 用户是否停留在聊天底部
@@ -428,6 +430,8 @@ function detachStream() {
   streaming = false;
   finalizing = false;
   reconnecting = false;
+  // 压缩的本地状态也得清：切走时服务端那份任务照跑，但按钮不能永远停在「压缩中…」
+  compacting = false;
   reconnectTries = 0;
   overlay = null;
   activeReader = null;
@@ -531,6 +535,7 @@ function renderAll(toBottom) {
   $('optionsToggle').checked = !!cur.options_enabled;
   $('tempInput').value = cur.temperature ?? '';
   $('maxTokensInput').value = cur.max_tokens ?? '';
+  $('keepTurnsInput').value = cur.compact_keep_turns ?? '';
   const chat = $('chat');
   chat.innerHTML = '';
   // 开局块：永远是对话界面第一个块
@@ -617,6 +622,13 @@ function updateComposer() {
   const btn = $('send');
   if (selecting) {
     btn.textContent = '切换中…';
+    btn.disabled = true;
+    btn.classList.remove('interrupting');
+    $('input').disabled = true;
+    return;
+  }
+  if (compacting) {
+    btn.textContent = '压缩中…';
     btn.disabled = true;
     btn.classList.remove('interrupting');
     $('input').disabled = true;
@@ -798,6 +810,18 @@ function fillAIOps(div, e, i) {
     await api(`/api/sessions/${enc()}/edit_ai`, post({ index: i, content: text, options: e.options || [] }));
     await refreshSession();
   })));
+  // 压缩生成的摘要块：不给「重新输出」（会把整段前情删掉从空历史重开）。它是 keep_turns=0
+  // 时的「最后一轮」，所以照样能只重掷选项；另给一个通往压缩前完整记录的入口。
+  if (e.compacted) {
+    if (i === cur.history.length - 1 && cur.options_enabled)
+      ops.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
+    if (e.archive) {
+      ops.appendChild(makeOpsBtn('压缩前记录', () => selectSession(e.archive)));
+    }
+    div.appendChild(ops);
+    div._opsSig = aiOpsSig(i);
+    return;
+  }
   // 只允许最后一个 AI 块重新输出
   if (i === cur.history.length - 1) {
     ops.appendChild(makeOpsBtn('重新输出', regenerate));
@@ -1241,6 +1265,11 @@ async function attachTurn(fresh, seq) {
   reconcileSession();
   const g = s.generating;
   if (!g) { updateComposer(); return; }
+  // 压缩不产生正文块：直接读它的流，等结束由 compactStream 整页重画
+  if (g.mode === 'compact') {
+    await compactStream(`/api/sessions/${encodeURIComponent(sid)}/stream`, {});
+    return;
+  }
   const last = s.history[s.history.length - 1];
   // options（只重掷选项）：正文已落盘，复用最后一个 AI 块接选项事件
   let reuseAI = null;
@@ -1266,11 +1295,75 @@ async function interrupt() {
   if (activeReader) { try { await activeReader.cancel(); } catch (e) {} }
 }
 
+// ---------- 上下文压缩 ----------
+// 压缩和生成一样是会话级后台任务（服务端同样注册在 _active 里），所以也走 SSE：
+// 刷新或换设备后能重连接着看，中途打断则什么都不改。
+// 它不产生 live 覆盖层——摘要是一次性替换整段历史的，等结束了整页重画最省事。
+
+async function compactStream(url, opts) {
+  const sid = cur.id;
+  const seq = ++streamSeq;
+  compacting = true;
+  streaming = true;
+  updateComposer();
+  let done = null;
+  try {
+    const resp = await fetch(url, opts || {});
+    if (resp.status === 401) { showLogin('登录已过期，请重新登录'); return; }
+    activeReader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done: eof, value } = await activeReader.read();
+      if (eof) break;
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) !== -1) {
+        const raw = buf.slice(0, cut); buf = buf.slice(cut + 2);
+        const line = raw.split('\n').find(l => l.startsWith('data:'));
+        if (!line) continue;
+        const ev = JSON.parse(line.slice(5));
+        if (seq !== streamSeq) return;
+        if (ev.type === 'compacted') done = ev;
+        else if (ev.type === 'error') alert(ev.message);
+      }
+      if (seq !== streamSeq) return;
+    }
+  } catch (e) {
+    if (seq === streamSeq) alert('压缩中断：' + ((e && e.message) || e));
+  } finally {
+    if (seq === streamSeq) {
+      activeReader = null;
+      streaming = false;
+      compacting = false;
+      updateComposer();
+    }
+  }
+  if (seq !== streamSeq) return;
+  if (done) {
+    // 摘要块替换了整段历史，所有块的 key 都变了：只能整页重建（不能走 reconcileSession）
+    await selectSession(sid);
+  } else {
+    await refreshSession();
+  }
+}
+
+async function runCompact(extra) {
+  if (!cur || selecting || streaming || finalizing || reconnecting || cur.generating) return;
+  await compactStream(`/api/sessions/${enc()}/compact`, post({ instruction: extra || '' }));
+}
+
 function send() {
   const text = $('input').value.trim();
   if (!text || selecting || streaming || finalizing || reconnecting || cur.generating) return;
   $('input').value = '';
   autoGrow();
+  // 斜杠指令在前端解析（以后直接加个「压缩」按钮也走这里）：
+  // /compact 后面可以跟补充要求，例如「/compact 保留人物关系，忽略战斗细节」
+  if (text === '/compact' || text.startsWith('/compact ')) {
+    runCompact(text.slice('/compact'.length).trim());
+    return;
+  }
   if (!cur.history.length) return; // 首轮用「开始」
   reconnectTries = 0;
   streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }), text);
@@ -1341,18 +1434,21 @@ $('endpointSelect').onchange = async e => {
   await api(`/api/sessions/${enc()}/endpoint`, post({ index: +e.target.value }));
   cur.endpoint = +e.target.value;
 };
-// 温度/上限：失焦或回车提交；清空则回退全局默认
+// 温度/上限/压缩保留轮数：失焦或回车提交；清空则回退全局默认
 async function pushParams() {
   const body = {
     temperature: $('tempInput').value === '' ? null : +$('tempInput').value,
     max_tokens: $('maxTokensInput').value === '' ? null : Math.round(+$('maxTokensInput').value),
+    compact_keep_turns: $('keepTurnsInput').value === '' ? null : Math.round(+$('keepTurnsInput').value),
   };
   const s = await api(`/api/sessions/${enc()}/params`, post(body));
   cur.temperature = s.temperature;
   cur.max_tokens = s.max_tokens;
+  cur.compact_keep_turns = s.compact_keep_turns;
 }
 $('tempInput').onchange = pushParams;
 $('maxTokensInput').onchange = pushParams;
+$('keepTurnsInput').onchange = pushParams;
 
 // ---------- 新建会话 ----------
 $('newSessionBtn').onclick = async () => {

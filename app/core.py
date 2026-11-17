@@ -20,28 +20,6 @@ PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
-# AIRP 任务提示词：使 AI 明确自身任务（正文直接文本输出，工具只用于判定与记账）。
-# 通过预设中的 {{respond_tool}} 宏显式插入，代码不会自动注入任何额外系统提示词。
-# 宏名沿用历史叫法，内容已不含任何选项契约：选项不再由模型在正文回合里提交，而是在正文
-# 落盘后由预设的 <preset_options>（缺省时用 OPTIONS_INSTRUCTION）驱动的独立请求生成
-# （见 llm.generate_options）。
-# 文本由 respond_tool_text 按预设 frontmatter 的 tools 白名单组装：没启用的工具不出现在
-# 提示词里。
-# 角色设定由预设中的 {{game_setting}} 宏注入，预设内部已用 <dream_setting> 等标签包裹。
-# 实际上用户可以看到思考内容，但不需要告诉模型
-
-# world_run 的说明段（它被启用时才出现）
-_WORLD_RUN_PARA = """\
-world_run是你的计算器兼笔记本，你自主决定如何使用，可以完全不使用。
-以下只是建议：
-数值与随机性判定（战斗、检定、经济、时间流逝……）用它写代码完成；随机性操作（如掷骰）用代码生成，口头编点数的随机性很糟糕。需要计算和追踪的游戏数据放进全局对象 state；重复的流程（骰子判定、伤害公式等）定义为顶层 def 函数，跨调用自动保留。
-state只记当前状态，避免无限增长的日志，防止无效信息堆积。"""
-
-_WORLD_RUN_NOTES = """\
-书写 world_run 代码的注意事项：
-- state 是 dict：读写一律用下标（state['hp']），不支持点访问（state.hp 会报错）。
-- 双引号嵌套需要多层转义、极易出错。含引号的文本（对话、选项）一律用单引号或三引号的 Python 字符串包裹，让双引号原样出现在字符串里。"""
-
 # 附加工具的说明段（read_file 只在流程里点名，没有专段）
 _TOOL_PARAS = {
     "write_file": """\
@@ -57,29 +35,9 @@ web_fetch 用来抓取单个网页并取回 Markdown 正文：先用 web_search 
 }
 
 
-def _airp_prompt(direct: list) -> str:
-    """非 PTC 模式的任务提示词：按启用的直接工具裁剪。"""
-    flow = ["每轮回复的固定流程："]
-    step = 1
-    if direct:
-        names = " / ".join(direct)
-        flow.append(
-            f"{step}.（可选）任意时刻调用 {names} 收集信息、执行计算、完成判定，执行结果作为工具结果返回给你；"
-        )
-        step += 1
-        flow.append(f"{step}. 输出正文。需要的话中间可以插入{names}。")
-    else:
-        flow.append(f"{step}. 输出正文。")
-    parts = ["\n".join(flow)]
-    if "world_run" in direct:
-        parts += [_WORLD_RUN_PARA, _WORLD_RUN_NOTES]
-    parts += [_TOOL_PARAS[n] for n in direct if n in _TOOL_PARAS]
-    parts.append("再次提醒：正文直接写出来即可，工具只用来做判定与记账。")
-    return "\n\n".join(parts)
-
 # PTC 模式的任务提示词：world_run 是唯一直接工具，read_file 等是代码内绑定。
 # 形态对齐 DeepSeek Harness 的 PTC 训练分布（单一代码执行工具 + 程序内绑定调用），
-# 叙事仍是普通文本输出。由 ptc: true 的预设通过 {{respond_tool}} 宏注入；
+# 叙事仍是普通文本输出。
 # 绑定清单按预设的 tools 白名单裁剪（启用什么列什么）。
 _PTC_BINDING_DOCS = {
     "read_file": "- read_file(file_path: str, offset: int = 1, limit: int = 2000)：读取 UTF-8 文本文件（玩家提供的设定文档、笔记等），内容返回到当次日志；大文件用 offset/limit 分页。",
@@ -91,27 +49,12 @@ _PTC_BINDING_DOCS = {
 }
 
 
-def _airp_prompt_ptc(bindings: list) -> str:
-    """PTC 模式的任务提示词：绑定函数清单按启用的工具生成。"""
-    docs = [_PTC_BINDING_DOCS[b] for b in bindings if b in _PTC_BINDING_DOCS]
-    parts = [
-        "每轮回复的固定流程：\n"
-        "1.（可选）调用 world_run 收集信息、执行计算、完成判定。world_run 是唯一能直接调用的工具，调用任何其它工具名都会失败。\n"
-        "2. 输出正文。正文直接作为普通文本输出。",
-        _WORLD_RUN_PARA,
-        _WORLD_RUN_NOTES,
-    ]
-    if docs:
-        parts.insert(1, "world_run 代码内的绑定函数（直接调用，不是工具）：\n" + "\n".join(docs))
-    parts.append("再次提醒：world_run 只用来做判定与记账，正文直接写出来即可。")
-    return "\n\n".join(parts)
-
 # 选项请求的默认指令：未在预设里写 <preset_options> 时回退到这份文本，保证旧预设行为不变。
 # 预设定义后整段替换（见 options_instruction），所以这里同时是格式规范的参考实现。
 # 必须与正文请求共用同一份 config，保证缓存命中。
 OPTIONS_INSTRUCTION = """\
 <system>
-现在只做一件事：为玩家提供接下来的剧情推进选项。不要续写正文或者调用任何工具。
+为玩家提供接下来的剧情推进选项。不要续写正文或者调用任何工具。
 需给出4条有趣的选项，一条延续当前场景，其它导向不同故事发展方向的、有创造力，支持出乎意料的展开。
 每条选项一句话、不透露玩家角色未知的信息。
 只输出选项本身，一行一条，每行以「-」开头：
@@ -123,20 +66,37 @@ OPTIONS_INSTRUCTION = """\
 """
 
 
+# 上下文压缩（/compact）的指令：作为最后一条 user 消息追加在完整历史之后，让模型把此前
+# 全部内容压成一份前情摘要。与选项指令同构——都是「正文之后的又一次请求」，共用同一份
+# TurnConfig 与同一个输入前缀，所以压缩本身几乎只付输出的钱。
+# 摘要是要写回 history、以后每轮都发回去的正文，所以格式要求写死在这里而不是交给预设：
+# 代码只认三类预设标记，多一类就是协议变更，不值得为它开个口子。
+COMPACT_INSTRUCTION = """\
+<system>
+把以上全部对话压缩成一份前情摘要，作为在新上下文中继续故事的前情依据。要求：
+1. 上帝视角总结玩家的历史交互：大致的时间线、已经发生的关键事件与后果、NPC及其关系与态度、
+   尚未解决的线索与承诺、当前场景与时间地点等等对接下来的故事发展重要的信息。
+2. 最开始的世界观和人设是永远完整可见的，不需要写入摘要。只写在故事发展中发生变化和增加的新信息。
+3. state和world_run内定义的函数会保留并且由系统在摘要之后自动附上，因此也不用写。
+4. 新会话中只有当前摘要可见，如果本次会话已经以一份旧摘要开头，则需要筛选必要信息整合到当前摘要中。
+5. 直接输出摘要正文：不要标题/前言，不要调用任何工具。
+</system>
+"""
+
+
 # api_type 无关的基础工具定义（只含 name/description/parameters）
 
 _WORLD_RUN_TOOL_DEF = {
     "name": "world_run",
     "description": (
-        "在持久的 Python 环境中执行一段代码，用于一切涉及数值与规则的判定与状态更新。"
-        "跨调用保留：全局对象 state、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失。"
-        "约定：会变的游戏数据放进 state；固定不变的常量表/魔法数字用全大写变量定义（如 TIERS = [...]、MAX_HP = 100）；可复用的流程用顶层 def 函数定义（函数内部的 def 是局部的，调用结束即消失）。"
-        "输出：print(...值) 写入当次日志返回。注意 normalize 之外的 print 是 normalize 执行前的值，normalize 执行后的结果在 state diff 中自动返回。"
-        "原子执行：代码出错时自动回滚到执行前（state、函数、常量全部还原），不会留下半更新的状态。"
-        "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；"
-        "把变量钳制（如 if state['hp'] < 0: state['hp'] = 0）、阈值提醒（函数里 print 即提醒）、派生量自动更新写在里面避免遗忘；"
-        "normalize 出错只回滚它自己的改动并记录，不影响本次代码的成果。"
-        "每次执行返回：日志、state 的变化 diff、normalize 错误（如有）。"
+        "你的计算器兼笔记本，在持久的 Python 环境中执行代码。对叙事正文没有直接影响，自主决定如何使用，也可以完全不使用。"
+        "跨调用保留：全局对象 state: dict、顶层 def 函数、全大写全局变量（常量）三者自动持久化，跨 turn 不丢失。state只记当前状态，避免无限增长的日志。无效信息堆积时积极清理。"
+        "约定：会变的游戏数据放进 state；固定不变的常量表/魔法数字用全大写变量定义（如 TIERS = [...]、MAX_HP = 100）。可复用的流程用顶层 def 函数定义（函数内部的 def 是局部的，调用结束即消失）。"
+        "随机性：口头编的随机数随机性很糟糕，应该使用代码生成随机数。"
+        "字符串写法：双引号嵌套需要多层转义、极易出错。含引号的文本一律用单引号或三引号的 Python 字符串包裹，让双引号原样出现在字符串里。"
+        "读取值：每回合state的变化部分会自动返回，如需获取其他信息，print(...值) 以追加到当次日志返回。"
+        "自动钩子：如果你定义了 normalize() 函数，每次代码成功执行后框架会自动调用它一次，可用于阈值提醒（函数里 print 即提醒）、派生量自动更新。注意 normalize 之外的 print 返回 normalize 执行前的值，normalize 执行后的结果会在 state diff 中自动返回。"
+        "每次执行返回：日志、state 的变化 diff、代码错误（如有）。代码出错时状态会自动回滚。"
     ),
     "parameters": {
         "type": "object",
@@ -158,8 +118,6 @@ _READ_FILE_TOOL_DEF = {
     "name": "read_file",
     "description": (
         "读取一个 UTF-8 文本文件并返回其内容。"
-        "用于读取玩家提供的设定文档、笔记、角色卡、存档等文本文件；"
-        "相对路径以当前会话角色卡所在目录为基准，也支持绝对路径；"
         "大文件可用 offset/limit 分页继续读取（分页信息在返回末尾）。"
     ),
     "parameters": {
@@ -181,8 +139,6 @@ _WRITE_FILE_TOOL_DEF = {
     "description": (
         "写一个 UTF-8 文本文件并返回写入结果。"
         "默认整篇覆盖（文件不存在就新建，父目录自动创建），mode=\"append\" 时追加到末尾（换行统一为 LF）。"
-        "相对路径以当前会话角色卡所在目录为基准，也支持绝对路径。"
-        "只改文件里的局部内容请用 edit_file，不要整篇重写。"
     ),
     "parameters": {
         "type": "object",
@@ -206,7 +162,6 @@ _EDIT_FILE_TOOL_DEF = {
         "old_string 必须与文件内容逐字一致（含缩进与空行），且默认必须唯一，"
         "不唯一时报错并要求给出更长的上下文；replace_all=true 时替换全部匹配。"
         "不确定文件当前内容时先用 read_file 看一眼。"
-        "相对路径以当前会话角色卡所在目录为基准，也支持绝对路径。"
     ),
     "parameters": {
         "type": "object",
@@ -226,7 +181,7 @@ _EDIT_FILE_TOOL_DEF = {
 _BASH_TOOL_DEF = {
     "name": "bash",
     "description": (
-        "执行一段 shell 命令（Git Bash），返回退出码与合并后的输出（stdout 在前、stderr 在后）。"
+        "执行一段 shell 命令（Bash），返回退出码与合并后的输出（stdout 在前、stderr 在后）。"
         "工作目录是当前会话角色卡所在目录。适合批量处理文件、跑脚本、查看环境这类事情；"
         "命令有超时上限（默认 60 秒，最多 600 秒），超时会被终止。不要用它跑需要交互输入的命令。"
     ),
@@ -243,16 +198,15 @@ _BASH_TOOL_DEF = {
 _WEB_SEARCH_TOOL_DEF = {
     "name": "web_search",
     "description": (
-        "联网搜索网页（DeepSeek Search 接口），返回标题、链接、摘要与发布时间等结果，用于获取实时信息"
-        "（新闻、版本、价格、事实核查）。query 支持搜索语法：site:/-site:/-关键词/\"精确短语\"/lang:zh,en/"
-        "after:2025-01-01/before:2026。一般先用默认参数看摘要，需要正文时再 need_content=True 或用 "
+        "联网搜索网页，返回标题、链接、摘要与发布时间等结果，用于获取实时信息"
+        "（新闻、版本、价格、事实核查）。一般先用默认参数看摘要，需要正文时再 need_content=True 或用 "
         "web_fetch 抓具体那一页。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "搜索词（1~128 字符），支持 site:/lang:/after: 等搜索语法。"},
-            "count": {"type": "number", "description": "返回条数，1~50；缺省用 config.yaml 的 web_tools.count（默认 10）。"},
+            "query": {"type": "string", "description": "搜索词（1~128 字符），支持 site:/-site:/-关键词/\"精确短语\"/lang:zh,en/after:2025-01-01/before:2026 等搜索语法。"},
+            "count": {"type": "number", "description": "返回条数，1~50。"}, # 默认是 config.yaml 的 web_tools.count
             "need_content": {"type": "boolean", "description": "是否一并返回网页正文（默认 false，只给摘要，省上下文）。"},
             "ori_question": {"type": "string", "description": "触发这次搜索的用户原始问题（1~128 字符），有助于理解搜索意图。"},
         },
@@ -263,13 +217,13 @@ _WEB_SEARCH_TOOL_DEF = {
 _WEB_FETCH_TOOL_DEF = {
     "name": "web_fetch",
     "description": (
-        "抓取单个网页并以 Markdown 文本返回正文（DeepSeek Fetch 接口）。一般先用 web_search 找到链接再抓"
-        "最相关的那一页，不要凭猜测拼 URL。url 必须是含主机名的 http/https 地址，且不能携带用户名或密码。"
+        "抓取单个网页并以 Markdown 文本返回正文。"
+        "最相关的那一页，不要凭猜测拼 URL。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "要抓取的网页地址（http/https，含主机名）。"},
+            "url": {"type": "string", "description": "要抓取的网页地址（http/https，含主机名且不能携带用户名或密码）。"},
         },
         "required": ["url"],
     },
@@ -320,17 +274,6 @@ def preset_tools(preset: dict) -> tuple:
 def session_tools(state: dict) -> tuple:
     """按会话预设解析 (直接工具名单, 绑定名)。预设不存在时 KeyError（交由调用方处理）。"""
     return preset_tools(load_presets()[state["preset"]])
-
-
-def respond_tool_text(preset: dict) -> str:
-    """{{respond_tool}} 宏的内容：按预设模式与启用的工具组装任务提示词。
-
-    宏名沿用历史叫法，内容已不含任何选项契约（选项由正文落盘后的独立请求生成）。
-    末尾保留一个换行：预设里这个宏独占一行，去掉换行会跟下一段黏在一起。
-    """
-    direct, bindings = preset_tools(preset)
-    text = _airp_prompt_ptc(bindings) if preset.get("ptc") else _airp_prompt(direct)
-    return text + "\n"
 
 
 def _world_run_ptc_def(bindings: list) -> dict:
@@ -419,7 +362,7 @@ BEGINNING_RE = re.compile(r"<game_beginning>(.*?)</game_beginning>", re.S)
 # 宏: {{表达式}}。所有预设文本统一按 Python 表达式求值
 MACRO_RE = re.compile(r"\{\{(.*?)\}\}")
 # 宏求值环境中预置的模块;另有上下文变量 game_setting / game_beginning /
-# user_setting / respond_tool(四个固定宏)和 user_input(仅 preset_user_input 块)
+# user_setting (固定宏)和 user_input(仅 preset_user_input 块)
 MACRO_MODULES = {"random": random, "time": time, "math": math, "datetime": datetime}
 
 
@@ -452,7 +395,6 @@ def _preset_env(state: dict, preset: dict, card: dict) -> dict:
         "game_setting": card["setting"],
         "game_beginning": state["beginning_text"],
         "user_setting": card["user_setting"],
-        "respond_tool": respond_tool_text(preset),
     }
 
 
@@ -723,6 +665,7 @@ def build_turn(state: dict) -> TurnConfig:
         tools=tuple(direct),
         bindings=tuple(bindings),
         options_enabled=resolve_options_enabled(state.get("options_enabled"), settings),
+        compact_keep_turns=resolve_compact_keep_turns(state.get("compact_keep_turns"), settings),
     )
 
 
@@ -749,6 +692,20 @@ def resolve_options_enabled(state_value, settings: Settings) -> bool:
     if isinstance(state_value, bool):
         return state_value
     return settings.options_enabled
+
+
+def resolve_compact_keep_turns(state_value, settings: Settings) -> int:
+    """解析压缩时保留的原文轮数：会话值合法直接用，否则用全局默认。
+
+    0 是合法值（全部压成摘要），所以不能用 `state_value or 默认` 这种写法。
+    """
+    if (
+        isinstance(state_value, int)
+        and not isinstance(state_value, bool)
+        and 0 <= state_value <= config.COMPACT_KEEP_TURNS_MAX
+    ):
+        return state_value
+    return settings.compact_keep_turns
 
 
 # ---------- session 存储 ----------
@@ -829,18 +786,20 @@ def create_session(user: str | None, name: str, preset: str, card: str, beginnin
     return state
 
 
-def fork_session(name: str, index: int) -> dict:
-    """在用户块 index 处分叉：复制会话状态与 history[:index] 为新会话，原会话不动。
+def fork_session(name: str, index: int, suffix: str = "fork") -> dict:
+    """在 index 处分叉：复制会话状态与 history[:index] 为新会话，原会话不动。
 
-    新会话最后一项是 assistant 块（或空历史），可直接继续输入。世界状态由
-    world.fork 按同一 index 复制。
+    index 只校验范围，不校验块类型 —— 「只能从用户块分支」是面向用户那条路径的约束，
+    由 /fork 端点自己检查；内部调用（压缩前留一份完整副本）需要 index == len(history)
+    这种任意位置。世界状态由 world.fork 按同一 index 复制（_snapshot_at 会回退到不晚于
+    它的最近一条，所以任意位置都取得到对应状态）。
     """
     user, _bare = split_scope(name)
     state = load_state(name)
     history = load_history(name)
-    if not (0 <= index < len(history)) or history[index]["role"] != "user":
-        raise ValueError("fork 目标不是用户块")
-    base = f"{state['name']}-fork-{time.strftime('%Y%m%d-%H%M%S')}"
+    if not 0 <= index <= len(history):
+        raise ValueError(f"fork 位置越界: {index}（history 共 {len(history)} 项）")
+    base = f"{state['name']}-{suffix}-{time.strftime('%Y%m%d-%H%M%S')}"
     new_name, n = base, 2
     while _session_dir(session_key(user, new_name)).exists():
         new_name, n = f"{base}-{n}", n + 1
@@ -893,8 +852,15 @@ def save_history(name: str, history: list) -> None:
 
 
 def count_turns(name: str) -> int:
-    """已运行的轮数 = history 里模型回复（assistant 块）的条数。"""
-    return sum(1 for e in load_history(name) if e.get("role") == "assistant")
+    """已运行的轮数 = history 里模型回复（assistant 块）的条数。
+
+    压缩生成的摘要块也是 assistant，但它不是一轮回复，不能算进去。
+    """
+    return sum(
+        1
+        for e in load_history(name)
+        if e.get("role") == "assistant" and not e.get("compacted")
+    )
 
 
 # ---------- 上下文拼装 ----------
@@ -1028,6 +994,52 @@ def build_options_input(state: dict, history: list, content: str, tool_calls: li
     preset = load_presets()[state["preset"]]
     card = load_cards()[state["card"]]
     instruction = options_instruction(preset, _preset_env(state, preset, card))
+    if turn.endpoint.api_type == "chat_completions":
+        items.append({"role": "user", "content": instruction})
+    else:
+        items.append(_message_item("user", instruction))
+    return items
+
+
+def compact_cut(history: list, keep_turns: int) -> int:
+    """压缩切点：history[:cut] 被摘要替换，history[cut:] 保留原文。
+
+    从末尾往回数到「第 keep_turns 个 assistant 块」之前，切点落在它所属那一轮的 user
+    块上——这样插入摘要后仍是 user/assistant 交替，保留部分也从完整的一轮开始。
+    keep_turns=0 时 cut == len(history)（全部压缩，历史只剩摘要块）。
+
+    没有可压缩的内容时返回 0，由调用方拒绝（历史太短）。
+    """
+    seen = 0
+    i = len(history) - 1
+    while i >= 0:
+        if history[i].get("role") == "assistant":
+            seen += 1
+            if seen > keep_turns:
+                break
+        i -= 1
+    cut = i + 1
+    # 正常历史是 user/assistant 严格交替，切点必然落在 user 块上。万一有连续 assistant
+    # 块（手工改过 history），往前挪到下一个 user 块，别让保留段以 assistant 开头。
+    while 0 < cut < len(history) and history[cut].get("role") != "user":
+        cut += 1
+    return cut if 0 <= cut <= len(history) else 0
+
+
+def build_compact_input(state: dict, history: list, turn: TurnConfig, extra: str = "") -> list:
+    """拼装压缩请求的输入：完整历史的输入 + 末尾的压缩指令。
+
+    与 build_options_input 同构：history 是完整历史（最后一块必须是 assistant，调用方
+    已校验），所以这次请求是上一次正文请求的严格续写，端点侧的前缀缓存能整段命中——
+    压缩只付输出的钱，而不是把整段上下文再买一遍。
+    """
+    items = build_input(state, history, None, turn)
+    instruction = ""
+    if extra.strip():
+        # 用户的额外要求放在指令**前面**：末尾必须是「直接输出摘要正文」那句，否则模型
+        # 容易把补充要求当成新任务去回答
+        instruction = f"本次压缩的额外要求（来自玩家，优先满足）：\n{extra.strip()}\n\n"
+    instruction += COMPACT_INSTRUCTION
     if turn.endpoint.api_type == "chat_completions":
         items.append({"role": "user", "content": instruction})
     else:

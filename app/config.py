@@ -41,6 +41,13 @@ DEFAULT_REASONING_EFFORT = "low"
 # 选项请求默认开启
 DEFAULT_OPTIONS_ENABLED = True
 
+# 上下文压缩（/compact）默认保留最近几轮原文。0 = 全部压成摘要（实验用：每轮都只剩摘要）。
+# 只影响压缩时的切点，不参与请求形状，所以不影响前缀缓存。
+DEFAULT_COMPACT_KEEP_TURNS = 3
+
+# 保留轮数的合法上限：再大就没有压缩效果了，也防止前端填个离谱的数字撑爆切点计算
+COMPACT_KEEP_TURNS_MAX = 500
+
 # 联网工具（web_search / web_fetch）的独立配置，打的是 DeepSeek 的 Search / Fetch 接口，
 # 与模型端点无关：api_key 就是 DeepSeek API Key，从端点那边复制过来即可。
 WEB_TOOL_API_BASE = "https://api.deepseek.com"
@@ -277,6 +284,7 @@ class Settings:
     max_tokens: int | None = None
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     options_enabled: bool = DEFAULT_OPTIONS_ENABLED
+    compact_keep_turns: int = DEFAULT_COMPACT_KEEP_TURNS
     user_agent: str | None = None
     auth: AuthSettings = field(default_factory=lambda: AuthSettings(False, {}, DEFAULT_SESSION_TTL_DAYS * 86400, False))
     server: ServerSettings = field(default_factory=ServerSettings)
@@ -324,6 +332,15 @@ class Settings:
         if user_agent is not None and not isinstance(user_agent, str):
             raise ValueError(f"config.yaml 的 user_agent 非法: {user_agent!r}")
 
+        keep_turns = raw.get("compact_keep_turns")
+        if keep_turns is None:
+            keep_turns = DEFAULT_COMPACT_KEEP_TURNS
+        elif not _is_int(keep_turns) or not 0 <= keep_turns <= COMPACT_KEEP_TURNS_MAX:
+            raise ValueError(
+                f"config.yaml 的 compact_keep_turns 非法: {keep_turns!r}"
+                f"（应为 0~{COMPACT_KEEP_TURNS_MAX} 的整数，0 = 全部压成摘要）"
+            )
+
         web_tools_raw = raw.get("web_tools")
         return cls(
             endpoints=endpoints,
@@ -331,6 +348,7 @@ class Settings:
             max_tokens=max_tokens,
             reasoning_effort=effort,
             options_enabled=options_enabled,
+            compact_keep_turns=keep_turns,
             user_agent=user_agent,
             auth=parse_auth(raw.get("auth")),
             server=parse_server(raw.get("server")),
@@ -389,3 +407,5 @@ class TurnConfig:
     tools: tuple[str, ...]
     bindings: tuple[str, ...]
     options_enabled: bool = DEFAULT_OPTIONS_ENABLED
+    # 压缩时保留最近几轮原文（0 = 全部压成摘要）。只影响 /compact 的切点，不发进请求体
+    compact_keep_turns: int = DEFAULT_COMPACT_KEEP_TURNS

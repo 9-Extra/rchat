@@ -410,6 +410,90 @@ def commit_turn(name: str, turn_len: int):
     _write_disk(name, rt["committed"], turn_len)
 
 
+# 压缩时附在摘要后的世界状态原文上限（state 与 lib 各自单独算）。全量 dump 会永久钉在
+# 上下文前缀里、每一轮都要发一遍，所以超过上限就降级成结构概览——比被压掉的内容还大就
+# 得不偿失了。
+DUMP_MAX_CHARS = 24000
+
+
+def _state_overview(state: dict) -> str:
+    """state 过大时的降级表示：键名 + 值的开头，剩下的靠模型自己 print 看。"""
+    lines = []
+    for key, value in state.items():
+        text = json.dumps(value, ensure_ascii=False)
+        if len(text) > 300:
+            kind = f"{len(value)} 项" if isinstance(value, (list, dict)) else f"{len(text)} 字符"
+            text = f"{text[:300]}…（{kind}，已省略）"
+        lines.append(f"  {key}: {text}")
+    body = "（state 过大，以下为结构概览；完整值用 print(state[...]) 查看）\n" + "\n".join(lines)
+    return body[:DUMP_MAX_CHARS] + ("…（概览也已截断）" if len(body) > DUMP_MAX_CHARS else "")
+
+
+def dump_text(name: str) -> str:
+    """压缩时附在摘要后的世界状态全貌：state 全量 + 已定义的函数与常量源码。
+
+    只读磁盘上的 committed，不碰运行时（压缩发生在轮次边界，磁盘即最新）。
+    会话从没用过 world_run 时返回一句说明，不凭空造 world 目录。
+    两段的标题行是模型认出「这是系统自动附加的快照、不是正文」的唯一依据，改标题时顺带
+    确认 core.COMPACT_INSTRUCTION 里没有按名字提到它们。
+    """
+    d = _world_dir(name)
+    if not d.exists():
+        # 标题必须与下面那段逐字一致：模型靠标题认出「这是自动附加的快照，不是正文」
+        return "【本轮state快照】\n（此会话尚未使用 world_run，没有世界状态。）"
+    committed = _load_committed(name)
+    state_json = json.dumps(committed["state"], ensure_ascii=False, indent=1)
+    if len(state_json) > DUMP_MAX_CHARS:
+        state_json = _state_overview(committed["state"])
+    lib_file = d / "lib.py"
+    code = lib_file.read_text(encoding="utf-8").strip() if lib_file.exists() else ""
+    if len(code) > DUMP_MAX_CHARS:
+        code = code[:DUMP_MAX_CHARS] + "\n# …（代码过长，已截断）"
+    parts = [
+        "【本轮state快照】\n"
+        f"```json\n{state_json}\n```"
+    ]
+    parts.append(
+        "【world_run 内已定义的函数与常量】\n"
+        f"```python\n{code or '# （尚未定义任何函数或常量）'}\n```"
+    )
+    return "\n\n".join(parts)
+
+
+def remap_after_compact(name: str, cut: int, new_len: int) -> None:
+    """历史被压缩改写后，把按历史长度做的快照搬到新坐标系。
+
+    快照 key 是「落盘时的历史长度」。压缩把 history[:cut] 换成一个摘要块后长度变短，
+    key 必须平移成 new = old - cut + 1（摘要块占掉新历史的 1 格）。不平移的后果是实打
+    实的：下一轮 _prepare 的 world.sync(name, len(history)) 会查到一条很早的快照，把
+    世界状态静默回滚到开局；再下一轮 commit_turn 的 prune 还会把之后的快照全删掉。
+
+    平移是单调的，所以 _snapshot_at 的「回退到不晚于目标的最近一条」语义保持不变；
+    落在被压掉区间里的快照（old < cut）已经没有对应的历史位置，直接丢弃。
+    """
+    d = _world_dir(name)
+    snaps = _snapshots(name)
+    if not snaps:
+        rt = _runtimes.get(name)
+        if rt is None:
+            return  # 没有任何世界状态要搬
+        # 有运行时却没有快照（理论上不该发生）：把当前 committed 当作切点边界
+        snaps = {str(cut): rt["committed"]}
+    out = {}
+    for key, value in snaps.items():
+        old = int(key)
+        if old >= cut:
+            out[str(old - cut + 1)] = value
+    # 切点本身必须有一条：压缩后的 index 1 是保留下来的第一个块，回滚到那里应当拿到
+    # 压缩前的状态
+    if "1" not in out:
+        out["1"] = _snapshot_at(snaps, cut)
+    d.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(d / "snapshots.json", json.dumps(out, ensure_ascii=False))
+    # 让运行时按新长度重新对齐（写盘时会把 > new_len 的快照剪掉，此时已不存在）
+    sync(name, new_len)
+
+
 def fork(src: str, dst: str, turn_len: int):
     """fork：把 src 在 turn_len 处的世界状态（及更早的快照）复制到新会话 dst。
 

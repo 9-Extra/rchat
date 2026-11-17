@@ -34,6 +34,14 @@ _OPTIONS_RETRY_HINT = """
 - 选项二
 """
 
+# 压缩请求的输出上限（摘要很短，但仍要留够）。只影响输出、不参与前缀缓存。
+COMPACT_MAX_TOKENS = 8192
+
+# 压缩请求第一次没产出可用摘要时追加的提醒（同样只追加、不改前缀）。
+_COMPACT_RETRY_HINT = """
+上一次输出不能当摘要用。请只输出摘要正文：不要调用任何工具，不要标题，不要说明文字。
+"""
+
 
 def _make_client(turn: TurnConfig) -> AsyncOpenAI:
     """构造 OpenAI 客户端，按需附加风控要求的请求头。
@@ -417,6 +425,72 @@ async def _stream_body_chat_completions(messages: list, turn: TurnConfig, run_to
 
             # 本轮全是工具调用，进入下一轮
         raise RuntimeError(f"工具循环超过 {MAX_ROUNDS} 轮仍未结束回复,已中止")
+
+
+async def generate_summary(input_items: list, turn: TurnConfig) -> tuple[str, str]:
+    """压缩请求（/compact）：用与正文请求**完全相同**的参数再问一次，只要一份摘要正文。
+
+    返回 (摘要, 错误文本)；失败不抛异常，由调用方决定「什么都不改」。
+    必须与正文请求共用同一份 turn：这次请求是上一次正文请求的严格续写，前缀缓存能整段
+    命中，压缩就只付输出的钱；换 model / tools / thinking 任何一样都会让它变成把整段
+    上下文重新买一遍。
+
+    输出不像摘要（调了工具、空的）就追加一句提醒重试一次；仍失败则返回错误。
+    不设长度下限：短摘要也是摘要，压得太狠是模型的选择，不该当作失败让用户重来。
+    """
+    error = ""
+    async with _make_client(turn) as client:
+        for attempt in range(2):
+            items = list(input_items)
+            if attempt:
+                items.append(_followup_item(turn, _COMPACT_RETRY_HINT))
+            try:
+                text, problem = await _request_compact_once(client, items, turn)
+            except Exception as e:
+                error = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+                logger.warning("压缩请求失败(第 %d 次): %s", attempt + 1, error)
+                continue
+            stripped = (text or "").strip()
+            if not problem:
+                return stripped, ""
+            error = problem
+            logger.warning(
+                "压缩请求失败(第 %d 次): %s\n模型原始输出:\n%s", attempt + 1, error, text or "（空输出）"
+            )
+        return "", error
+
+
+async def _request_compact_once(client, input_items: list, turn: TurnConfig) -> tuple:
+    """发一次非流式的压缩请求，返回 (模型输出文本, 说明)。"""
+    api_type = turn.endpoint.api_type
+    payload = build_request(input_items, turn)
+    payload.pop("stream", None)  # 要完整摘要，用非流式一次拿到
+    limit = min(turn.max_tokens or COMPACT_MAX_TOKENS, COMPACT_MAX_TOKENS)
+    if api_type == "chat_completions":
+        payload["max_tokens"] = limit
+        resp = await client.chat.completions.create(**payload)
+        logger.info("压缩请求 %s", _usage_note(getattr(resp, "usage", None)))
+        choice = resp.choices[0]
+        calls = getattr(choice.message, "tool_calls", None)
+        if calls:
+            return _render_calls(calls), "模型在压缩请求里调用了工具，没有给出摘要"
+        text = choice.message.content or ""
+        if not text.strip():
+            return "", _empty_output_error(
+                f"finish_reason={choice.finish_reason}" if choice.finish_reason else "", streamed=False
+            )
+        return text, ""
+    payload["max_output_tokens"] = limit
+    resp = await client.responses.create(**payload)
+    logger.info("压缩请求 %s", _usage_note(getattr(resp, "usage", None)))
+    calls = [o for o in (getattr(resp, "output", None) or [])
+             if getattr(o, "type", "") == "function_call"]
+    if calls:
+        return _render_calls(calls), "模型在压缩请求里调用了工具，没有给出摘要"
+    text = resp.output_text or ""
+    if not text.strip():
+        return "", f"模型没输出任何文本（{_response_status(resp)}）"
+    return text, ""
 
 
 async def generate_options(input_items: list, turn: TurnConfig) -> tuple:
