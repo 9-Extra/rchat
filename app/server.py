@@ -60,7 +60,7 @@ async def auth_gate(request: Request, call_next):
         if path.startswith("/api/"):
             if path not in PUBLIC_PATHS:
                 return JSONResponse({"detail": "未登录或登录已过期"}, status_code=401)
-        elif path != "/":
+        elif path not in ("/", "/favicon.ico"):
             # 页面（/preview.html 这类调试页）未登录就回首页——首页自己会弹登录框
             return RedirectResponse("/", status_code=302)
     return await call_next(request)
@@ -156,6 +156,11 @@ def index():
 @app.get("/preview.html")
 def preview_page():
     return FileResponse(STATIC / "preview.html", headers=NO_CACHE)
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return FileResponse(STATIC / "favicon.ico", headers=NO_CACHE)
 
 
 # ---------- 资源列表 ----------
