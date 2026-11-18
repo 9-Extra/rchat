@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import urllib.parse
@@ -233,31 +234,124 @@ _GIT_BASH_DIRS = (
     r"%USERPROFILE%\scoop\apps\git\current\bin",
 )
 
+# 探测 bash 用的短命令超时：只跑一次，别让一个坏候选把首次调用卡太久
+BASH_PROBE_TIMEOUT = 5
+# 超时杀进程树后，再给管道这么久把剩余输出收回来（孙进程可能还攥着管道）
+BASH_KILL_GRACE = 2
+
+
+def _is_wsl_bash_stub(path: str | Path) -> bool:
+    """WindowsApps 下的 bash.exe 是 WSL 的 0 字节 App Execution Alias，不是 Git Bash。
+
+    它跑 `-c` 会一直挂着等 WSL 启动（实测连 `echo hi` 都要挂满工具超时），探测时跳过。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        parts = [part.lower() for part in Path(path).parts]
+    except (OSError, ValueError):
+        return False
+    return "windowsapps" in parts and Path(path).name.lower() in {"bash", "bash.exe"}
+
+
+def _probe_shell(path: str) -> bool:
+    """跑一条极短命令确认这个 bash 真能用（挡住 WSL 启动器 / 坏安装）。"""
+    try:
+        proc = subprocess.run(
+            [path, "-c", "printf rchat-ok"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=BASH_PROBE_TIMEOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and "rchat-ok" in (proc.stdout or "")
+
+
+def _shell_candidates() -> list[str]:
+    """按优先级给出 bash 候选：Windows 先看 Git Bash 的常见安装目录。"""
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        for directory in _GIT_BASH_DIRS:
+            candidate = Path(os.path.expandvars(directory)) / "bash.exe"
+            if candidate.is_file():
+                candidates.append(str(candidate))
+    for name in ("bash", "bash.exe", "sh"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
 
 def _shell() -> str | None:
     """定位可用的 bash（首次调用时探测并缓存）。"""
     global _SHELL, _SHELL_TRIED, _SHELL_PROBED
     if not _SHELL_PROBED:
-        found = shutil.which("bash") or shutil.which("bash.exe") or shutil.which("sh")
-        tried: list = []
-        if found is None and sys.platform == "win32":
-            for directory in _GIT_BASH_DIRS:
-                candidate = Path(os.path.expandvars(directory)) / "bash.exe"
-                tried.append(str(candidate))
-                if candidate.is_file():
-                    found = candidate
-                    break
-        _SHELL = str(found) if found else None
+        tried: list[str] = []
+        found: str | None = None
+        for candidate in _shell_candidates():
+            if _is_wsl_bash_stub(candidate):
+                tried.append(f"{candidate}（WSL 启动器，跳过）")
+                continue
+            tried.append(candidate)
+            if _probe_shell(candidate):
+                found = candidate
+                break
+        _SHELL = found
         _SHELL_TRIED = tuple(tried)
         _SHELL_PROBED = True
     return _SHELL
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """超时后杀掉整棵进程树。
+
+    只杀 bash 会留下攥着管道写端的孙进程，`communicate()` 会一直等到它们退出——实测
+    `sleep 5` 配 1s 超时，实际要 5s 才返回。Windows 上 `&` 启动的后台进程会在 bash
+    退出后逃出 taskkill 的树，仍可能留下孤儿；POSIX 的 killpg 能覆盖这种情况。
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = None) -> str:
     """在工作目录里跑一段 shell 命令，返回退出码与合并后的输出。
 
-    输出超长时只保留开头；超时的命令会被终止（Windows 上可能留下孙进程）。所有错误以
-    文本返回，由模型自行纠正。
+    输出超长时只保留开头；超时的命令连同子进程一起终止（Windows 上 `&` 后台进程可能
+    逃逸，别用它起常驻服务）。stdin 接空设备，所以需要交互输入的命令会立刻拿到 EOF，
+    而不是挂到超时。所有错误以文本返回，由模型自行纠正。
     """
     if not isinstance(command, str) or not command.strip():
         return "错误：command 不能为空"
@@ -271,8 +365,9 @@ def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = Non
     if shell is None:
         tried = f"；已尝试：{', '.join(_SHELL_TRIED)}" if _SHELL_TRIED else ""
         return (
-            "错误：找不到 bash（Windows 上需要安装 Git Bash，"
-            f"并确保 bash 在 PATH 中，或存在于 Git 的 bin 目录）{tried}"
+            "错误：找不到可用的 bash（Windows 上需要安装 Git Bash，并确保 bash 在 PATH 中，"
+            "或存在于 Git 的 bin 目录；WindowsApps 下的 bash 是 WSL 启动器，会挂住，不算）"
+            f"{tried}"
         )
     workdir = Path(cwd) if cwd else core.ROOT
     workdir.mkdir(parents=True, exist_ok=True)
@@ -286,24 +381,42 @@ def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = Non
         )
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [shell, "-c", command],
             cwd=str(workdir),
-            capture_output=True,
-            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
+            start_new_session=sys.platform != "win32",
         )
+    except Exception as e:
+        return f"错误：{type(e).__name__}: {e}"
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        partial = (e.stdout or "") + (e.stderr or "")
+        # 先收下已经读到的部分，再杀整棵树，最后把剩下的读回来
+        partial_out = e.stdout or ""
+        partial_err = e.stderr or ""
+        _kill_tree(proc)
+        try:
+            rest_out, rest_err = proc.communicate(timeout=BASH_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            rest_out, rest_err = "", ""
+            try:
+                proc.kill()
+                proc.wait(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        partial = (partial_out + rest_out) + (partial_err + rest_err)
         return (
             f"错误：命令超过 {timeout}s 未结束，已被终止。\n<output>\n"
             f"{partial[:BASH_MAX_CHARS]}</output>"
         )
-    except Exception as e:
-        return f"错误：{type(e).__name__}: {e}"
-    return render((proc.stdout or "") + (proc.stderr or ""), proc.returncode)
+    return render((stdout or "") + (stderr or ""), proc.returncode)
 
 
 def _truncate(text: str, limit: int) -> str:

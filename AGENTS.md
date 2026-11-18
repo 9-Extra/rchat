@@ -91,6 +91,9 @@
 | 页面上冒出假选项按钮 | 解析器只认行首 `-` / `*` / `•` / `·` 或编号，前言后记代码围栏一律丢弃，**不做宽松兜底**。失败会重发一次，仍失败则记 `options_error` + `options_raw`，正文照常落盘。 |
 | 新建会话后前端找不到它 | 裸会话名里带 `/` 会被当成作用域前缀，会话落进 `sessions/<前半截>/`。归一化只在 `create_session`。 |
 | 旧会话指向了另一个模型 | 端点身份 = `endpoints` **列表下标**，重排列表就会改掉所有旧会话的指向。 |
+| Windows 上 bash 工具每条命令都卡满 60s | `shutil.which("bash")` 会优先命中 `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`——0 字节的 WSL 启动器，`-c` 直接挂住。`_shell()` 必须跳过它、优先探测 Git Bash 的安装目录，并实际跑一条短命令确认能出结果。 |
+| bash 超时后要等很久才返回 | 只杀 bash 会留下攥着管道写端的孙进程，`communicate()` 要等它们退出（实测 1s 超时实际 5s）。超时要用 `taskkill /T` / `killpg` 杀整棵树，再 `communicate(timeout=...)` 收尾。 |
+| 模型跑 `cat` 或交互式命令时挂到超时 | `Popen` 继承服务进程的 stdin 会一直等输入；必须 `stdin=DEVNULL`，让这类命令立刻 EOF。 |
 
 ## 预设 / 角色卡 / 选项（作者契约）
 
