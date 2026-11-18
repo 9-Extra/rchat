@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import auth, core, tools, world
+from app import __version__, auth, core, tools, world
 from app.config import COMPACT_KEEP_TURNS_MAX
 from app.llm import (
     build_request,
@@ -35,7 +35,7 @@ async def _lifespan(_app: FastAPI):
     await close_clients()
 
 
-app = FastAPI(title="AIRP", lifespan=_lifespan)
+app = FastAPI(title="AIRP", version=__version__, lifespan=_lifespan)
 
 # 未登录也能访问的接口：登录本身，以及前端用来判断「要不要显示登录页」的自身状态
 PUBLIC_PATHS = {"/api/login", "/api/me"}
