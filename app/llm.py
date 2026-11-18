@@ -11,11 +11,10 @@
 """
 import logging
 
-from openai import AsyncOpenAI
-
 from app import core
 from app.config import TurnConfig
 from app.core import get_tools
+from app.llm_transport import LLMClient
 
 logger = logging.getLogger("airp.llm")
 
@@ -43,25 +42,88 @@ _COMPACT_RETRY_HINT = """
 """
 
 
-def _make_client(turn: TurnConfig) -> AsyncOpenAI:
-    """构造 OpenAI 客户端，按需附加风控要求的请求头。
+# 同一端点（连接参数相同）的正文 / 选项 / 压缩请求复用同一个 httpx.AsyncClient：
+# 后两次请求省掉 TCP+TLS 握手。上限只是兜底——config.yaml 每改一次连接参数会多一个
+# 客户端，正常用不到这么多。
+_MAX_CACHED_CLIENTS = 32
+_clients: dict[tuple, LLMClient] = {}
 
-    - user_agent：覆盖 SDK 默认的 "OpenAI/Python ..." UA（部分端点风控拒绝语言默认 UA）
-    - x_opencode_session + chat_id：opencode-go 要求每个对话带固定的 UUID v4 会话头
-      （同一对话所有请求同一个值，用于 GPU KV 缓存亲和调度）
-    """
+
+def _endpoint_path(ep) -> str:
+    return "/chat/completions" if ep.api_type == "chat_completions" else "/responses"
+
+
+def _client_key(turn: TurnConfig) -> tuple:
+    """连接参数快照：api_key / UA / api_type 改了就不能复用旧客户端。"""
     ep = turn.endpoint
-    headers = {}
-    if turn.user_agent:
-        headers["User-Agent"] = turn.user_agent
-    if ep.x_opencode_session and turn.chat_id:
-        headers["X-Opencode-Session"] = turn.chat_id
-    return AsyncOpenAI(
-        api_key=ep.api_key,
+    return (ep.api_base, ep.api_key, _endpoint_path(ep), turn.user_agent or "")
+
+
+class _ClientLease:
+    """`_make_client` 的返回值：借出缓存的客户端，退出时不关它。
+
+    调用点仍是 `async with _make_client(turn) as client`，但关闭交给进程退出时的
+    `close_clients()`；否则正文结束后连接池就被销毁，选项请求又要重新握手。
+    """
+
+    def __init__(self, turn: TurnConfig) -> None:
+        self._turn = turn
+
+    async def __aenter__(self) -> LLMClient:
+        return await _get_client(self._turn)
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+async def _get_client(turn: TurnConfig) -> LLMClient:
+    key = _client_key(turn)
+    client = _clients.get(key)
+    if client is not None:
+        return client
+    ep = turn.endpoint
+    headers = {"User-Agent": turn.user_agent} if turn.user_agent else {}
+    client = LLMClient(
         base_url=ep.api_base,
-        timeout=600.0,
-        default_headers=headers or None,
+        api_key=ep.api_key,
+        path=_endpoint_path(ep),
+        headers=headers,
     )
+    _clients[key] = client
+    while len(_clients) > _MAX_CACHED_CLIENTS:
+        old_key = next(iter(_clients))
+        old = _clients.pop(old_key)
+        logger.warning(
+            "LLM 客户端缓存超过 %d 个，关闭最旧的一个: %s", _MAX_CACHED_CLIENTS, old_key[0]
+        )
+        await old.aclose()
+    return client
+
+
+async def close_clients() -> None:
+    """关闭所有缓存客户端（进程退出 / 测试清理用）。"""
+    clients = list(_clients.values())
+    _clients.clear()
+    for client in clients:
+        await client.aclose()
+
+
+def _make_client(turn: TurnConfig) -> _ClientLease:
+    """借出到该端点的传输客户端（按端点缓存），返回的是「退出不关闭」的租约。
+
+    - user_agent：客户端级常驻头，覆盖默认的 "rchat/0.1"（部分端点风控拒绝语言默认 UA）
+    - x_opencode_session + chat_id：逐请求头（见 `_turn_headers`）——它随会话变，不能
+      塞进按端点缓存的客户端
+    """
+    return _ClientLease(turn)
+
+
+def _turn_headers(turn: TurnConfig) -> dict | None:
+    """只随会话变化、因此必须逐请求附带的头。"""
+    ep = turn.endpoint
+    if ep.x_opencode_session and turn.chat_id:
+        return {"X-Opencode-Session": turn.chat_id}
+    return None
 
 
 def _mapped_effort(turn: TurnConfig):
@@ -77,8 +139,8 @@ def _mapped_effort(turn: TurnConfig):
     return mapping.get(effort, effort)
 
 
-def _extra_body(turn: TurnConfig, fields: dict):
-    """SDK 不认的字段只能经 extra_body 透传（直接当 kwarg 传会 TypeError），没有内容时返回 None。
+def _vendor_fields(turn: TurnConfig, fields: dict) -> dict:
+    """端点私有的请求体字段，直接并进请求体（不属于 OpenAI 的标准参数）。
 
     - provider：OpenRouter 的路由偏好（排序、最低吞吐），端点里配了才发
     - session_id：端点开了 session_id 就把本会话的 chat_id 发过去——OpenRouter 拿它做粘性路由
@@ -91,15 +153,16 @@ def _extra_body(turn: TurnConfig, fields: dict):
     if turn.endpoint.session_id and turn.chat_id:
         extra["session_id"] = turn.chat_id
     extra.update(fields)
-    return extra or None
+    return extra
 
 
 def build_request(input_items: list, turn: TurnConfig) -> dict:
-    """构造实际发送给模型的请求参数（/api/preview 也用它展示上下文）。
+    """构造实际发送给模型的请求体（/api/preview 也用它展示上下文）。
 
-    工具 schema 来自 turn 里的预设工具配置（core.build_turn 写入的 ptc/tools/bindings）：
-    ptc 模式只含 world_run，普通模式是白名单里的直接工具。
-    选项请求（generate_options）也走这个函数：同一份 turn 才能命中前缀缓存。
+    返回的就是线上 JSON 的字段（含 stream），传输层不再加工。工具 schema 来自 turn 里的
+    预设工具配置（core.build_turn 写入的 ptc/tools/bindings）：ptc 模式只含 world_run，
+    普通模式是白名单里的直接工具。选项请求（generate_options）也走这个函数：同一份 turn
+    才能命中前缀缓存。
     """
     api_type = turn.endpoint.api_type
     schemas = get_tools(api_type, turn.ptc, turn.tools, turn.bindings)
@@ -120,18 +183,16 @@ def build_request(input_items: list, turn: TurnConfig) -> dict:
         effort = _mapped_effort(turn)
         fields = {}
         if effort == "none":
-            # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
-            # TypeError），只能塞 extra_body 透传。实测 deepseek 官方、OpenRouter、kimicode 都
-            # 认它；反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
+            # 禁用思考要发厂商私有的 thinking.disabled。实测 deepseek 官方、OpenRouter、
+            # kimicode 都认它；反过来 OpenRouter 上 reasoning.effort / enabled = none 会
+            # 400（部分端强制思考）。
             fields["thinking"] = {"type": "disabled"}
         elif effort is not None:
             payload["reasoning_effort"] = effort
-        extra = _extra_body(turn, fields)
-        if extra:
-            payload["extra_body"] = extra
+        payload.update(_vendor_fields(turn, fields))
         return payload
 
-    payload = {"model": turn.endpoint.model, "input": input_items}
+    payload = {"model": turn.endpoint.model, "input": input_items, "stream": True}
     # 白名单为空时整个工具字段都不发（空 tools 数组会被部分端点拒绝）
     if schemas:
         payload["tools"] = schemas
@@ -143,15 +204,11 @@ def build_request(input_items: list, turn: TurnConfig) -> dict:
     effort = _mapped_effort(turn)
     fields = {}
     if effort == "none":
-        # 禁用思考要发厂商私有的 thinking.disabled：SDK 不认这个参数名（当 kwarg 传直接
-        # TypeError），只能塞 extra_body 透传。实测 deepseek 官方、OpenRouter、kimicode 都
-        # 认它；反过来 OpenRouter 上 reasoning.effort / enabled = none 会 400（部分端强制思考）。
+        # 与 chat_completions 相同的厂商私有参数，见上。
         fields["thinking"] = {"type": "disabled"}
     elif effort is not None:
         payload["reasoning"] = {"effort": effort}
-    extra = _extra_body(turn, fields)
-    if extra:
-        payload["extra_body"] = extra
+    payload.update(_vendor_fields(turn, fields))
     return payload
 
 
@@ -212,55 +269,61 @@ async def _stream_body_responses(input_items: list, turn: TurnConfig, run_tool):
             texts = {}  # message item_id -> 本轮该消息项累积的文本
             round_output = []
             cut = ""  # 本轮为什么没跑完（response.incomplete，如 max_output_tokens）
-            stream = await client.responses.create(**build_request(input_items, turn), stream=True)
-            async for event in stream:
-                etype = event.type
+            async for event in client.stream(
+                build_request(input_items, turn), headers=_turn_headers(turn)
+            ):
+                etype = event.get("type")
                 if etype == "response.reasoning_text.delta":
-                    round_reasoning += event.delta
-                    _note_reasoning(reasonings, round_output, event.item_id)
-                    reasonings[event.item_id] += event.delta
-                    yield {"type": "reasoning", "delta": event.delta}
+                    delta = event.get("delta") or ""
+                    item_id = event.get("item_id")
+                    round_reasoning += delta
+                    _note_reasoning(reasonings, round_output, item_id)
+                    reasonings[item_id] += delta
+                    yield {"type": "reasoning", "delta": delta}
                 elif etype == "response.reasoning_text.done":
                     # done 带完整文本（有的实现只发 done 不发 delta），以它为准
-                    _note_reasoning(reasonings, round_output, event.item_id)
-                    reasonings[event.item_id] = getattr(event, "text", None) or reasonings[event.item_id]
+                    item_id = event.get("item_id")
+                    _note_reasoning(reasonings, round_output, item_id)
+                    reasonings[item_id] = event.get("text") or reasonings[item_id]
                 elif etype == "response.output_item.added":
-                    item = event.item
-                    itype = getattr(item, "type", None)
+                    item = event.get("item") or {}
+                    itype = item.get("type")
                     if itype == "reasoning":
-                        _note_reasoning(reasonings, round_output, item.id)
+                        _note_reasoning(reasonings, round_output, item.get("id"))
                     elif itype == "function_call":
-                        by_item[item.id] = len(calls)
-                        c = {"call_id": item.call_id, "name": item.name, "arguments": ""}
+                        by_item[item.get("id")] = len(calls)
+                        c = {"call_id": item.get("call_id"), "name": item.get("name"), "arguments": ""}
                         calls.append(c)
                         round_output.append({"kind": "call", "call": c})
                     elif itype == "message":
-                        texts[item.id] = ""
-                        round_output.append({"kind": "text", "ref": item.id})
+                        texts[item.get("id")] = ""
+                        round_output.append({"kind": "text", "ref": item.get("id")})
                 elif etype == "response.output_text.delta":
-                    content += event.delta
-                    yield {"type": "content", "delta": event.delta}
-                    if event.item_id not in texts:
+                    delta = event.get("delta") or ""
+                    item_id = event.get("item_id")
+                    content += delta
+                    yield {"type": "content", "delta": delta}
+                    if item_id not in texts:
                         # 少数实现不发 message 项的 added 事件；不补登记的话这段正文就进不了
                         # 本轮的 input（用户仍能看到——它已经进了 content）
-                        texts[event.item_id] = ""
-                        round_output.append({"kind": "text", "ref": event.item_id})
-                    texts[event.item_id] += event.delta
+                        texts[item_id] = ""
+                        round_output.append({"kind": "text", "ref": item_id})
+                    texts[item_id] += delta
                 elif etype == "response.function_call_arguments.delta":
-                    idx = by_item.get(event.item_id)
+                    idx = by_item.get(event.get("item_id"))
                     if idx is None:
                         continue
-                    calls[idx]["arguments"] += event.delta
+                    calls[idx]["arguments"] += event.get("delta") or ""
                 elif etype == "response.output_item.done":
-                    item = event.item
-                    idx = by_item.get(getattr(item, "id", None))
-                    if idx is not None and getattr(item, "arguments", None):
-                        calls[idx]["arguments"] = item.arguments
+                    item = event.get("item") or {}
+                    idx = by_item.get(item.get("id"))
+                    if idx is not None and item.get("arguments"):
+                        calls[idx]["arguments"] = item["arguments"]
                 elif etype == "response.incomplete":
                     # 被输出上限/内容过滤提前收尾：流照样正常结束，只有这个事件说明原因
-                    cut = _response_status(event.response)
+                    cut = _response_status(event.get("response") or {})
                 elif etype == "response.failed":
-                    error = getattr(event.response, "error", None)
+                    error = (event.get("response") or {}).get("error")
                     raise RuntimeError(f"Responses API 失败: {error}")
 
             n_reasoning = 0  # 本轮已追加的 reasoning 项数
@@ -314,7 +377,7 @@ async def _stream_body_responses(input_items: list, turn: TurnConfig, run_tool):
         raise RuntimeError(f"工具循环超过 {MAX_ROUNDS} 轮仍未结束回复,已中止")
 
 
-def _delta_reasoning(delta) -> str:
+def _delta_reasoning(delta: dict) -> str:
     """取 chat_completions 流式 delta 里的思考链文本：字段名各家不一，按出现情况自动兜底。
 
     - reasoning_content：deepseek 与多数 OpenAI 兼容端点的叫法
@@ -326,20 +389,18 @@ def _delta_reasoning(delta) -> str:
     判断依据只有「这个字段有没有文本」，不用按端点配置。
     """
     for key in ("reasoning_content", "reasoning"):
-        text = getattr(delta, key, None)
+        text = delta.get(key)
         if isinstance(text, str) and text:
             return text
-    details = getattr(delta, "reasoning_details", None)
+    details = delta.get("reasoning_details")
     if not details:
         return ""
     parts = []
     for item in details:
-        if isinstance(item, dict):
-            dtype, text = item.get("type"), item.get("text") or item.get("summary")
-        else:
-            dtype = getattr(item, "type", None)
-            text = getattr(item, "text", None) or getattr(item, "summary", None)
-        if dtype in ("reasoning.text", "reasoning.summary") and text:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text") or item.get("summary")
+        if item.get("type") in ("reasoning.text", "reasoning.summary") and text:
             parts.append(text)
     return "".join(parts)
 
@@ -355,36 +416,37 @@ async def _stream_body_chat_completions(messages: list, turn: TurnConfig, run_to
             round_text = ""  # 本轮新增的正文（回合级累积的是 content）
             calls = []  # 本轮工具调用：[{"id", "type", "name", "arguments"}]
             finish_reason = ""  # 本轮上游给的结束原因（length = 被输出上限截断）
-            stream = await client.chat.completions.create(**build_request(messages, turn))
-            async for chunk in stream:
-                choice = chunk.choices[0] if chunk.choices else None
-                if choice is None:
+            async for chunk in client.stream(
+                build_request(messages, turn), headers=_turn_headers(turn)
+            ):
+                choices = chunk.get("choices") or []
+                if not choices:
                     continue
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-                delta = choice.delta
+                choice = choices[0]
+                if choice.get("finish_reason"):
+                    finish_reason = choice.get("finish_reason")
+                delta = choice.get("delta") or {}
                 reasoning = _delta_reasoning(delta)
                 if reasoning:
                     round_reasoning += reasoning
                     yield {"type": "reasoning", "delta": reasoning}
-                text = getattr(delta, "content", None)
+                text = delta.get("content")
                 if text:
                     content += text
                     round_text += text
                     yield {"type": "content", "delta": text}
-                for tc in delta.tool_calls or []:
-                    idx = tc.index
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index") or 0
                     while len(calls) <= idx:
                         calls.append({"id": None, "type": "function", "name": "", "arguments": ""})
                     call = calls[idx]
-                    if tc.id:
-                        call["id"] = tc.id
-                    func = tc.function
-                    if func:
-                        if func.name:
-                            call["name"] = func.name
-                        if func.arguments:
-                            call["arguments"] += func.arguments
+                    if tc.get("id"):
+                        call["id"] = tc["id"]
+                    func = tc.get("function") or {}
+                    if func.get("name"):
+                        call["name"] = func["name"]
+                    if func.get("arguments"):
+                        call["arguments"] += func["arguments"]
 
             if round_reasoning:
                 last_reasoning = round_reasoning
@@ -468,28 +530,15 @@ async def _request_compact_once(client, input_items: list, turn: TurnConfig) -> 
     limit = min(turn.max_tokens or COMPACT_MAX_TOKENS, COMPACT_MAX_TOKENS)
     if api_type == "chat_completions":
         payload["max_tokens"] = limit
-        resp = await client.chat.completions.create(**payload)
-        logger.info("压缩请求 %s", _usage_note(getattr(resp, "usage", None)))
-        choice = resp.choices[0]
-        calls = getattr(choice.message, "tool_calls", None)
-        if calls:
-            return _render_calls(calls), "模型在压缩请求里调用了工具，没有给出摘要"
-        text = choice.message.content or ""
-        if not text.strip():
-            return "", _empty_output_error(
-                f"finish_reason={choice.finish_reason}" if choice.finish_reason else "", streamed=False
-            )
-        return text, ""
-    payload["max_output_tokens"] = limit
-    resp = await client.responses.create(**payload)
-    logger.info("压缩请求 %s", _usage_note(getattr(resp, "usage", None)))
-    calls = [o for o in (getattr(resp, "output", None) or [])
-             if getattr(o, "type", "") == "function_call"]
+    else:
+        payload["max_output_tokens"] = limit
+    resp = await client.request(payload, headers=_turn_headers(turn))
+    logger.info("压缩请求 %s", _usage_note(resp.get("usage")))
+    text, calls, why_empty = _non_stream_reply(resp, api_type)
     if calls:
         return _render_calls(calls), "模型在压缩请求里调用了工具，没有给出摘要"
-    text = resp.output_text or ""
     if not text.strip():
-        return "", f"模型没输出任何文本（{_response_status(resp)}）"
+        return "", _empty_output_error(why_empty, streamed=False)
     return text, ""
 
 
@@ -554,20 +603,21 @@ def _followup_item(turn: TurnConfig, text: str) -> dict:
 
 def _usage_note(usage) -> str:
     """把 usage 压成一行日志（缓存命中数的字段名各家不一，取不到就不写）。"""
-    if usage is None:
+    if not isinstance(usage, dict):
         return ""
-    data = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
-    prompt = data.get("prompt_tokens", data.get("input_tokens"))
-    cached = data.get("prompt_cache_hit_tokens")
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+    cached = usage.get("prompt_cache_hit_tokens")
     for key in ("prompt_tokens_details", "input_tokens_details"):
         if cached is None:
-            cached = (data.get(key) or {}).get("cached_tokens")
-    out = data.get("completion_tokens", data.get("output_tokens"))
+            details = usage.get(key)
+            cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    out = usage.get("completion_tokens", usage.get("output_tokens"))
     # 思考 token 也占输出上限：选项请求被压空时，这里是第一嫌疑人
     think = None
     for key in ("completion_tokens_details", "output_tokens_details"):
         if think is None:
-            think = (data.get(key) or {}).get("reasoning_tokens")
+            details = usage.get(key)
+            think = details.get("reasoning_tokens") if isinstance(details, dict) else None
     parts = []
     if prompt is not None:
         parts.append(f"prompt={prompt}")
@@ -592,45 +642,60 @@ async def _request_options_once(client, input_items: list, turn: TurnConfig) -> 
     limit = min(turn.max_tokens or OPTIONS_MAX_TOKENS, OPTIONS_MAX_TOKENS)
     if api_type == "chat_completions":
         payload["max_tokens"] = limit
-        resp = await client.chat.completions.create(**payload)
-        logger.info("选项请求 %s", _usage_note(getattr(resp, "usage", None)))
-        choice = resp.choices[0]
-        calls = getattr(choice.message, "tool_calls", None)
-        if calls:
-            return _render_calls(calls), "模型在选项请求里调用了工具，没有给出选项列表"
-        text = choice.message.content or ""
-        if not text.strip():
-            return "", _empty_output_error(
-                f"finish_reason={choice.finish_reason}" if choice.finish_reason else "", streamed=False
-            )
-        return text, ""
-    payload["max_output_tokens"] = limit
-    resp = await client.responses.create(**payload)
-    logger.info("选项请求 %s", _usage_note(getattr(resp, "usage", None)))
-    calls = [o for o in (getattr(resp, "output", None) or [])
-             if getattr(o, "type", "") == "function_call"]
+    else:
+        payload["max_output_tokens"] = limit
+    resp = await client.request(payload, headers=_turn_headers(turn))
+    logger.info("选项请求 %s", _usage_note(resp.get("usage")))
+    text, calls, why_empty = _non_stream_reply(resp, api_type)
     if calls:
         return _render_calls(calls), "模型在选项请求里调用了工具，没有给出选项列表"
-    text = resp.output_text or ""
     if not text.strip():
-        return "", f"模型没输出任何文本（{_response_status(resp)}）"
+        return "", _empty_output_error(why_empty, streamed=False)
     return text, ""
+
+
+def _non_stream_reply(resp: dict, api_type: str) -> tuple[str, list, str]:
+    """从非流式响应里取 (正文, 工具调用, 空输出原因)。
+
+    chat_completions 与 responses 的响应形状不同，但两个非流式调用（选项 / 压缩）对它们的
+    要求一样：要么给正文，要么说明为什么没有。
+    """
+    if api_type == "chat_completions":
+        choice = (resp.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        finish = choice.get("finish_reason")
+        why = f"finish_reason={finish}" if finish else ""
+        return message.get("content") or "", message.get("tool_calls") or [], why
+    calls = [o for o in (resp.get("output") or []) if o.get("type") == "function_call"]
+    return _output_text(resp), calls, _response_status(resp)
+
+
+def _output_text(resp: dict) -> str:
+    """Responses API 的 output_text：拼接 message 项里的 output_text 片段。"""
+    parts = []
+    for item in resp.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if part.get("type") == "output_text":
+                parts.append(part.get("text") or "")
+    return "".join(parts)
 
 
 def _render_calls(calls) -> str:
     """把工具调用渲染成文本：这是选项请求失败时最该被看到的东西。"""
     lines = []
     for c in calls:
-        fn = getattr(c, "function", None)
-        name = getattr(fn, "name", None) or getattr(c, "name", "")
-        args = getattr(fn, "arguments", None) or getattr(c, "arguments", "")
+        fn = c.get("function") or {}
+        name = fn.get("name") or c.get("name") or ""
+        args = fn.get("arguments") or c.get("arguments") or ""
         lines.append(f"{name}({args})")
     return "\n".join(lines)
 
 
-def _response_status(resp) -> str:
+def _response_status(resp: dict) -> str:
     """响应为什么没有文本：截断、被拒，还是模型什么都没说。"""
-    status = getattr(resp, "status", None) or "unknown"
-    details = getattr(resp, "incomplete_details", None)
-    reason = getattr(details, "reason", None) if details else None
+    status = resp.get("status") or "unknown"
+    details = resp.get("incomplete_details") or {}
+    reason = details.get("reason") if isinstance(details, dict) else None
     return f"status={status}, reason={reason}" if reason else f"status={status}"

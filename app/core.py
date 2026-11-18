@@ -20,35 +20,6 @@ PRESET_DIR = ROOT / "preset"
 GAMES_DIR = ROOT / "games"
 SESSIONS_DIR = ROOT / "sessions"
 
-# 附加工具的说明段（read_file 只在流程里点名，没有专段）
-_TOOL_PARAS = {
-    "write_file": """\
-write_file 用来写文件：默认整篇覆盖（文件不存在就新建，父目录自动创建），mode='append' 时追加到末尾；换行统一为 LF。相对路径以本会话角色卡所在目录为基准，也接受绝对路径。改文件里的局部内容请用 edit_file，不要整篇重写。""",
-    "edit_file": """\
-edit_file 用来把文件里的一段文字精确替换成另一段：old_string 必须与文件内容逐字一致（含缩进与空行），默认要求它在文件里唯一，否则报错要你给出更长的上下文；replace_all=True 时全部替换。不确定文件当前内容时先用 read_file 看一眼。""",
-    "bash": """\
-bash 在角色卡所在目录执行一段 shell 命令（Git Bash），返回退出码与合并后的输出（stdout 在前、stderr 在后）：适合批量处理文件、跑脚本、查环境这类事情。命令有超时上限（默认 60 秒，最多 600 秒），超时会被终止；不要用它跑需要交互输入的命令。""",
-    "web_search": """\
-web_search 用来联网搜索：按 query 搜网页，返回标题、链接、摘要、发布时间与权威性。涉及实时信息（新闻、版本号、价格、你不确定的事实）先搜再写，不要凭记忆编造。query 支持 site:/lang:/after: 这类搜索语法；一次搜索给不给正文由 need_content 决定，需要细节时一般先看摘要，再用 web_fetch 抓最相关的那一页。""",
-    "web_fetch": """\
-web_fetch 用来抓取单个网页并取回 Markdown 正文：先用 web_search 拿到真实链接再抓，不要凭猜测拼 URL。页面很长时只保留开头部分。""",
-}
-
-
-# PTC 模式的任务提示词：world_run 是唯一直接工具，read_file 等是代码内绑定。
-# 形态对齐 DeepSeek Harness 的 PTC 训练分布（单一代码执行工具 + 程序内绑定调用），
-# 叙事仍是普通文本输出。
-# 绑定清单按预设的 tools 白名单裁剪（启用什么列什么）。
-_PTC_BINDING_DOCS = {
-    "read_file": "- read_file(file_path: str, offset: int = 1, limit: int = 2000)：读取 UTF-8 文本文件（玩家提供的设定文档、笔记等），内容返回到当次日志；大文件用 offset/limit 分页。",
-    "write_file": "- write_file(file_path: str, content: str = '', mode: str = 'overwrite')：写 UTF-8 文本文件（overwrite 整篇覆盖/新建，append 追加到末尾，父目录自动创建），相对路径以角色卡所在目录为基准。",
-    "edit_file": "- edit_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False)：把文件里的一段文字精确替换成另一段，old_string 必须与文件内容逐字一致且默认唯一。",
-    "bash": "- bash(command: str, timeout: int = 60)：执行一段 shell 命令（Git Bash），返回退出码与合并后的输出，timeout 最多 600 秒。",
-    "web_search": "- web_search(query: str, count: int = 10, need_content: bool = False)：联网搜索网页，返回标题/链接/摘要（need_content=True 时附带正文），用于实时信息。",
-    "web_fetch": "- web_fetch(url: str)：抓取单个网页并以 Markdown 返回正文，url 必须是含主机名的 http/https 地址。",
-}
-
-
 # 选项请求的默认指令：未在预设里写 <preset_options> 时回退到这份文本，保证旧预设行为不变。
 # 预设定义后整段替换（见 options_instruction），所以这里同时是格式规范的参考实现。
 # 必须与正文请求共用同一份 config，保证缓存命中。

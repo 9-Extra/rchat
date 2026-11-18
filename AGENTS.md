@@ -26,7 +26,8 @@
 | `main.py` | 参数、启动期 config 校验、uvicorn、keep-awake |
 | `app/config.py` | `Settings`（config.yaml 快照，按 mtime 缓存）与 `TurnConfig`（一次请求实际生效的值）；**默认值只在这里定义** |
 | `app/core.py` | 预设解析与宏渲染、工具 schema 与白名单、`build_input` 上下文拼装、会话与落盘（`create_session` / `session_key` / `_atomic_write_text`）、压缩切点 `compact_cut` |
-| `app/llm.py` | 正文工具循环与选项请求，两种 `api_type` 的实现 |
+| `app/llm.py` | 正文工具循环与选项请求，两种 `api_type` 的实现（请求/响应都是普通 dict） |
+| `app/llm_transport.py` | 手写 HTTP + SSE 传输层：URL 拼装、重试、流内错误、把 `data:` 解成 dict |
 | `app/server.py` | 端点、SSE 转发、会话锁与并发槽位、鉴权中间件 |
 | `app/tools.py` | 工具分发；文件工具、bash、联网工具 |
 | `app/world.py` | world_run 的持久 exec 命名空间、快照（含压缩后的平移）、PTC 绑定 |
@@ -52,6 +53,7 @@
 - 一轮生成跑在会话级后台任务（`_active[会话键]`）里，HTTP 与生成解耦：断开连接只中断转发，生成照旧跑完落盘；重连靠 `/stream` 重放事件（幂等，可多客户端同时接）。别把生成塞进请求生命周期。
 - 生成与改会话（回滚 / 编辑 AI 块 / 换预设 / 改参数 / fork / 删除）互斥：这些端点必须是 `async def`，和 `_generate` 共用 `server._lock_for(键)`。`_generate` 在锁里完成「查 `_active` + `_prepare` + 注册」，所以没有「检查过了但还没注册」的抢跑窗口。**锁内不许 `await`**（会让出控制权），流式转发不持锁。
 - 全局并发槽位 `_generation_sem` 控制同时打上游的生成数，多人同时发是排队。
+- LLM 客户端按端点缓存（`llm._get_client`），正文 / 选项 / 压缩共用连接池；`_make_client` 返回的是「退出不关闭」的租约，进程退出由 `server` 的 lifespan 调 `close_clients()`。流式读到 `[DONE]` 后要把剩余字节 drain 到 EOF，连接才会回池——提前 break 会让下一次请求重新握手（`llm_transport` 里 `_drain_and_close` 负责这件事，上限 2s）。
 - 失败也要落盘半截结果（正文或占位、已执行的 tool_calls、思考链），并让 world 状态与历史对齐。
 
 ### 工具与世界状态
@@ -84,7 +86,7 @@
 | 模型把自己的正文读了好几遍 | `chat_completions` 每轮回放只带**本轮新增**正文；`content` 是跨轮累积量。 |
 | 同一段思考回放多遍 | `responses` 侧同一段思考只放在它带来的第一个调用前（`prev_reasoning` 去重）。 |
 | 抓不到思考链 | 字段依次 `reasoning_content`（deepseek 等）→ `reasoning`（OpenRouter 归一化）→ `reasoning_details`（结构化块，跳过 encrypted），按序取第一个有文本的；OpenRouter 会同时发前两个，所以不能合并。回传统一用 `reasoning_content`。 |
-| `reasoning_effort: none` 直接当 kwarg 传 | TypeError，一行都发不出去。只能经 `extra_body={"thinking": {"type": "disabled"}}` 透传。 |
+| `reasoning_effort: none` 直接发 `reasoning.effort = none` | OpenRouter 上部分端会 400（强制思考）。禁用思考一律发厂商私有的 `thinking: {"type": "disabled"}`（deepseek 官方、OpenRouter、kimicode 都认），直接并进请求体即可。 |
 | 选项请求缓存命中率从 98% 掉到个位数 | 必须与正文共用同一份 `TurnConfig`（同 model / tools / thinking），且不加 `response_format`；别单独压低思考。指令放请求末尾，替换它不影响前缀。 |
 | 页面上冒出假选项按钮 | 解析器只认行首 `-` / `*` / `•` / `·` 或编号，前言后记代码围栏一律丢弃，**不做宽松兜底**。失败会重发一次，仍失败则记 `options_error` + `options_raw`，正文照常落盘。 |
 | 新建会话后前端找不到它 | 裸会话名里带 `/` 会被当成作用域前缀，会话落进 `sessions/<前半截>/`。归一化只在 `create_session`。 |

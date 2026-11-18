@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -11,7 +12,13 @@ from pydantic import BaseModel
 
 from app import auth, core, tools, world
 from app.config import COMPACT_KEEP_TURNS_MAX
-from app.llm import build_request, generate_options, generate_summary, stream_body
+from app.llm import (
+    build_request,
+    close_clients,
+    generate_options,
+    generate_summary,
+    stream_body,
+)
 
 logger = logging.getLogger("airp")
 
@@ -20,7 +27,15 @@ STATIC = core.ROOT / "app" / "static"
 # 单页应用、文件少且常改：禁用缓存，避免浏览器拿旧版 JS
 NO_CACHE = {"Cache-Control": "no-cache"}
 
-app = FastAPI(title="AIRP")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    # 关掉按端点缓存的 LLM 客户端，断开 keep-alive 连接（正常退出时不留悬挂连接）
+    await close_clients()
+
+
+app = FastAPI(title="AIRP", lifespan=_lifespan)
 
 # 未登录也能访问的接口：登录本身，以及前端用来判断「要不要显示登录页」的自身状态
 PUBLIC_PATHS = {"/api/login", "/api/me"}

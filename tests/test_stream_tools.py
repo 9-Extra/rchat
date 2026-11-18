@@ -10,8 +10,8 @@
 4. 被输出上限截断、或上游发来 response.incomplete 时，报错要说出原因，而不是笼统的
    「模型未输出任何内容」。
 
-全部离线：假客户端只吐事件对象，`run_tool` 默认只记录（不执行）。只有最后一条用例真的走一遍
-tools.execute_tool，读本仓库自己的文件。
+全部离线：假客户端只吐 SSE 解出来的 dict 事件，`run_tool` 默认只记录（不执行）。只有最后
+一条用例真的走一遍 tools.execute_tool，读本仓库自己的文件。
 """
 import json
 import pathlib
@@ -31,39 +31,24 @@ USER_ITEM = [{"role": "user", "content": "看看"}]
 USER_INPUT_ITEM = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "看看"}]}]
 
 
-class Obj:
-    """最小事件对象：属性取不到返回 None，同时支持下标与 .get()（对应 SDK 对象的两种读法）。"""
-
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-    def __getattr__(self, name):
-        return None
-
-    def get(self, name, default=None):
-        return self.__dict__.get(name, default)
-
-    def __getitem__(self, name):
-        return self.__dict__[name]
-
-
 def _chunk(delta=None, finish_reason=None):
     """一条 chat_completions 流式分片。"""
-    return Obj(choices=[Obj(delta=Obj(**(delta or {})), finish_reason=finish_reason)])
+    return {"choices": [{"delta": delta or {}, "finish_reason": finish_reason}]}
 
 
 def _call(index, id=None, name=None, arguments=None):
     """delta.tool_calls 里的一项。"""
-    return Obj(index=index, id=id, type="function", function=Obj(name=name, arguments=arguments))
+    return {"index": index, "id": id, "type": "function",
+            "function": {"name": name, "arguments": arguments}}
 
 
 def _ev(etype, **kw):
-    """一条 responses 流式事件。"""
-    return Obj(type=etype, **kw)
+    """一条 responses 流式事件（JSON dict，真实 SSE 解出来就是这样）。"""
+    return {"type": etype, **kw}
 
 
 class _Stream:
-    """把一批事件包成异步可迭代对象（SDK 的流也是这么用的：async for）。"""
+    """把一批事件包成异步可迭代对象（对应 transport 的 stream()）。"""
 
     def __init__(self, events):
         self.events = list(events)
@@ -78,15 +63,22 @@ class _Stream:
 
 
 class _Replay:
-    """按次数回放预先写好的一批批事件，并记下每次请求带了什么。"""
+    """假的 LLMClient：按次数回放预先写好的一批批事件，并记下每次请求。"""
 
     def __init__(self, *rounds):
         self.rounds = list(rounds)
-        self.requests = []
+        self.requests = []  # 上下文项（messages / input），既有用例的读法
+        self.bodies = []  # 完整请求体，供 body 形状断言
 
-    def __call__(self, **kwargs):
-        # messages 是 chat_completions 的输入字段，input 是 responses 的
-        self.requests.append(kwargs.get("messages", kwargs.get("input")))
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, payload, headers=None):
+        self.bodies.append(payload)
+        self.requests.append(payload.get("messages", payload.get("input")))
         return _Stream(self.rounds.pop(0))
 
     @property
@@ -106,13 +98,7 @@ class _Collect:
         return f"结果 {len(self.calls)}"
 
     async def drive(self, turn, replay, input_items=None):
-        client = mock.MagicMock()
-        client.chat.completions.create = mock.AsyncMock(side_effect=replay)
-        client.responses.create = mock.AsyncMock(side_effect=replay)
-        cm = mock.MagicMock()
-        cm.__aenter__ = mock.AsyncMock(return_value=client)
-        cm.__aexit__ = mock.AsyncMock(return_value=False)
-        with mock.patch.object(llm, "_make_client", lambda turn: cm):
+        with mock.patch.object(llm, "_make_client", lambda turn: replay):
             async for event in llm.stream_body(
                 input_items if input_items is not None else USER_ITEM, turn, self.run_tool
             ):
@@ -183,18 +169,18 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _responses_calls_round():
         return [
-            _ev("response.output_item.added", item=Obj(id="rs_1", type="reasoning")),
+            _ev("response.output_item.added", item={"id": "rs_1", "type": "reasoning"}),
             _ev("response.reasoning_text.delta", item_id="rs_1", delta="要查两处。"),
             _ev("response.output_item.added",
-                item=Obj(id="fc_1", type="function_call", call_id="c1", name="read_file")),
+                item={"id": "fc_1", "type": "function_call", "call_id": "c1", "name": "read_file"}),
             _ev("response.output_item.added",
-                item=Obj(id="fc_2", type="function_call", call_id="c2", name="read_file")),
+                item={"id": "fc_2", "type": "function_call", "call_id": "c2", "name": "read_file"}),
             _ev("response.function_call_arguments.delta", item_id="fc_1", delta='{"file_path": "a'),
             _ev("response.function_call_arguments.delta", item_id="fc_2", delta='{"file_path": "b'),
             _ev("response.function_call_arguments.delta", item_id="fc_1", delta='.py"}'),
             _ev("response.function_call_arguments.delta", item_id="fc_2", delta='.py"}'),
-            _ev("response.output_item.done", item=Obj(id="fc_1", arguments='{"file_path": "a.py"}')),
-            _ev("response.output_item.done", item=Obj(id="fc_2", arguments='{"file_path": "b.py"}')),
+            _ev("response.output_item.done", item={"id": "fc_1", "arguments": '{"file_path": "a.py"}'}),
+            _ev("response.output_item.done", item={"id": "fc_2", "arguments": '{"file_path": "b.py"}'}),
         ]
 
     async def test_responses_batches_two_calls(self):
@@ -202,7 +188,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
         replay = _Replay(
             self._responses_calls_round(),
             [
-                _ev("response.output_item.added", item=Obj(id="msg_1", type="message")),
+                _ev("response.output_item.added", item={"id": "msg_1", "type": "message"}),
                 _ev("response.output_text.delta", item_id="msg_1", delta="看完了。"),
             ],
         )
@@ -229,7 +215,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_responses_incomplete_round_names_reason(self):
         """response.incomplete：流是正常结束的，只有这个事件说得清为什么没内容。"""
-        incomplete = Obj(status="incomplete", incomplete_details=Obj(reason="max_output_tokens"))
+        incomplete = {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
         col = _Collect()
         with self.assertRaises(RuntimeError) as ctx:
             await col.drive(tests.support.make_turn("responses"),

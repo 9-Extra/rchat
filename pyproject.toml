@@ -8,7 +8,6 @@ dependencies = [
     "uvicorn",
     "httpx",
     "pyyaml",
-    "openai>=3.0.0",
 ]
 
 [[tool.uv.index]]
