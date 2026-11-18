@@ -573,7 +573,7 @@ async def _tail(gen: dict):
 
 
 def _persist(name, history, mode, user_input, draft, content, options, reasoning,
-             tool_calls, error=None, options_error=None, options_raw=None):
+             tool_calls, error=None, options_error=None, options_raw=None, interrupted=None):
     """把本轮结果落盘。
 
     用户块不在这里追加：_prepare 开局时就把它写进 history 了（这样进程被 kill 也不丢
@@ -594,6 +594,10 @@ def _persist(name, history, mode, user_input, draft, content, options, reasoning
     # 失败时模型实际产出的原文(build_input 同样忽略,不进模型上下文),前端折叠显示
     if options_raw:
         entry["options_raw"] = options_raw
+    # 用户打断:记录打断发生在正文还是选项阶段,前端据此就地给重试按钮。
+    # 与 error/options_error 一样只供前端显示,build_input 回放忽略,不进模型上下文。
+    if interrupted:
+        entry["interrupted"] = interrupted
     # 本轮的 world_run/read_file 调用,重放上下文时用
     if tool_calls:
         entry["tool_calls"] = tool_calls
@@ -663,6 +667,7 @@ async def _run(gen: dict, prep: dict) -> None:
     tail_reasoning = ""
     streaming_started = False
     acquired = False
+    options_started = False  # 是否已进入选项阶段（打断时据此标注 interrupted=body/options）
     try:
         # 全局并发上限：排队等一个槽位再发请求（等待期间被打断走下面的 CancelledError 分支）。
         # 这里不做超时/拒绝——朋友间的小服务器，排队比报错友好。
@@ -699,6 +704,7 @@ async def _run(gen: dict, prep: dict) -> None:
         # 选项提示词由预设的 <preset_options> 渲染，可能因空块/宏报错而构建失败；那也
         # 只是选项没拿到，正文已经流完并会照常落盘（错误进 options_error）。
         if prep["options_enabled"]:
+            options_started = True
             _emit(gen, {"type": "options_start"})
             try:
                 options_input = core.build_options_input(
@@ -735,7 +741,7 @@ async def _run(gen: dict, prep: dict) -> None:
         # 助手块已落盘：前端据此把流式块就地定稿（没有这个事件时按快照重建）
         _emit(gen, {"type": "saved", "index": len(history) - 1})
     except asyncio.CancelledError:
-        # 用户打断：半截输出落盘，由用户手动回滚或修改
+        # 用户打断：半截输出落盘，由用户手动回滚、修改或就地重试
         if streaming_started:
             _persist(
                 name,
@@ -747,6 +753,8 @@ async def _run(gen: dict, prep: dict) -> None:
                 [],
                 tail_reasoning,
                 tool_calls,
+                # 选项阶段被打断时正文已完整落盘，只是选项没拿到；正文阶段则是半截。
+                interrupted="options" if options_started else "body",
             )
             # 半截回合已进历史,其世界状态改动一并提交,保持叙事与状态一致
             world.commit_turn(name, len(history))

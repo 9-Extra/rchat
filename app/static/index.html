@@ -103,13 +103,20 @@
   .block .content.markdown hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
   .errnote { color: #e07a5f; font-size: 13px; line-height: 1.6; margin-bottom: 8px; padding: 6px 10px; background: rgba(224,122,95,.08); border-left: 3px solid #e07a5f; border-radius: 0 6px 6px 0; }
   .options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+  .opt-item { display: inline-flex; max-width: 100%; }
   .options button { background: #253047; border-color: #35466b; color: #a9c4f5; font-size: 12px; border-radius: 20px; padding: 4px 14px; max-width: 100%; white-space: normal; text-align: left; }
   .options button:hover { background: #2c3a58; border-color: #4a5f8f; }
+  .options .opt-text { border-radius: 20px 0 0 20px; padding-right: 8px; min-width: 0; }
+  .options .opt-send { border-radius: 0 20px 20px 0; padding: 4px 11px 4px 9px; border-left-color: #4a5f8f; font-size: 11px; color: #8fb0ee; }
+  .options .opt-send:hover { background: #37548c; border-color: #5c79b5; color: #e6f0ff; }
   .options-pending, .options-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); color: var(--dim); font-size: 12px; }
   .options-error button { font-size: 12px; padding: 2px 9px; background: rgba(35,38,46,.9); }
   .options-raw { flex-basis: 100%; background: #1a1c23; border: 1px solid #2a2d38; border-radius: 8px; padding: 7px 12px; }
   .options-raw summary { color: #8198bd; font-size: 12px; cursor: pointer; }
   .options-raw .raw { white-space: pre-wrap; word-break: break-word; color: #9095a0; font-size: 13px; margin-top: 8px; line-height: 1.7; max-height: 320px; overflow: auto; }
+  .retry-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+  .retry-bar button { font-size: 12px; padding: 4px 12px; background: #3a2a2a; border-color: #6b4040; color: #f0b0b0; }
+  .retry-bar button:hover:not(:disabled) { background: #4a3030; border-color: #8a5050; }
   details.thinking { margin-bottom: 10px; background: #191b20; border: 1px solid #26282f; border-radius: 8px; padding: 7px 12px; }
   details.thinking summary { color: #7a9b7a; font-size: 12px; cursor: pointer; }
   details.thinking div { white-space: pre-wrap; color: #9095a0; font-size: 13px; margin-top: 8px; line-height: 1.7; }
@@ -120,13 +127,20 @@
   .edittext { width: 100%; min-height: 140px; background: #17191e; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-family: inherit; line-height: 1.7; font-size: 14px; }
 
   #composer { border-top: 1px solid var(--border); padding: 14px 24px 16px; background: var(--panel); }
-  #composerInner { margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  #composerInner { margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; position: relative; }
   #input { flex: 1; resize: none; min-height: 68px; max-height: 320px; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-family: inherit; line-height: 1.6; font-size: 14px; overflow-y: auto; }
   #input:focus { outline: none; border-color: var(--accent); }
   #send { min-height: 68px; padding: 0 26px; font-size: 14px; background: #2b3a55; border-color: #3d5279; color: #cfe0ff; align-self: stretch; }
   #send:hover:not(:disabled) { background: #34496b; }
   #send.interrupting { background: #4a2b2b; border-color: #6b3a3a; color: #f0b0b0; }
   #send.interrupting:hover { background: #5a3535; }
+  #moreBtn { min-height: 68px; width: 46px; padding: 0; align-self: stretch; font-size: 20px; line-height: 1; color: var(--dim); flex: none; }
+  #moreBtn:hover:not(:disabled) { color: var(--text); background: #2e323c; }
+  #moreMenu { position: absolute; bottom: calc(100% - 4px); right: 96px; z-index: 15; width: 260px; background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 5px; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  .more-item { display: block; width: 100%; text-align: left; padding: 9px 11px; border: none; border-radius: 6px; background: transparent; color: var(--text); font-size: 13px; line-height: 1.4; }
+  .more-item span { display: block; color: var(--dim); font-size: 11px; margin-top: 3px; }
+  .more-item:hover:not(:disabled) { background: #2e3a54; }
+  .more-item:disabled { opacity: .4; }
   #emptyHint { color: #565a64; text-align: center; margin-top: 60px; font-size: 14px; }
 
   #modalMask { position: fixed; inset: 0; background: rgba(0,0,0,.65); display: none; align-items: center; justify-content: center; }
@@ -260,7 +274,13 @@
     <div id="composer" style="display:none">
       <div id="composerInner">
         <textarea id="input" placeholder="输入你的行动或对话…（Ctrl+Enter 发送）"></textarea>
+        <button id="moreBtn" title="更多操作" aria-haspopup="menu" aria-expanded="false">⋯</button>
         <button id="send">发送</button>
+        <div id="moreMenu" role="menu" style="display:none">
+          <button class="more-item" role="menuitem" data-act="regenerate">重新输出本轮<span>重跑最后一轮正文</span></button>
+          <button class="more-item" role="menuitem" data-act="options">重新生成选项<span>只重问选项，正文不动</span></button>
+          <button class="more-item" role="menuitem" data-act="compact">压缩上下文<span>带要求用 /compact</span></button>
+        </div>
       </div>
     </div>
   </main>
@@ -611,8 +631,37 @@ function renderEndpointSelect() {
   });
 }
 
+function closeMoreMenu() {
+  const m = $('moreMenu');
+  if (m.style.display !== 'none') m.style.display = 'none';
+  $('moreBtn').setAttribute('aria-expanded', 'false');
+}
+
+// 菜单项置灰与发送按钮共用同一套状态：生成/压缩/切换/对账期间一律不可用并收起菜单。
+// 各项的可用条件跟对应端点一致（见 server._prepare / _prepare_options / compact）。
+function syncMoreMenu() {
+  const last = cur && cur.history[cur.history.length - 1];
+  const locked = selecting || compacting || streaming || finalizing || reconnecting ||
+    !!(cur && cur.generating);
+  $('moreBtn').disabled = locked || !cur;
+  if (locked) closeMoreMenu();
+  const isAI = !!last && last.role === 'assistant';
+  const allow = {
+    // 摘要块不能重新输出（会把整段前情从空历史重开）
+    regenerate: !locked && isAI && !last.compacted,
+    // 摘要块天然支持重掷选项；只要求末块是 AI 且开了选项开关
+    options: !locked && isAI && !!cur.options_enabled,
+    // 压缩要求末块是 AI（和后端 compact 的切点约束一致）
+    compact: !locked && isAI,
+  };
+  for (const item of $('moreMenu').querySelectorAll('.more-item')) {
+    item.disabled = !allow[item.getAttribute('data-act')];
+  }
+}
+
 function updateComposer() {
   if (!cur) return;
+  syncMoreMenu();
   // 空历史 = 等待点击「开始」；最后一块是 AI = 等待用户输入；
   // 最后一块是用户块 = 这一轮还没写出来（生成被打断在落盘前、或进程重启过），点「继续」补回来
   const last = cur.history[cur.history.length - 1];
@@ -645,7 +694,9 @@ function updateComposer() {
     btn.textContent = !started ? '开始' : (resumable ? '继续' : '发送');
     btn.disabled = !(waiting || resumable);
   }
-  $('input').disabled = busy || !started || !waiting;
+  // 生成期间也放行输入：打字只动本地 DOM，不会触发请求；真正发送仍由「单会话单轮生成」
+  // 约束把关（busy 时发送按钮是「打断」）。resumable（末块是 user）静止时仍禁用，避免发到错位上下文。
+  $('input').disabled = !started || (!waiting && !busy);
 }
 
 function makeOpsBtn(text, fn) {
@@ -654,15 +705,52 @@ function makeOpsBtn(text, fn) {
   return b;
 }
 
+// 失败/被打断的末块在末尾就地给重试入口。只对末块有意义：
+// regenerate / regenerateOptions 的后端校验都要求历史最后是 AI 块，对更早的块调用会重掷错对象。
+// 正文侧：error(生成失败) 或 interrupted==='body'(正文阶段被打断)；
+// 选项侧：options_error(选项失败) 或 interrupted==='options'(选项阶段被打断)。
+function appendRetryBar(div, e, i) {
+  const old = div.querySelectorAll('.retry-bar');
+  for (let k = old.length - 1; k >= 0; k--) old[k].remove();
+  if (i !== cur.history.length - 1) return;
+  const bodyBad = !!e.error || e.interrupted === 'body';
+  const optionsBad = !!e.options_error || e.interrupted === 'options';
+  if (!bodyBad && !optionsBad) return;
+  const bar = document.createElement('div');
+  bar.className = 'retry-bar';
+  if (bodyBad) bar.appendChild(makeOpsBtn('重新输出本轮', regenerate));
+  if (optionsBad && cur.options_enabled) bar.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
+  div.appendChild(bar);
+}
+
 // 剧情推进选项按钮：历史块与流式渲染共用
+// 主体点击 = 把选项文本新起一行追加到输入框，玩家可继续编辑；末尾 ▲ = 用该选项立即发送
+function appendOption(text) {
+  const ta = $('input');
+  const cur = ta.value;
+  ta.value = cur && !cur.endsWith('\n') ? cur + '\n' + text : cur + text;
+  autoGrow();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
 function optionsDiv(options) {
   const opts = document.createElement('div');
   opts.className = 'options';
   options.forEach(o => {
-    const b = document.createElement('button');
-    b.textContent = o;
-    b.onclick = () => { $('input').value = o; send(); };
-    opts.appendChild(b);
+    const item = document.createElement('span');
+    item.className = 'opt-item';
+    const body = document.createElement('button');
+    body.className = 'opt-text';
+    body.textContent = o;
+    body.onclick = () => appendOption(o);
+    const fire = document.createElement('button');
+    fire.className = 'opt-send';
+    fire.textContent = '▲';
+    fire.title = '立即发送该选项';
+    fire.onclick = () => { $('input').value = o; send(); };
+    item.appendChild(body);
+    item.appendChild(fire);
+    opts.appendChild(item);
   });
   return opts;
 }
@@ -674,7 +762,7 @@ function optionsErrorDiv(message, raw) {
   const span = document.createElement('span');
   span.textContent = `〔选项生成失败〕${message}`;
   d.appendChild(span);
-  d.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
+  // 「重新生成选项」按钮统一由 appendRetryBar 在块末尾给出，这里不再重复放。
   if (raw) d.appendChild(optionsRawDetails(raw));
   return d;
 }
@@ -787,6 +875,7 @@ function fillAIBlock(div, e, i) {
   if (e.options && e.options.length) div.appendChild(optionsDiv(e.options));
   if (e.options_error) div.appendChild(optionsErrorDiv(e.options_error, e.options_raw));
   fillAIOps(div, e, i);
+  appendRetryBar(div, e, i);
   div._sig = entrySig(e);
 }
 
@@ -797,8 +886,9 @@ function makeAIBlock(e, i) {
   return div;
 }
 
-function aiOpsSig(i) {
-  return i + '|' + (i === cur.history.length - 1 ? 1 : 0) + '|' + (cur.options_enabled ? 1 : 0);
+function aiOpsSig() {
+  // ops 现在只放与块身份绑定的操作（修改/压缩前记录），不随「是否末块」「选项开关」变化。
+  return '1';
 }
 
 function fillAIOps(div, e, i) {
@@ -810,27 +900,14 @@ function fillAIOps(div, e, i) {
     await api(`/api/sessions/${enc()}/edit_ai`, post({ index: i, content: text, options: e.options || [] }));
     await refreshSession();
   })));
-  // 压缩生成的摘要块：不给「重新输出」（会把整段前情删掉从空历史重开）。它是 keep_turns=0
-  // 时的「最后一轮」，所以照样能只重掷选项；另给一个通往压缩前完整记录的入口。
-  if (e.compacted) {
-    if (i === cur.history.length - 1 && cur.options_enabled)
-      ops.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
-    if (e.archive) {
-      ops.appendChild(makeOpsBtn('压缩前记录', () => selectSession(e.archive)));
-    }
-    div.appendChild(ops);
-    div._opsSig = aiOpsSig(i);
-    return;
+  // 压缩生成的摘要块：保留通往压缩前完整记录的入口。重掷选项已移到 composer 菜单。
+  if (e.compacted && e.archive) {
+    ops.appendChild(makeOpsBtn('压缩前记录', () => selectSession(e.archive)));
   }
-  // 只允许最后一个 AI 块重新输出
-  if (i === cur.history.length - 1) {
-    ops.appendChild(makeOpsBtn('重新输出', regenerate));
-    // 开了选项开关时，最后一轮还能只重掷选项（正文不动）
-    if (cur.options_enabled)
-      ops.appendChild(makeOpsBtn('重新生成选项', regenerateOptions));
-  }
+  // 重新输出 / 重新生成选项不再挂在每个块的悬浮 ops 上：
+  // 统一走 composer 的「更多操作」菜单；失败/打断时在该块末尾就地给重试入口（见 retryBarFor）。
   div.appendChild(ops);
-  div._opsSig = aiOpsSig(i);
+  div._opsSig = aiOpsSig();
 }
 
 function makeUserBlock(e, i) {
@@ -867,7 +944,7 @@ function fillUserOps(div, i) {
 function updateBlock(node, e, i) {
   if (e.role === 'assistant') {
     if (node._sig !== entrySig(e)) fillAIBlock(node, e, i);
-    else if (node._opsSig !== aiOpsSig(i)) fillAIOps(node, e, i);
+    else if (node._opsSig !== aiOpsSig()) fillAIOps(node, e, i);
   } else {
     if (node._content !== e.content) {
       node._content = e.content;
@@ -1176,6 +1253,7 @@ function finalizeTurn(s, ov, seq) {
       directChild(div, 'tag').textContent = 'AI';
       restoreOptionsArea(div, last);
       fillAIOps(div, last, h.length - 1);
+      appendRetryBar(div, last, h.length - 1);
       const btns = div.querySelectorAll('button');
       for (let k = 0; k < btns.length; k++) btns[k].disabled = false;
       div._sig = entrySig(last);
@@ -1193,6 +1271,7 @@ function finalizeTurn(s, ov, seq) {
       syncErrorNote(div, last.error);
       restoreOptionsArea(div, last);
       fillAIOps(div, last, i);
+      appendRetryBar(div, last, i);
       div._sig = entrySig(last);
       if (ov.userDiv) {
         ov.userDiv.classList.remove('live');
@@ -1353,17 +1432,31 @@ async function runCompact(extra) {
   await compactStream(`/api/sessions/${enc()}/compact`, post({ instruction: extra || '' }));
 }
 
+// 斜杠指令在前端解析，不进 /chat。以 / 开头一律视为指令：未知指令报错、不发送，
+// 并保留输入框内容供修改；/compact 后可跟补充要求，例如「/compact 保留人物关系，忽略战斗细节」。
+// 返回 true 表示这条输入已被当作指令消费（无论合法与否），send() 不应再往下发。
+function handleSlashCommand(raw) {
+  const text = raw.trim();  // 兼容指令前带空格/换行（粘贴、缩进等）；解析只看这条规整后的串
+  if (!text.startsWith('/')) return false;
+  const m = text.match(/^\/(\S+)(?:\s+([\s\S]*))?$/);
+  const name = (m ? m[1] : '').toLowerCase();
+  const extra = m && m[2] ? m[2].trim() : '';
+  if (name === 'compact') {
+    $('input').value = '';
+    autoGrow();
+    runCompact(extra);
+  } else {
+    alert(`未知指令「/${name || text.slice(1).trim()}」。当前仅支持 /compact [补充要求]，已取消发送。`);
+  }
+  return true;
+}
+
 function send() {
   const text = $('input').value.trim();
   if (!text || selecting || streaming || finalizing || reconnecting || cur.generating) return;
+  if (handleSlashCommand(text)) return;
   $('input').value = '';
   autoGrow();
-  // 斜杠指令在前端解析（以后直接加个「压缩」按钮也走这里）：
-  // /compact 后面可以跟补充要求，例如「/compact 保留人物关系，忽略战斗细节」
-  if (text === '/compact' || text.startsWith('/compact ')) {
-    runCompact(text.slice('/compact'.length).trim());
-    return;
-  }
   if (!cur.history.length) return; // 首轮用「开始」
   reconnectTries = 0;
   streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }), text);
@@ -1402,6 +1495,35 @@ $('send').onclick = () => {
   else if (last.role === 'user') regenerate();  // 末尾是用户块：把这一轮补出来
   else send();
 };
+
+// composer 的「更多操作」菜单：toggle / 点菜单项执行 / 点外部或 Esc 关闭。
+$('moreBtn').onclick = e => {
+  e.stopPropagation();
+  if ($('moreBtn').disabled) return;
+  const m = $('moreMenu');
+  const open = m.style.display !== 'none';
+  if (open) { closeMoreMenu(); return; }
+  syncMoreMenu();  // 打开前刷新一次可用态
+  m.style.display = 'block';
+  $('moreBtn').setAttribute('aria-expanded', 'true');
+};
+$('moreMenu').onclick = e => {
+  const item = e.target.closest('.more-item');
+  if (!item || item.disabled) return;
+  e.stopPropagation();
+  closeMoreMenu();
+  const act = item.getAttribute('data-act');
+  if (act === 'regenerate') regenerate();
+  else if (act === 'options') regenerateOptions();
+  else if (act === 'compact') runCompact('');
+};
+document.addEventListener('click', e => {
+  if ($('moreMenu').style.display !== 'none' &&
+      !e.target.closest('#moreMenu') && !e.target.closest('#moreBtn')) closeMoreMenu();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeMoreMenu();
+});
 $('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); $('send').click(); }
 });
