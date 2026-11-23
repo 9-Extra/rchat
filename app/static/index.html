@@ -75,10 +75,16 @@
   .block.ai { border-left: 3px solid var(--ai); }
   .block.user { border-left: 3px solid var(--accent); background: #1c2230; }
   .block.beginning { border-left: 3px solid var(--gold); }
+  .block.opening { border-left: 3px dashed var(--accent); background: #1a1f2b; }
   .block .tag { font-size: 12px; color: var(--dim); margin-bottom: 8px; letter-spacing: .5px; }
   .block.ai .tag { color: var(--ai); }
   .block.user .tag { color: var(--accent); }
   .block.beginning .tag { color: var(--gold); }
+  .block.opening .tag { color: var(--accent); }
+  .beginnings-hint { max-width: 840px; margin: 0 auto 12px; padding: 0 18px; color: var(--dim); font-size: 13px; line-height: 1.6; }
+  .beginning-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .beginning-actions button { font-size: 12px; padding: 3px 12px; }
+  .beginning-actions .beg-start { background: #253047; border-color: #35466b; color: #a9c4f5; }
   .block .ops { position: absolute; top: 10px; right: 12px; display: flex; gap: 6px; opacity: 0; transition: opacity .15s; }
   .block:hover .ops { opacity: 1; }
   .block .ops button { font-size: 12px; padding: 2px 9px; background: rgba(35,38,46,.9); }
@@ -293,7 +299,6 @@
     <div><label>名称（留空自动生成）</label><input type="text" id="mName"></div>
     <div><label>角色卡</label><select id="mCard"></select></div>
     <div><label>预设</label><select id="mPreset"></select></div>
-    <div><label>开局</label><select id="mBeginning"></select></div>
     <div class="row"><button id="mCancel">取消</button><button id="mCreate">创建</button></div>
   </div>
 </div>
@@ -503,12 +508,18 @@ async function selectSession(id) {
 }
 
 // ---------- 渲染 ----------
-// 每个块有稳定 key：beginning / user:<i> / assistant:<i>。同一会话内只用 reconcileSession
+// 每个块有稳定 key：beginning:<i> / opening / user:<i> / assistant:<i>。同一会话内只用 reconcileSession
 // 做增量 patch，不重建没变的节点——滚动位置、展开的 details、文本选区、编辑中的 textarea
 // 才不会被数据刷新一起冲掉。
 
 function blockKey(e, i) {
   return (e.role === 'assistant' ? 'assistant:' : 'user:') + i;
+}
+
+// 未开始（没有 history、也还没有开场输入）且有开局候选：显示开局块，否则显示开场输入/历史
+function showBeginnings() {
+  return !!(cur.card_beginnings && cur.card_beginnings.length
+    && !cur.history.length && !cur.opening_input);
 }
 
 function syncErrorBar() {
@@ -559,12 +570,21 @@ function renderAll(toBottom) {
   $('keepTurnsInput').value = cur.compact_keep_turns ?? '';
   const chat = $('chat');
   chat.innerHTML = '';
-  // 开局块：永远是对话界面第一个块
-  chat.appendChild(makeBeginningBlock());
+  // 还没开始：一个提示 + 每个开局一个独立块（卡里的 <game_beginning>，全文）。
+  // 已经有开场输入时只显示「开场输入」块。两者都不进 history。
+  if (showBeginnings()) {
+    chat.appendChild(makeBeginningsHint());
+    cur.card_beginnings.forEach((_text, i) => chat.appendChild(makeBeginningBlock(i)));
+  }
+  if (cur.opening_input) chat.appendChild(makeOpeningBlock());
   cur.history.forEach((e, i) => chat.appendChild(makeBlock(e, i)));
-  if (toBottom) {
+  if (toBottom && cur.history.length) {
     stickBottom = true;
     scrollBottom(true);
+  } else if (toBottom) {
+    // 还没开始：开局候选 / 开场输入从顶部看起，别一进来就滚到最下面
+    chat.scrollTop = 0;
+    syncStick();
   } else {
     syncStick();
   }
@@ -577,7 +597,19 @@ function reconcileSession() {
   if (!cur) return;
   syncChrome();
   const chat = $('chat');
-  const desired = [{ key: 'beginning', make: makeBeginningBlock, update: updateBeginningBlock }];
+  const desired = [];
+  // 开局候选和开场输入都不是 history 里的块，只在「还没开始」时出现
+  if (showBeginnings()) {
+    desired.push({ key: 'beginnings-hint', make: makeBeginningsHint });
+    cur.card_beginnings.forEach((_text, i) => desired.push({
+      key: 'beginning:' + i,
+      make: () => makeBeginningBlock(i),
+      update: node => updateBeginningBlock(node, i),
+    }));
+  }
+  if (cur.opening_input) desired.push({
+    key: 'opening', make: makeOpeningBlock, update: updateOpeningBlock,
+  });
   cur.history.forEach((e, i) => desired.push({
     key: blockKey(e, i),
     make: () => makeBlock(e, i),
@@ -663,7 +695,8 @@ function syncMoreMenu() {
 function updateComposer() {
   if (!cur) return;
   syncMoreMenu();
-  // 空历史 = 等待点击「开始」；最后一块是 AI = 等待用户输入；
+  // 空历史 = 还没开始：输入框里写了东西就发首句（进预设的 {{user_input}}），
+  // 留空点按钮则走 /start 让模型自己起头（不带开局）。最后一块是 AI = 等待用户输入；
   // 最后一块是用户块 = 这一轮还没写出来（生成被打断在落盘前、或进程重启过），点「继续」补回来
   const last = cur.history[cur.history.length - 1];
   const started = cur.history.length > 0;
@@ -692,12 +725,15 @@ function updateComposer() {
     btn.classList.add('interrupting');
   } else {
     btn.classList.remove('interrupting');
-    btn.textContent = !started ? '开始' : (resumable ? '继续' : '发送');
+    btn.textContent = !started
+      ? ($('input').value.trim() ? '发送' : '开始')
+      : (resumable ? '继续' : '发送');
     btn.disabled = !(waiting || resumable);
   }
   // 生成期间也放行输入：打字只动本地 DOM，不会触发请求；真正发送仍由「单会话单轮生成」
   // 约束把关（busy 时发送按钮是「打断」）。resumable（末块是 user）静止时仍禁用，避免发到错位上下文。
-  $('input').disabled = !started || (!waiting && !busy);
+  // 空历史也放行：首句要能打出来（见 send）。
+  $('input').disabled = started && !waiting && !busy;
 }
 
 function makeOpsBtn(text, fn) {
@@ -810,27 +846,79 @@ function liveAITag() {
   return null;
 }
 
-function makeBeginningBlock() {
+// 还没开始时，一个提示 + 每个开局一个独立块：全文展示。
+// 「立即开始」直接用这段当第一句；「加入输入框」填进输入框再改。
+function makeBeginningsHint() {
+  const div = document.createElement('div');
+  div.className = 'beginnings-hint';
+  div.setAttribute('data-key', 'beginnings-hint');
+  div.textContent = '还没开始：选一个开局「立即开始」，或「加入输入框」改完再发；也可以直接在下面写第一句。';
+  return div;
+}
+
+function beginningText(i) {
+  return (cur.card_beginnings || [])[i] || '';
+}
+
+function makeBeginningBlock(i) {
   const div = document.createElement('div');
   div.className = 'block beginning';
-  div.setAttribute('data-key', 'beginning');
-  div._text = cur.beginning_text;
-  div.innerHTML = `<div class="tag">开局</div><div class="content markdown">${renderMarkdown(cur.beginning_text || '（空开局）')}</div>`;
+  div.setAttribute('data-key', 'beginning:' + i);
+  div._text = beginningText(i);
+  div.innerHTML = `<div class="tag">开局 ${i + 1}</div>` +
+    `<div class="content markdown">${renderMarkdown(div._text)}</div>` +
+    `<div class="beginning-actions">` +
+      `<button class="beg-start">立即开始</button>` +
+      `<button class="beg-add">加入输入框</button>` +
+    `</div>`;
+  div.querySelector('.beg-start').onclick = () => {
+    const text = beginningText(i);
+    if (!text) return;
+    $('input').value = text;
+    autoGrow();
+    send();
+  };
+  div.querySelector('.beg-add').onclick = () => {
+    const text = beginningText(i);
+    if (!text) return;
+    $('input').value = text;
+    autoGrow();
+    updateComposer();
+    $('input').focus();
+  };
+  return div;
+}
+
+function updateBeginningBlock(div, i) {
+  const text = beginningText(i);
+  if (div._text === text) return;
+  div._text = text;
+  directChild(div, 'tag').textContent = `开局 ${i + 1}`;
+  directChild(div, 'content').innerHTML = renderMarkdown(text);
+}
+
+// 开场输入：玩家选/改的第一句（也是开局）。它不在 history 里，只由预设 section 的
+// {{user_input}} 渲染；块本身给玩家看和改。改它等于改前缀，和以前改开局一样。
+function makeOpeningBlock() {
+  const div = document.createElement('div');
+  div.className = 'block opening';
+  div.setAttribute('data-key', 'opening');
+  div._text = cur.opening_input;
+  div.innerHTML = `<div class="tag">开场输入</div><div class="content markdown">${renderMarkdown(cur.opening_input)}</div>`;
   const ops = document.createElement('div');
   ops.className = 'ops';
-  ops.appendChild(makeOpsBtn('修改', () => editBlock(div, cur.beginning_text, async text => {
-    await api(`/api/sessions/${enc()}/beginning`, post({ text }));
+  ops.appendChild(makeOpsBtn('修改', () => editBlock(div, cur.opening_input, async text => {
+    await api(`/api/sessions/${enc()}/opening_input`, post({ text }));
     await refreshSession();
   })));
   div.appendChild(ops);
   return div;
 }
 
-function updateBeginningBlock(div) {
-  if (div._text === cur.beginning_text) return;
-  div._text = cur.beginning_text;
-  directChild(div, 'content').innerHTML =
-    renderMarkdown(cur.beginning_text || '（空开局）');
+function updateOpeningBlock(div) {
+  if (div._text === cur.opening_input) return;
+  div._text = cur.opening_input;
+  directChild(div, 'content').innerHTML = renderMarkdown(cur.opening_input);
 }
 
 // 工具调用块（与思考块一样默认折叠）：参数尽量按 JSON 美化，调用结果拼在同一块里
@@ -1360,10 +1448,14 @@ async function attachTurn(fresh, seq) {
     if (!reuseAI) { updateComposer(); return; }
   }
   // 这一轮的用户输入后端开局就已落盘（history 末尾就是它，界面已按 history 画好），
-  // 只有末尾不是用户块时才需要现场补画一个
-  const userText = g.mode === 'chat' && !(last && last.role === 'user') ? g.user_input : null;
+  // 只有末尾不是用户块时才需要现场补画一个。空历史的首句不画 user 块：它在
+  // state.opening_input 里，已经由 reconcileSession 画成「开场输入」块。
+  const userText = g.mode === 'chat' && s.history.length && !(last && last.role === 'user')
+    ? g.user_input : null;
   // 新流用 streaming 表示 busy；旧的 reconnect finally 因 seq 变化不会再清它
   reconnecting = false;
+  // 首轮重连：页面可能停在顶部（开局候选），跟住正在生成的正文
+  if (!s.history.length) stickBottom = true;
   await streamInto(`/api/sessions/${encodeURIComponent(sid)}/stream`, {}, userText, reuseAI);
 }
 
@@ -1458,8 +1550,16 @@ function send() {
   if (handleSlashCommand(text)) return;
   $('input').value = '';
   autoGrow();
-  if (!cur.history.length) return; // 首轮用「开始」
   reconnectTries = 0;
+  if (!cur.history.length) {
+    // 首句：后端把它存进 state.opening_input，由预设 section 渲染，不是一条 user 块。
+    // 先把「开场输入」块画出来（玩家要看见自己说了什么），再挂上 AI 的 live 块。
+    cur.opening_input = text;
+    reconcileSession();
+    stickBottom = true;  // 开局候选可能把页面停在顶部，送出后要跟住正文
+    streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }), null);
+    return;
+  }
   streamInto(`/api/sessions/${enc()}/chat`, post({ input: text }), text);
 }
 
@@ -1492,7 +1592,14 @@ $('send').onclick = () => {
   if (streaming || reconnecting || cur.generating) { interrupt(); return; }
   const last = cur.history[cur.history.length - 1];
   reconnectTries = 0;
-  if (!last) streamInto(`/api/sessions/${enc()}/start`, { method: 'POST' });
+  if (!last) {
+    // 空历史：输入框有字 = 玩家先开口；没字 = 不带开场输入，让模型自己起头
+    if ($('input').value.trim()) send();
+    else {
+      stickBottom = true;  // 开局候选可能把页面停在顶部
+      streamInto(`/api/sessions/${enc()}/start`, { method: 'POST' });
+    }
+  }
   else if (last.role === 'user') regenerate();  // 末尾是用户块：把这一轮补出来
   else send();
 };
@@ -1528,13 +1635,13 @@ document.addEventListener('keydown', e => {
 $('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); $('send').click(); }
 });
-// 输入框随内容自动增高（68px ~ 320px）
+// 输入框随内容自动增高（68px ~ 320px）；空历史时按钮文案在「开始 / 发送」之间切换
 function autoGrow() {
   const ta = $('input');
   ta.style.height = 'auto';
   ta.style.height = Math.min(ta.scrollHeight, 320) + 'px';
 }
-$('input').addEventListener('input', autoGrow);
+$('input').addEventListener('input', () => { autoGrow(); updateComposer(); });
 
 $('previewBtn').onclick = () => {
   sessionStorage.setItem('preview_draft', $('input').value);
@@ -1574,19 +1681,11 @@ $('maxTokensInput').onchange = pushParams;
 $('keepTurnsInput').onchange = pushParams;
 
 // ---------- 新建会话 ----------
+// 开局不在这里选：建完会话后，对话区会用卡里的全部开局做「发送 / 修改」候选。
 $('newSessionBtn').onclick = async () => {
   const [presets, cards] = await Promise.all([api('/api/presets'), api('/api/cards')]);
   $('mPreset').innerHTML = presets.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
   $('mCard').innerHTML = cards.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
-  const fillBeginnings = () => {
-    const c = cards.find(x => x.id === $('mCard').value);
-    $('mBeginning').innerHTML = `<option value="">（空开局）</option>` +
-      c.beginnings.map((b, i) => `<option value="${i}">开局 ${i + 1}：${esc(b)}…</option>`).join('');
-    // 默认选中第一个开局，没有开局才是空开局
-    if (c.beginnings.length) $('mBeginning').selectedIndex = 1;
-  };
-  $('mCard').onchange = fillBeginnings;
-  fillBeginnings();
   $('modalMask').style.display = 'flex';
 };
 $('mCancel').onclick = () => $('modalMask').style.display = 'none';
@@ -1595,7 +1694,6 @@ $('mCreate').onclick = async () => {
     name: $('mName').value.trim(),
     preset: $('mPreset').value,
     card: $('mCard').value,
-    beginning_index: $('mBeginning').value === '' ? null : +$('mBeginning').value,
   };
   try {
     const s = await api('/api/sessions', post(body));

@@ -96,7 +96,7 @@ class PresetOptionsInstructionTest(unittest.TestCase):
             "options_instruction": "请给 {{user_setting}} 选项\n- 甲\n- 乙",
         }
         card = {"id": "c", "setting": "世界", "user_setting": "勇者", "beginnings": []}
-        state = {"preset": "p", "card": "c", "beginning_text": ""}
+        state = {"preset": "p", "card": "c", "opening_input": ""}
         expected = "请给 勇者 选项\n- 甲\n- 乙"
         for api_type in ("chat_completions", "responses"):
             with self.subTest(api_type=api_type):
@@ -123,7 +123,7 @@ class PresetOptionsInstructionTest(unittest.TestCase):
     def test_build_options_input_uses_default_when_missing(self):
         preset = {"id": "p", "sections": []}  # 没有 options_instruction
         card = {"id": "c", "setting": "世界", "user_setting": "勇者", "beginnings": []}
-        state = {"preset": "p", "card": "c", "beginning_text": ""}
+        state = {"preset": "p", "card": "c", "opening_input": ""}
         with (
             mock.patch.object(core, "load_presets", return_value={"p": preset}),
             mock.patch.object(core, "load_cards", return_value={"c": card}),

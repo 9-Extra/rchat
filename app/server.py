@@ -181,7 +181,6 @@ def get_cards():
             "id": c["id"],
             "name": c["name"],
             "description": c["description"],
-            "beginnings": [b[:60] for b in c["beginnings"]],
         }
         for c in core.load_cards().values()
     ]
@@ -225,15 +224,14 @@ class CreateSession(BaseModel):
     name: str = ""
     preset: str
     card: str
-    beginning_index: int | None = None
 
 
 @app.post("/api/sessions")
 def post_session(req: CreateSession, user: str | None = Depends(current_user)):
     # 名字归一化、留空自动命名、作用域拼装都在 core.create_session 里（格式规则只在一处）
     try:
-        return core.create_session(user, req.name, req.preset, req.card, req.beginning_index)
-    except (ValueError, IndexError) as e:
+        return core.create_session(user, req.name, req.preset, req.card)
+    except ValueError as e:
         raise HTTPException(400, str(e))
 
 
@@ -243,6 +241,11 @@ def get_session(name: str, user: str | None = Depends(current_user)):
     try:
         state = core.load_state(key)
         state["history"] = core.load_history(key)
+        # 还没开始、也还没有开场输入：把这张卡的全部开局给前端做成「立即开始 / 加入输入框」候选。
+        # 只在这个阶段付全文的代价（角色卡的 <game_beginning> 不再进任何宏）。
+        if not state["history"] and not state.get("opening_input"):
+            card = core.load_cards().get(state.get("card"), {})
+            state["card_beginnings"] = [b for b in card.get("beginnings", []) if b.strip()]
         settings = core.load_settings()
         # 返回实际生效值（会话值非法/缺失时回退默认），供前端选中/填显当前配置
         state["reasoning_effort"] = core.resolve_reasoning_effort(
@@ -418,17 +421,24 @@ async def set_options(name: str, req: SetOptions, user: str | None = Depends(cur
     return state
 
 
-class EditBeginning(BaseModel):
+class EditOpening(BaseModel):
     text: str
 
 
-@app.post("/api/sessions/{name}/beginning")
-async def edit_beginning(name: str, req: EditBeginning, user: str | None = Depends(current_user)):
+@app.post("/api/sessions/{name}/opening_input")
+async def edit_opening_input(
+    name: str, req: EditOpening, user: str | None = Depends(current_user)
+):
+    """改「开场输入」：它只进预设 section 的 {{user_input}}，不在 history 里。
+
+    和改开局一样，改它会改下一次请求的前缀（缓存从头失效），这是有意的：玩家在调整
+    开局设定，而不是在已发生的对话里插话。
+    """
     key = _key(user, name)
     async with _lock_for(key):
         _busy(key)
         state = core.load_state(key)
-        state["beginning_text"] = req.text
+        state["opening_input"] = req.text
         core.save_state(state)
     return state
 
@@ -509,9 +519,16 @@ def preview(req: Preview, user: str | None = Depends(current_user)):
     state = core.load_state(key)
     history = core.load_history(key)
     try:
+        # 预览的首句和真实 /chat 走同一条路：空历史时它不是一条 user 消息，而是填进
+        # state.opening_input 由预设 section 渲染；这里只改内存副本，不落盘。
+        draft = req.input or None
+        if not history:
+            if draft:
+                state = {**state, "opening_input": draft}
+            draft = None
         # 预览展示的就是真实生成会用的那一份 TurnConfig（同一处构造，不会与线上漂移）
         turn = core.build_turn(state)
-        input_items = core.build_input(state, history, req.input or None, turn)
+        input_items = core.build_input(state, history, draft, turn)
     except ValueError as e:
         # 预设宏执行失败：用户侧错误，返回 400 而非 500
         raise HTTPException(400, str(e))
@@ -634,9 +651,19 @@ def _prepare(name: str, mode: str, user_input: str | None) -> dict:
         if history:
             raise ValueError("会话已开始，不能再次开局")
     elif mode == "chat":
-        if not history or history[-1]["role"] != "assistant":
-            raise ValueError("当前不能发送：没有待回复的 AI 块")
-        draft = user_input
+        if not (user_input or "").strip():
+            raise ValueError("输入为空")
+        if history:
+            if history[-1]["role"] != "assistant":
+                raise ValueError("当前不能发送：没有待回复的 AI 块")
+            draft = user_input
+        else:
+            # 会话还一块都没有：这是玩家的第一句。它不追加 user 块，而是存进
+            # state.opening_input，由预设 section 的 {{user_input}} 决定插到哪；
+            # 预设没写这个宏就等于玩家没说过。先落盘再拼上下文——生成中途进程
+            # 被杀，这句话也还在，点「开始」会带着它重来。
+            state["opening_input"] = user_input
+            core.save_state(state)
     else:  # regenerate：丢弃最后一个 AI 块，用它回复的用户输入重新生成
         if history and history[-1]["role"] == "assistant":
             # 压缩后的摘要块不能重掷：把它 pop 掉再重发，等于删掉整个前情、从空历史重开

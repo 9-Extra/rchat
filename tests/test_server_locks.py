@@ -24,7 +24,7 @@ from tests.support import AppTestCase
 
 MUTATORS = [
     "delete_session", "switch_preset", "set_reasoning_effort", "set_endpoint", "set_params",
-    "set_options", "edit_beginning", "edit_ai", "rollback", "fork",
+    "set_options", "edit_opening_input", "edit_ai", "rollback", "fork",
 ]
 
 

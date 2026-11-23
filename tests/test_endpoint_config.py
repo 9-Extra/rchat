@@ -48,7 +48,7 @@ class EndpointApiTypeTest(unittest.TestCase):
         """链尾：build_turn 产出的 TurnConfig 里，api_type 直接可读（不再靠 get 兜底）。"""
         settings = config.Settings.from_mapping(_raw(api_type="responses"))
         preset = {"id": "p", "tools": []}
-        state = {"preset": "p", "card": "c", "beginning_text": ""}
+        state = {"preset": "p", "card": "c", "opening_input": ""}
         with (
             mock.patch.object(core, "load_settings", return_value=settings),
             mock.patch.object(core, "load_presets", return_value={"p": preset}),

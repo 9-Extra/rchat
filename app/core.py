@@ -332,8 +332,8 @@ USER_SETTING_RE = re.compile(r"<user_setting>(.*?)</user_setting>", re.S)
 BEGINNING_RE = re.compile(r"<game_beginning>(.*?)</game_beginning>", re.S)
 # 宏: {{表达式}}。所有预设文本统一按 Python 表达式求值
 MACRO_RE = re.compile(r"\{\{(.*?)\}\}")
-# 宏求值环境中预置的模块;另有上下文变量 game_setting / game_beginning /
-# user_setting (固定宏)和 user_input(仅 preset_user_input 块)
+# 宏求值环境中预置的模块;另有上下文变量 game_setting / user_setting (固定宏)
+# 和 user_input(开场输入;preset_user_input 块里则是本次输入)
 MACRO_MODULES = {"random": random, "time": time, "math": math, "datetime": datetime}
 
 
@@ -358,14 +358,18 @@ def render_template(text: str, env: dict) -> str:
 def _preset_env(state: dict, preset: dict, card: dict) -> dict:
     """预设正文与 <preset_options> 共用的宏求值环境。
 
-    选项阶段没有输入框草稿，所以不该有 user_input；预设 section、user_input 模板各自
-    再按需把额外变量合进来。
+    user_input 是**开场输入**，也就是玩家在会话开始前发的那句话（state["opening_input"]，
+    没发过就是空串）。它每轮都一样，所以放进 section 不会破坏前缀缓存。逐轮输入的同名
+    变量由 <preset_user_input> 模板自己覆盖（见 build_input）。
+
+    角色卡里的 `<game_beginning>` 只是前端「选择开局」候选，不再有同名宏：开局通过
+    `user_input` 进入上下文。
     """
     return {
         **MACRO_MODULES,
         "game_setting": card["setting"],
-        "game_beginning": state["beginning_text"],
         "user_setting": card["user_setting"],
+        "user_input": state.get("opening_input", ""),
     }
 
 
@@ -701,11 +705,14 @@ def list_sessions(user: str | None = None) -> list:
     return out
 
 
-def create_session(user: str | None, name: str, preset: str, card: str, beginning_index):
+def create_session(user: str | None, name: str, preset: str, card: str):
     """新建会话并返回 state。user 是归属用户（本地模式 None），name 是裸会话名。
 
     名字的作用域拼装、归一化与「留空自动命名」都在这儿做：其余端点都按「带作用域的
     会话键」定位已有会话，只有创建这一条路要造名字，格式规则就只在这一个地方维护。
+
+    开局不再在创建时选定：新会话的 opening_input 为空，由玩家在对话区选/改第一句后
+    才进入预设。角色卡里的 `<game_beginning>` 只是前端的候选文本。
     """
     cards = load_cards()
     if preset not in load_presets():
@@ -723,10 +730,6 @@ def create_session(user: str | None, name: str, preset: str, card: str, beginnin
     d = _session_dir(key)
     if d.exists():
         raise ValueError(f"session 已存在: {bare}")
-    if beginning_index is None:
-        text = ""
-    else:
-        text = card_obj["beginnings"][beginning_index]
     d.mkdir(parents=True)
     (d / "history.jsonl").touch()
     settings = load_settings()
@@ -741,8 +744,9 @@ def create_session(user: str | None, name: str, preset: str, card: str, beginnin
         "preset": preset,
         "card": card_obj["id"],
         "card_name": card_obj["name"],
-        "beginning_index": beginning_index,
-        "beginning_text": text,
+        # 玩家的第一句（也是「开局」）。由预设 section 的 {{user_input}} 决定插到哪；
+        # 它不进 history（见 server._prepare），所以没写这个宏的预设就当玩家没说过。
+        "opening_input": "",
         "created_at": time.time(),
         # 每会话固定的 UUID v4,作为 X-Opencode-Session 请求头发送(opencode-go 风控)
         "chat_id": str(uuid.uuid4()),
@@ -932,7 +936,11 @@ def _build_input_chat_completions(state, history, draft, preset, env):
 def build_input(state: dict, history: list, draft, turn: TurnConfig) -> list:
     """拼装发送给模型的完整输入。按本次生效的 api_type 返回 Responses input_items 或
     Chat Completions messages —— turn 由 `build_turn()` 构造，和发给 llm 的是同一个对象，
-    保证「上下文形状」与「请求形状」不会各说各话。"""
+    保证「上下文形状」与「请求形状」不会各说各话。
+
+    首句（state["opening_input"]）不走 draft：它由预设 section 的 {{user_input}} 渲染，
+    不会在 history 里多出一条 user 块；draft 只表示「这一轮输入框里的新输入」。
+    """
     preset = load_presets()[state["preset"]]
     card = load_cards()[state["card"]]
     env = _preset_env(state, preset, card)

@@ -34,7 +34,7 @@ ptc: true
 
 以下是开局场景：
 <start_scene>
-{{game_beginning}}
+{{user_input}}
 </start_scene>
 </system>
 </preset_section>

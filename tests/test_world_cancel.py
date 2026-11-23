@@ -32,7 +32,7 @@ def make_session():
     core._session_dir(KEY).mkdir(parents=True)
     core.save_state({
         "id": "cancelcheck", "name": "cancelcheck", "owner": "alice", "preset": "GM-safe",
-        "card": "龙娘x猫娘", "card_name": "x", "beginning_index": None, "beginning_text": "",
+        "card": "龙娘x猫娘", "card_name": "x", "opening_input": "",
         "created_at": 1.0, "chat_id": "c", "endpoint": 0, "temperature": 0.7,
         "max_tokens": 1000, "reasoning_effort": "low", "options_enabled": False,
     })

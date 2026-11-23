@@ -48,6 +48,7 @@
 - 一切落盘走 `core._atomic_write_text`（同目录临时名 + `os.replace` + 每路径进程内锁）。不用它的后果是实测过的：同步端点跑在线程池里，两人同时写同一文件，每 1000 次约 39 次失败（Linux `FileNotFoundError`、Windows `WinError 32`）。
 - 用户输入在 `_prepare` 时就落盘，助手块由 `_persist` 补。不要合并成「一轮结束才写」——进程被 kill 会丢用户刚打的那句话。
 - 末尾是 user 块 = 可恢复状态（上一轮没写出来），前端据此把发送按钮变成「继续」并走 `/regenerate`。
+- **玩家的第一句就是「开局」**：新会话不带开局，前端把角色卡的 `<game_beginning>` 全文列成候选（`GET /api/sessions/{name}` 在 history 为空且没有开场输入时附 `card_beginnings`），点「立即开始」或「加入输入框」后作为输入发送。发送时存进 `state.opening_input`，由预设 section 的 `{{user_input}}` 渲染；它不落 history，所以首轮落盘后 history 以 assistant 块开头（和 `/start` 同形，`compact_cut` 已处理）。前端单独画「开场输入」块（可改，走 `POST /api/sessions/{name}/opening_input`），改它等于改前缀。**这是对话内容里唯一不进 history 的一块；再想加类似的 macro 前先问「能不能只靠 history 表达」。** 宏只有 `{{user_input}}`，没有 `{{game_beginning}}`：后者只是角色卡里的候选文本标签。
 
 ### 生成与并发
 - 一轮生成跑在会话级后台任务（`_active[会话键]`）里，HTTP 与生成解耦：断开连接只中断转发，生成照旧跑完落盘；重连靠 `/stream` 重放事件（幂等，可多客户端同时接）。别把生成塞进请求生命周期。
@@ -73,10 +74,11 @@
 - **摘要块成为最后一轮时（`keep_turns=0`，即 `cut == len(history)`），选项跟着搬到摘要块上**：压缩前末块已有 `options` 就直接沿用（同一段剧情的延续，重问一遍只换个措辞、白花一次请求），没有且开关打开才补问一次。补问失败记进 `options_error`，压缩本身照常完成。保留原文时末块还是原来那一轮，它的 `options` 原样留着，别拿摘要块去覆盖。`_prepare_options` 不认 `compacted`，所以摘要块天然支持「重新生成选项」，但前端只在它是末块时才给按钮。
 
 ### 前端
-- 同会话刷新只走 `reconcileSession()` 按块 key 增量对账；整页 `renderAll()` 只在**切换会话**时用（且显式滚到底）。一轮结束优先用 `saved` 事件就地定稿，别重建 DOM——否则滚动位置、展开的 details、选区、编辑中的 textarea 都会丢。
+- 同会话刷新只走 `reconcileSession()` 按块 key 增量对账；整页 `renderAll()` 只在**切换会话**时用（已开始的会话滚到底，没开始的滚到顶部）。一轮结束优先用 `saved` 事件就地定稿，别重建 DOM——否则滚动位置、展开的 details、选区、编辑中的 textarea 都会丢。
 - **唯一的例外是压缩**：摘要块替换整段历史，所有块的 key 都变了，`reconcileSession` 会把整棵树对错位，必须走 `selectSession` 整页重建。
 - 每条流有 `sid` / `seq`，重连、对账、滚动前先校验，旧流不许写进新会话。
 - 斜杠指令（`/compact`）在前端解析，不进 `/chat`——后端不该在正文路径里认命令。
+- 空历史时输入框可用：输入非空 → `/chat`（首句进预设），留空点按钮 → `/start`（不带开局让模型自己起头），按钮文案随输入框在「开始 / 发送」间切换。开局候选与「开场输入」都不是 history 块：候选是一条提示 + 每个开局一个 `beginning:<i>` 块（只在 history 空、`opening_input` 空时出现，全文 + 「立即开始」/「加入输入框」），开场块 key `opening`（可改，走 `/opening_input`）；`attachTurn` 只在 history 非空时补画 user 块，否则会多出一个对不上账的 `user:-1`。没开始的会话 `renderAll` 滚到顶部，送出后强制贴底。
 
 ## 踩过的坑（改到相关代码前先看）
 
@@ -98,7 +100,7 @@
 ## 预设 / 角色卡 / 选项（作者契约）
 
 - 代码只处理三类标记：`<preset_section role="system|user|assistant">`、`<preset_user_input>`、`<preset_options>`。其它 XML 标签都是预设的**内部文本**，原样发给模型。不要给新标记加语义，除非确实要改协议。
-- `{{...}}` 按 Python 表达式 eval（`core.render_template`）。固定宏 `game_setting` / `game_beginning` / `user_setting`，环境里另有 `random` / `time` / `math` / `datetime`（`preset_user_input` 块额外有 `user_input`）。严格模式：未知变量或求值出错直接 ValueError，不静默兜底。预设是本机可信文件，不是安全边界。
+- `{{...}}` 按 Python 表达式 eval（`core.render_template`）。固定宏 `game_setting` / `user_setting` / `user_input`，环境里另有 `random` / `time` / `math` / `datetime`。`user_input` 在预设正文（section / `<preset_options>`）里是**开场输入**（`state.opening_input`，没发过就是空串，每轮一样）；`<preset_user_input>` 块里的同名变量是**本次**输入，渲染模板时覆盖它。**没有 `game_beginning` 宏了**：角色卡的 `<game_beginning>` 只是前端「选择开局」的候选文本，进入上下文靠 `user_input`。严格模式：未知变量或求值出错直接 ValueError，不静默兜底。预设是本机可信文件，不是安全边界。
 - `<preset_options>` 是选项请求的**完整指令**，格式要求必须由预设作者自己写清：一行一条、行首 `- `（半角短横线）、无合适选项只输出单独一行「无」、不要前言 / 后记 / 代码围栏 / JSON。代码不会在块外再补任何格式要求。块要放在 `preset_section` 外，多个块取第一个；未定义时回退 `core.OPTIONS_INSTRUCTION`。
 - 预设 frontmatter 的 `tools` 是白名单：顺序即 schema 顺序，未写默认 `world_run` + `read_file`，未知名字（含历史的 `respond`）直接 ValueError。`ptc: true` 时 schema 只剩 `world_run`，其余工具降级为程序内同步绑定。
 

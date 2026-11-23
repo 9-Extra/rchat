@@ -237,7 +237,7 @@ class StreamToolCallsTest(unittest.IsolatedAsyncioTestCase):
         core._session_dir(key).mkdir(parents=True)
         core.save_state({
             "id": key, "name": key, "owner": None, "preset": TEST_PRESET, "card": TEST_CARD,
-            "card_name": TEST_CARD, "beginning_index": 0, "beginning_text": "", "created_at": 1.0,
+            "card_name": TEST_CARD, "opening_input": "", "created_at": 1.0,
             "chat_id": "c", "endpoint": 0, "temperature": 0.7, "max_tokens": 1000,
             "reasoning_effort": "low", "options_enabled": False,
         })

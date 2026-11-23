@@ -66,7 +66,7 @@ class IsolationTest(AppTestCase):
                 r = await client.post("/api/login", json={"username": user, "password": TEST_USERS[user]})
                 self.assertEqual(r.status_code, 200, r.text)
                 r = await client.post("/api/sessions", json={"name": "same", "preset": preset,
-                                                             "card": "龙娘x猫娘", "beginning_index": 0})
+                                                             "card": "龙娘x猫娘"})
                 self.assertEqual(r.status_code, 200, r.text)
                 self.assertEqual(r.json()["id"], "same", "API 只暴露裸会话名")
                 self.assertEqual(r.json()["owner"], user)
@@ -96,12 +96,12 @@ class IsolationTest(AppTestCase):
             for client, user in ((alice, "alice"), (bob, "bob")):
                 await client.post("/api/login", json={"username": user, "password": TEST_USERS[user]})
             await alice.post("/api/sessions", json={"name": "a1", "preset": "GM-safe",
-                                                    "card": "龙娘x猫娘", "beginning_index": 0})
+                                                    "card": "龙娘x猫娘"})
             await alice.post("/api/sessions/a1/params", json={"temperature": 1.9})
             await bob.post("/api/sessions", json={"name": "b1", "preset": "GM-ptc",
-                                                  "card": "龙娘x猫娘", "beginning_index": 0})
+                                                  "card": "龙娘x猫娘"})
             r = await bob.post("/api/sessions", json={"name": "b2", "preset": "GM-ptc",
-                                                      "card": "龙娘x猫娘", "beginning_index": 0})
+                                                      "card": "龙娘x猫娘"})
             self.assertNotEqual(r.json()["temperature"], 1.9, "bob 的新会话继承了 alice 的参数")
 
 
@@ -119,7 +119,7 @@ class SessionNameTest(AppTestCase):
     async def create(self, cid, cards, name=""):
         with mock.patch.object(core, "load_cards", lambda: cards):
             return await self.client.post("/api/sessions", json={
-                "name": name, "preset": TEST_PRESET, "card": cid, "beginning_index": 0,
+                "name": name, "preset": TEST_PRESET, "card": cid,
             })
 
     async def test_auto_name_from_nested_card_stays_bare(self):

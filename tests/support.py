@@ -174,7 +174,7 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def new_session(self, name="s1", preset=TEST_PRESET, card=TEST_CARD):
         r = await self.client.post("/api/sessions", json={
-            "name": name, "preset": preset, "card": card, "beginning_index": 0,
+            "name": name, "preset": preset, "card": card,
         })
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
