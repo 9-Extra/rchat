@@ -1154,7 +1154,9 @@ async function streamInto(url, opts, userText, reuseAI) {
   const ov = {
     sid, seq, userDiv, aiDiv: div, reuseAI: !!reuseAI,
     contentDiv: directChild(div, 'content'),
-    partial: '', painted: '', scheduled: false, frame: 0, saved: false, heard: false,
+    partial: '', painted: '', scheduled: false, frame: 0, heard: false,
+    // saved 事件带来的落盘块（含本轮新写的 user 块），收尾时就地定稿用
+    savedIndex: null, savedEntry: null, savedUser: null,
   };
   overlay = ov;
   // 流内滚动绑在当前这条流上：切走以后旧流不能再滚新会话
@@ -1234,8 +1236,12 @@ async function streamInto(url, opts, userText, reuseAI) {
           thinkDiv = null;
           scrollStream();
         }
-        // 助手块已落盘：整轮结束时优先就地定稿，不再整页重建
-        else if (ev.type === 'saved') { ov.saved = true; }
+        // 助手块已落盘：事件里带着落盘块本身，收尾时直接补进本地 history，不再拉整份 history
+        else if (ev.type === 'saved') {
+          ov.savedIndex = ev.index;
+          ov.savedEntry = ev.entry || null;
+          ov.savedUser = ev.user || null;
+        }
         // 正文之后的选项请求：先淡色占位，拿到后换成按钮；失败换成提示+重试
         else if (ev.type === 'options_start') {
           const p = document.createElement('div');
@@ -1256,6 +1262,11 @@ async function streamInto(url, opts, userText, reuseAI) {
           // 用户侧错误（如预设宏执行失败）弹窗提示；其余错误内联显示在 AI 块。
           // 半截输出已落盘时保留已流出的正文，错误说明用 .errnote 另起一行。
           if (ev.popup) alert(ev.message);
+          // 服务端把「最近一次失败」一并送来：没有收尾快照也要让错误条跟上
+          if (cur && ev.last_error !== undefined) {
+            cur.last_error = ev.last_error;
+            syncErrorBar();
+          }
           // 只重掷选项时正文不动，错误只弹窗提示
           if (!reuseAI) {
             directChild(div, 'tag').textContent = '出错';
@@ -1290,7 +1301,7 @@ async function streamInto(url, opts, userText, reuseAI) {
   if (seq !== streamSeq) return;
   activeReader = null;
   reconnectTries = 0;
-  // 拉快照 + 就地定稿期间继续保持 busy，避免用户抢在当前轮对账前发下一轮
+  // 收尾（就地定稿或补拉快照）期间继续保持 busy，避免用户抢在当前轮对账前发下一轮
   finalizing = true;
   try {
     await finalizeFromServer(seq, sid, ov);
@@ -1303,12 +1314,65 @@ async function streamInto(url, opts, userText, reuseAI) {
   }
 }
 
-// 正常结束/打断后拉一次权威快照：saved 就地定稿，否则按快照重建缺的块
+// 正常结束/打断后收尾：saved 事件已经带着落盘块，直接补进本地 history 就地定稿；
+// 只有拿不到 saved（被用户打断、断线后服务端才落盘）或索引对不上时才回服务端。
 async function finalizeFromServer(seq, sid, ov) {
   if (seq !== streamSeq || !cur || cur.id !== sid) return;
+  if (ov && ov.savedEntry && applySavedEntry(ov)) {
+    finalizeTurn(ov, seq);
+    return;
+  }
+  await resyncSession(seq, sid, ov);
+}
+
+// 把 saved 里的落盘块补进本地 history（不再为这一块拉整份 history）。
+// 三种位置：新块（start / 首句 / 重连后 user 块已并进 history）、
+// 原地替换（regenerate / 只重掷选项）、chat 时先补本轮回合新写的 user 块再补 AI 块。
+// 对不上就返回 false，回退到拉快照——宁可多一次请求，也不猜。
+function applySavedEntry(ov) {
+  const h = cur.history;
+  if (ov.savedIndex === h.length) {
+    h.push(ov.savedEntry);
+  } else if (ov.savedIndex === h.length - 1 && h.length) {
+    h[h.length - 1] = ov.savedEntry;
+  } else if (ov.savedIndex === h.length + 1 && ov.savedUser) {
+    h.push(ov.savedUser, ov.savedEntry);
+  } else {
+    return false;
+  }
+  // 这一轮已经结束：generating 由快照带回来的那个值不再需要
+  cur.generating = null;
+  return true;
+}
+
+// 会话地址：history_from>0 只取历史尾部（重连/补块用），0 = 整份
+function sessionPath(sid, from) {
+  const base = '/api/sessions/' + encodeURIComponent(sid);
+  return from > 0 ? base + '?history_from=' + from : base;
+}
+
+// 把 GET 会话合并进当前会话：history_from>0 表示响应是「接在本地 history 后面」的增量。
+// 前缀对不上（例如别的设备压缩/回滚过）就整份替换，不做半截拼接。
+function mergeSession(s) {
+  if (!cur || cur.id !== s.id || !s.history_from) {
+    cur = s;  // 整份快照
+    return false;
+  }
+  if (s.history_from === cur.history.length) {
+    cur = { ...s, history: cur.history.concat(s.history) };
+    return true;
+  }
+  // 理论上到不了这里（请求的 from 就是本地长度）：只更新元信息，不拿半截覆盖本地历史
+  cur = { ...s, history: cur.history };
+  return false;
+}
+
+// 异常收尾：只补服务端已经多出来的块（通常 1~2 条），不再整份拉。
+async function resyncSession(seq, sid, ov) {
+  const from = cur && cur.id === sid ? cur.history.length : 0;
   let s;
   try {
-    s = await api('/api/sessions/' + encodeURIComponent(sid));
+    s = await api(sessionPath(sid, from));
   } catch (e) {
     if (seq !== streamSeq) return;
     if (ov && ov.reuseAI) {
@@ -1326,13 +1390,19 @@ async function finalizeFromServer(seq, sid, ov) {
     return;
   }
   if (seq !== streamSeq || !cur || cur.id !== sid) return;
-  finalizeTurn(s, ov, seq);
+  mergeSession(s);
+  overlay = null;
+  removeLiveNodes();
+  reconcileSession();
+  syncStick();
+  updateComposer();
+  loadSessions().catch(() => {});
 }
 
-function finalizeTurn(s, ov, seq) {
-  if (seq !== streamSeq || !cur || cur.id !== s.id) return;
-  cur = s;
-  const h = s.history;
+// 就地定稿：history 已由 applySavedEntry 更新好，这里只动 DOM，不重建整棵树
+function finalizeTurn(ov, seq) {
+  if (seq !== streamSeq || !cur) return;
+  const h = cur.history;
   const last = h[h.length - 1];
   if (ov) {
     if (ov.reuseAI && last && last.role === 'assistant') {
@@ -1346,7 +1416,7 @@ function finalizeTurn(s, ov, seq) {
       const btns = div.querySelectorAll('button');
       for (let k = 0; k < btns.length; k++) btns[k].disabled = false;
       div._sig = entrySig(last);
-    } else if (!ov.reuseAI && ov.saved && last && last.role === 'assistant') {
+    } else if (!ov.reuseAI && last && last.role === 'assistant') {
       const i = h.length - 1;
       const div = ov.aiDiv;
       paintNow(ov);
@@ -1378,10 +1448,8 @@ function finalizeTurn(s, ov, seq) {
   loadSessions().catch(() => {});
 }
 
-// 这一轮已在服务端结束：丢掉 live 覆盖层，按快照对账（不重建没变的块）
-function finishFromSnapshot(s) {
-  if (!cur || cur.id !== s.id) return;
-  cur = s;
+// 这一轮已在服务端结束（history 已合并好）：丢掉 live 覆盖层，按 history 对账
+function finishFromSnapshot() {
   overlay = null;
   removeLiveNodes();
   reconcileSession();
@@ -1389,16 +1457,18 @@ function finishFromSnapshot(s) {
   loadSessions().catch(() => {});
 }
 
-// 断线后重连续看：后端还在生成就重放整轮接上，这一轮已结束就按快照对账。
+// 断线后重连续看：后端还在生成就重放整轮接上，这一轮已结束就补上缺的块。
 // seq/sid 保证切到别的会话后，旧流的重连不会把新会话顶掉。
 async function reconnectTurn(seq, sid) {
   if (seq !== streamSeq || !cur || cur.id !== sid) return;
+  // 只拉本地缺的那几个块：重连时通常只差这一轮开始时就落盘的 user 块
   let s = null;
-  try { s = await api('/api/sessions/' + encodeURIComponent(sid)); } catch (e) {}
+  try { s = await api(sessionPath(sid, cur.history.length)); } catch (e) {}
   if (seq !== streamSeq || !cur || cur.id !== sid) return;
   if (s && !s.generating) {
     reconnectTries = 0;
-    finishFromSnapshot(s);
+    mergeSession(s);
+    finishFromSnapshot();
     return;
   }
   if (++reconnectTries > 12) {
@@ -1415,30 +1485,30 @@ async function reconnectTurn(seq, sid) {
 }
 
 // 接上后端正在进行的这一轮（页面加载、断线重连、切回前台共用）：
-// 先按快照对账已提交历史，再挂上 overlay 重放本轮流。
+// 先按快照对账已提交历史（能增量就只补缺的块），再挂上 overlay 重放本轮流。
 async function attachTurn(fresh, seq) {
   if (seq != null && seq !== streamSeq) return;
   if (selecting || streaming || finalizing || !cur) return;
   const sid = cur.id;
   let s = fresh;
   if (!s) {
-    try { s = await api('/api/sessions/' + encodeURIComponent(sid)); }
+    try { s = await api(sessionPath(sid, cur.history.length)); }
     catch (e) { await reconnectTurn(seq, sid); return; }
   }
   if (seq != null && seq !== streamSeq) return;
   if (!cur || cur.id !== sid || s.id !== sid || streaming || finalizing) return;
-  cur = s;
+  mergeSession(s);
   overlay = null;
   removeLiveNodes();
   reconcileSession();
-  const g = s.generating;
+  const g = cur.generating;
   if (!g) { updateComposer(); return; }
   // 压缩不产生正文块：直接读它的流，等结束由 compactStream 整页重画
   if (g.mode === 'compact') {
     await compactStream(`/api/sessions/${encodeURIComponent(sid)}/stream`, {});
     return;
   }
-  const last = s.history[s.history.length - 1];
+  const last = cur.history[cur.history.length - 1];
   // options（只重掷选项）：正文已落盘，复用最后一个 AI 块接选项事件
   let reuseAI = null;
   if (g.mode === 'options') {
@@ -1450,12 +1520,12 @@ async function attachTurn(fresh, seq) {
   // 这一轮的用户输入后端开局就已落盘（history 末尾就是它，界面已按 history 画好），
   // 只有末尾不是用户块时才需要现场补画一个。空历史的首句不画 user 块：它在
   // state.opening_input 里，已经由 reconcileSession 画成「开场输入」块。
-  const userText = g.mode === 'chat' && s.history.length && !(last && last.role === 'user')
+  const userText = g.mode === 'chat' && cur.history.length && !(last && last.role === 'user')
     ? g.user_input : null;
   // 新流用 streaming 表示 busy；旧的 reconnect finally 因 seq 变化不会再清它
   reconnecting = false;
   // 首轮重连：页面可能停在顶部（开局候选），跟住正在生成的正文
-  if (!s.history.length) stickBottom = true;
+  if (!cur.history.length) stickBottom = true;
   await streamInto(`/api/sessions/${encodeURIComponent(sid)}/stream`, {}, userText, reuseAI);
 }
 
@@ -1716,7 +1786,8 @@ document.addEventListener('visibilitychange', async () => {
       reconnectTries = 0;
       await attachTurn(s);
     } else if (overlay || cur.generating) {
-      finishFromSnapshot(s);
+      cur = s;
+      finishFromSnapshot();
     } else {
       cur = s;
       reconcileSession();

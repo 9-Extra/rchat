@@ -236,14 +236,26 @@ def post_session(req: CreateSession, user: str | None = Depends(current_user)):
 
 
 @app.get("/api/sessions/{name}")
-def get_session(name: str, user: str | None = Depends(current_user)):
+def get_session(name: str, history_from: int = 0, user: str | None = Depends(current_user)):
+    """会话快照。`history_from=N` 只返回 history[N:]（掉线重连/打断后补块用）。
+
+    响应里始终带 `history_total`（完整长度）和 `history_from`（实际切点，0 = 全量）：
+    前端拿这两项决定「接到本地 history 后面」还是「整份替换」。参数越界（负数 / 超过
+    总长度）一律退化成全量，不做静默截断。
+    """
     key = _key(user, name)
     try:
         state = core.load_state(key)
-        state["history"] = core.load_history(key)
+        history = core.load_history(key)
+        total = len(history)
+        start = history_from if 0 < history_from <= total else 0
+        state["history"] = history[start:]
+        state["history_total"] = total
+        state["history_from"] = start
         # 还没开始、也还没有开场输入：把这张卡的全部开局给前端做成「立即开始 / 加入输入框」候选。
         # 只在这个阶段付全文的代价（角色卡的 <game_beginning> 不再进任何宏）。
-        if not state["history"] and not state.get("opening_input"):
+        # 判空要看完整 history，不能用上面的切片。
+        if not total and not state.get("opening_input"):
             card = core.load_cards().get(state.get("card"), {})
             state["card_beginnings"] = [b for b in card.get("beginnings", []) if b.strip()]
         settings = core.load_settings()
@@ -640,6 +652,22 @@ def _persist(name, history, mode, user_input, draft, content, options, reasoning
         entry["tool_calls"] = tool_calls
     history.append(entry)
     core.save_history(name, history)
+    return entry
+
+
+def _saved_event(entry: dict, history: list, mode: str | None) -> dict:
+    """一轮落盘后发给前端的 saved：带上落盘块本身。
+
+    前端拿到它就能就地定稿，不必再 GET 整份 history（长会话每轮少传几百 KB）。
+    `user` 只在这轮确实新写了一条 user 块时给（mode=chat 且已有历史）：那条块
+    前端本地 history 里还没有，要让前端知道先补什么。
+    """
+    return {
+        "type": "saved",
+        "index": len(history) - 1,
+        "entry": entry,
+        "user": history[-2] if mode == "chat" and len(history) >= 2 else None,
+    }
 
 
 def _prepare(name: str, mode: str, user_input: str | None) -> dict:
@@ -770,7 +798,7 @@ async def _run(gen: dict, prep: dict) -> None:
             else:
                 _emit(gen, {"type": "options", "options": options})
         # 成功后一次性落盘
-        _persist(
+        entry = _persist(
             name,
             history,
             mode,
@@ -785,12 +813,12 @@ async def _run(gen: dict, prep: dict) -> None:
         )
         # 世界状态随历史提交,快照键为落盘后的历史长度
         world.commit_turn(name, len(history))
-        # 助手块已落盘：前端据此把流式块就地定稿（没有这个事件时按快照重建）
-        _emit(gen, {"type": "saved", "index": len(history) - 1})
+        # 助手块已落盘：前端据此把流式块就地定稿（不用再拉整份 history）
+        _emit(gen, _saved_event(entry, history, mode))
     except asyncio.CancelledError:
         # 用户打断：半截输出落盘，由用户手动回滚、修改或就地重试
         if streaming_started:
-            _persist(
+            entry = _persist(
                 name,
                 history,
                 mode,
@@ -805,7 +833,7 @@ async def _run(gen: dict, prep: dict) -> None:
             )
             # 半截回合已进历史,其世界状态改动一并提交,保持叙事与状态一致
             world.commit_turn(name, len(history))
-            _emit(gen, {"type": "saved", "index": len(history) - 1})
+            _emit(gen, _saved_event(entry, history, mode))
         else:
             world.abort_turn(name)
     except ValueError as e:
@@ -813,7 +841,8 @@ async def _run(gen: dict, prep: dict) -> None:
         world.abort_turn(name)
         _set_session_error(name, str(e))
         logger.warning("会话 %s 用户侧错误: %s", name, e)
-        _emit(gen, {"type": "error", "message": str(e), "popup": True})
+        _emit(gen, {"type": "error", "message": str(e), "popup": True,
+                    "last_error": _session_error_of(name)})
     except Exception as e:
         # 后端/API 错误：控制台保留完整堆栈。半截结果照打断的先例落盘（带 error
         # 标记），让用户看到到底发生了什么，可修改/回滚/重新输出；已执行的工具
@@ -822,7 +851,7 @@ async def _run(gen: dict, prep: dict) -> None:
         logger.exception("会话 %s 生成失败", name)
         _set_session_error(name, str(e))
         if streaming_started:
-            _persist(
+            entry = _persist(
                 name,
                 history,
                 mode,
@@ -835,10 +864,11 @@ async def _run(gen: dict, prep: dict) -> None:
                 error=str(e),
             )
             world.commit_turn(name, len(history))
-            _emit(gen, {"type": "saved", "index": len(history) - 1})
+            _emit(gen, _saved_event(entry, history, mode))
         else:
             world.abort_turn(name)
-        _emit(gen, {"type": "error", "message": str(e), "persisted": streaming_started})
+        _emit(gen, {"type": "error", "message": str(e), "persisted": streaming_started,
+                    "last_error": _session_error_of(name)})
     finally:
         gen["finished"] = True
         gen["wake"].set()
@@ -896,13 +926,16 @@ async def _run_options(gen: dict, prep: dict) -> None:
             entry.pop("options_raw", None)
             _emit(gen, {"type": "options", "options": options})
         core.save_history(name, history)
+        # 改写后的末块也用 saved 送回：前端就地替换，不必再拉整份 history
+        _emit(gen, _saved_event(entry, history, None))
     except asyncio.CancelledError:
         raise  # 用户打断：选项没生成出来，历史保持原样
     except Exception as e:
         logger.exception("会话 %s 重新生成选项失败", name)
         message = f"重新生成选项失败：{e}"
         _set_session_error(name, message)
-        _emit(gen, {"type": "error", "message": message, "popup": True})
+        _emit(gen, {"type": "error", "message": message, "popup": True,
+                    "last_error": _session_error_of(name)})
     finally:
         gen["finished"] = True
         gen["wake"].set()
@@ -956,7 +989,8 @@ async def _generate(name: str, mode: str, user_input: str | None):
                 )
                 _active[name] = gen
     if gen is None:
-        yield _sse({"type": "error", "message": error, "popup": True})
+        yield _sse({"type": "error", "message": error, "popup": True,
+                    "last_error": _session_error_of(name)})
         return
     async for chunk in _tail(gen):
         yield chunk
@@ -1214,7 +1248,8 @@ async def _compact_stream(name: str, extra: str):
                 gen["task"] = asyncio.create_task(_run_compact(gen, prep))
                 _active[name] = gen
     if gen is None:
-        yield _sse({"type": "error", "message": error, "popup": True})
+        yield _sse({"type": "error", "message": error, "popup": True,
+                    "last_error": _session_error_of(name)})
         return
     async for chunk in _tail(gen):
         yield chunk

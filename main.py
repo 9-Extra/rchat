@@ -98,7 +98,12 @@ def main() -> None:
     sock.bind((args.host, args.port))
     sock.listen(2048)
     # proxy_headers：放在 Caddy/nginx 后面时，日志与限速用得到真实的客户端地址
-    server = uvicorn.Server(uvicorn.Config(app, log_level="info", proxy_headers=True))
+    # timeout_keep_alive：默认 5s，而前端侧栏正好每 5s 轮询一次——空闲连接总在两次请求
+    # 之间被关掉，每次轮询都要重新握手（走 TLS 时还要多一次 TLS 握手）。调到 75s，
+    # 既覆盖轮询间隔，也扛得住常见反代的 60s 空闲超时。
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_level="info", proxy_headers=True, timeout_keep_alive=75)
+    )
 
     async def serve() -> None:
         if not args.no_browser:

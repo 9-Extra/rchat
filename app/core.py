@@ -812,18 +812,85 @@ def save_state(state: dict) -> None:
     )
 
 
-def load_history(name: str) -> list:
-    f = _session_dir(name) / "history.jsonl"
-    if not f.exists():
+# history.jsonl 的解析缓存。解析一份长历史不便宜（实测 2.2 MB / 600 条 ≈ 8.5 ms），
+# 而侧栏每 5 秒轮询一次都要为每个会话重算轮数、每轮收尾还要整份读一次；会话多、历史长
+# 时这些重复解析是纯浪费。按「文件身份」(mtime_ns, size) 缓存解析结果：所有写入都走
+# save_history，写后立即失效，所以应用自己改的 history 不会读到旧值。
+#
+# 只读路径（count_turns）直接用缓存里那份；load_history 返回浅拷贝（list + 每项 dict），
+# 调用方 append / pop / 改顶层键都不会污染缓存——本项目的 history 改动都只动顶层键。
+# 新增改 history 的代码必须保持这个约定：别原地改嵌套的 options / tool_calls 列表。
+_HISTORY_CACHE: dict[Path, tuple[tuple[int, int], list, int]] = {}
+_HISTORY_CACHE_GUARD = threading.Lock()
+_HISTORY_CACHE_BYTES = 0
+# 缓存的文件字节总量上限；超出按插入顺序淘汰最旧的条目（侧栏轮询本来就按目录顺序读，
+# 淘汰顺序接近轮转，够用；维护真 LRU 不值）
+_HISTORY_CACHE_MAX_BYTES = 32 * 1024 * 1024
+# 单份历史超过这个大小就不缓存：别为一个极端长会话把内存吃满，这类会话本来就该压缩
+_HISTORY_CACHE_MAX_FILE = 16 * 1024 * 1024
+
+
+def _drop_history_cache(path: Path) -> None:
+    global _HISTORY_CACHE_BYTES
+    with _HISTORY_CACHE_GUARD:
+        old = _HISTORY_CACHE.pop(path, None)
+        if old is not None:
+            _HISTORY_CACHE_BYTES -= old[2]
+
+
+def _history_entries(name: str) -> list:
+    """解析缓存里的内部视图，调用方**不得**修改返回的 list 或其中的 dict。"""
+    global _HISTORY_CACHE_BYTES
+    path = _session_dir(name) / "history.jsonl"
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        # 会话被删/还没落过盘：顺手把缓存里的旧条目清掉，别让它一直占着内存
+        _drop_history_cache(path)
         return []
-    return [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
+    stamp = (st.st_mtime_ns, st.st_size)
+    with _HISTORY_CACHE_GUARD:
+        hit = _HISTORY_CACHE.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    entries = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if st.st_size > _HISTORY_CACHE_MAX_FILE:
+        return entries
+    with _HISTORY_CACHE_GUARD:
+        old = _HISTORY_CACHE.pop(path, None)
+        if old is not None:
+            _HISTORY_CACHE_BYTES -= old[2]
+        if _HISTORY_CACHE_BYTES + st.st_size > _HISTORY_CACHE_MAX_BYTES:
+            # 超预算：从最旧的开始淘汰，直到放得下这份新的
+            while _HISTORY_CACHE_BYTES + st.st_size > _HISTORY_CACHE_MAX_BYTES:
+                oldest = next(iter(_HISTORY_CACHE), None)
+                if oldest is None:
+                    break
+                _HISTORY_CACHE_BYTES -= _HISTORY_CACHE.pop(oldest)[2]
+        _HISTORY_CACHE[path] = (stamp, entries, st.st_size)
+        _HISTORY_CACHE_BYTES += st.st_size
+    return entries
+
+
+def load_history(name: str) -> list:
+    # 浅拷贝：调用方拿到的是自己的副本，缓存那份始终保持「磁盘上刚解析出来的样子」。
+    # dict 里的嵌套值（options / tool_calls）也是共用的，所以那些列表只能整体替换、不能原地改。
+    return [dict(entry) for entry in _history_entries(name)]
 
 
 def save_history(name: str, history: list) -> None:
+    path = _session_dir(name) / "history.jsonl"
     _atomic_write_text(
-        _session_dir(name) / "history.jsonl",
+        path,
         "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in history),
     )
+    # 写后失效：下一次 load_history 重新解析（也因此不需要维护「保存时把新列表塞进缓存」
+    # 这条容易和异常分支对不上的路径）。
+    _drop_history_cache(path)
 
 
 def count_turns(name: str) -> int:
@@ -833,7 +900,7 @@ def count_turns(name: str) -> int:
     """
     return sum(
         1
-        for e in load_history(name)
+        for e in _history_entries(name)
         if e.get("role") == "assistant" and not e.get("compacted")
     )
 

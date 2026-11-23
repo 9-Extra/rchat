@@ -46,6 +46,7 @@
 - 会话键 = `core.session_key(user, name)`，即 `"<user>/<name>"`（本地模式 `user=None` 时是裸名），落盘 `sessions/<user>/<name>/`。**API 路径只暴露裸名**，用户名只从 cookie 取——这也顺带避开 `%2F` 被 Starlette 解码成 `/`、`{name}` 匹配不上的问题。
 - 会话名归一化（strip、`/`→`-`、空名自动命名）只在 `core.create_session` 一处。其它端点只定位已存在的会话，不自己造名字。
 - 一切落盘走 `core._atomic_write_text`（同目录临时名 + `os.replace` + 每路径进程内锁）。不用它的后果是实测过的：同步端点跑在线程池里，两人同时写同一文件，每 1000 次约 39 次失败（Linux `FileNotFoundError`、Windows `WinError 32`）。
+- `history.jsonl` 有进程内解析缓存（`core._HISTORY_CACHE`，按 `mtime_ns + size` 认文件）。读一律走 `load_history`：它返回**浅拷贝**（list + 每项 dict），调用方可以 append / pop / 改顶层键；写必须走 `save_history`，它写后立即失效。别原地改嵌套的 `options` / `tool_calls` 列表，也别绕过 `save_history` 直接写文件——那样要等文件时间/长度变化才失效。缓存有 32 MiB 总量、16 MiB 单文件上限，超了按插入顺序淘汰或干脆不缓存；`count_turns` 走只读视图，不再拷贝。
 - 用户输入在 `_prepare` 时就落盘，助手块由 `_persist` 补。不要合并成「一轮结束才写」——进程被 kill 会丢用户刚打的那句话。
 - 末尾是 user 块 = 可恢复状态（上一轮没写出来），前端据此把发送按钮变成「继续」并走 `/regenerate`。
 - **玩家的第一句就是「开局」**：新会话不带开局，前端把角色卡的 `<game_beginning>` 全文列成候选（`GET /api/sessions/{name}` 在 history 为空且没有开场输入时附 `card_beginnings`），点「立即开始」或「加入输入框」后作为输入发送。发送时存进 `state.opening_input`，由预设 section 的 `{{user_input}}` 渲染；它不落 history，所以首轮落盘后 history 以 assistant 块开头（和 `/start` 同形，`compact_cut` 已处理）。前端单独画「开场输入」块（可改，走 `POST /api/sessions/{name}/opening_input`），改它等于改前缀。**这是对话内容里唯一不进 history 的一块；再想加类似的 macro 前先问「能不能只靠 history 表达」。** 宏只有 `{{user_input}}`，没有 `{{game_beginning}}`：后者只是角色卡里的候选文本标签。
@@ -75,6 +76,7 @@
 
 ### 前端
 - 同会话刷新只走 `reconcileSession()` 按块 key 增量对账；整页 `renderAll()` 只在**切换会话**时用（已开始的会话滚到底，没开始的滚到顶部）。一轮结束优先用 `saved` 事件就地定稿，别重建 DOM——否则滚动位置、展开的 details、选区、编辑中的 textarea 都会丢。
+- 一轮正常结束**不拉整份 history**：`saved` 事件自带落盘块（`entry`、`index`、本轮新写的 `user` 块），`applySavedEntry` 直接补进本地 `cur.history` 定稿。拿不到 `saved`（打断、断线后服务端才落盘）或索引对不上时才 `GET /api/sessions/{name}?history_from=N` 补尾部，`mergeSession` 拼到本地历史后面；整份 GET 只留给打开会话、切回前台对账、以及增量拼不上的兜底。改 `saved` 的字段要同步 `tests/test_session_sync.py` 和前端这三处。
 - **唯一的例外是压缩**：摘要块替换整段历史，所有块的 key 都变了，`reconcileSession` 会把整棵树对错位，必须走 `selectSession` 整页重建。
 - 每条流有 `sid` / `seq`，重连、对账、滚动前先校验，旧流不许写进新会话。
 - 斜杠指令（`/compact`）在前端解析，不进 `/chat`——后端不该在正文路径里认命令。
