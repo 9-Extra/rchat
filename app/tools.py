@@ -346,6 +346,22 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+def _timeout_text(chunk) -> str:
+    """把超时路径拿到的输出片段统一成 str。
+
+    `TimeoutExpired.stdout/stderr` 即使 `text=True` 也是 bytes——CPython 在
+    `_check_timeout` 里用 `b''.join(...)` 构造异常，不走 TextIOWrapper。Linux 上超时前
+    已经读到的输出会进这里，直接和第二次 `communicate()` 的 str 相加就抛
+    `TypeError: can't concat str to bytes`（Windows 上通常是 None/空，所以不易发现）。
+    截断的 UTF-8 尾巴用 replace 兜住。
+    """
+    if not chunk:
+        return ""
+    if isinstance(chunk, bytes):
+        return chunk.decode("utf-8", "replace")
+    return chunk
+
+
 def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = None) -> str:
     """在工作目录里跑一段 shell 命令，返回退出码与合并后的输出。
 
@@ -399,8 +415,8 @@ def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = Non
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
         # 先收下已经读到的部分，再杀整棵树，最后把剩下的读回来
-        partial_out = e.stdout or ""
-        partial_err = e.stderr or ""
+        partial_out = _timeout_text(e.stdout)
+        partial_err = _timeout_text(e.stderr)
         _kill_tree(proc)
         try:
             rest_out, rest_err = proc.communicate(timeout=BASH_KILL_GRACE)
@@ -411,7 +427,9 @@ def bash(command: str, timeout: int = BASH_TIMEOUT, cwd: str | Path | None = Non
                 proc.wait(timeout=1)
             except (OSError, subprocess.SubprocessError):
                 pass
-        partial = (partial_out + rest_out) + (partial_err + rest_err)
+        partial = (partial_out + _timeout_text(rest_out)) + (
+            partial_err + _timeout_text(rest_err)
+        )
         return (
             f"错误：命令超过 {timeout}s 未结束，已被终止。\n<output>\n"
             f"{partial[:BASH_MAX_CHARS]}</output>"

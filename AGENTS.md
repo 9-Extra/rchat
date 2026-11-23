@@ -97,6 +97,7 @@
 | 旧会话指向了另一个模型 | 端点身份 = `endpoints` **列表下标**，重排列表就会改掉所有旧会话的指向。 |
 | Windows 上 bash 工具每条命令都卡满 60s | `shutil.which("bash")` 会优先命中 `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe`——0 字节的 WSL 启动器，`-c` 直接挂住。`_shell()` 必须跳过它、优先探测 Git Bash 的安装目录，并实际跑一条短命令确认能出结果。 |
 | bash 超时后要等很久才返回 | 只杀 bash 会留下攥着管道写端的孙进程，`communicate()` 要等它们退出（实测 1s 超时实际 5s）。超时要用 `taskkill /T` / `killpg` 杀整棵树，再 `communicate(timeout=...)` 收尾。 |
+| Linux 上 bash 超时报 `TypeError: can't concat str to bytes` | `TimeoutExpired.stdout/stderr` 即使 `text=True` 也是 bytes（CPython 在 `_check_timeout` 里用 `b''.join` 构造异常）；Windows 上读线程没跑完、拿到的是 None，所以本地不暴露。超时路径统一走 `_timeout_text` 解码再拼。 |
 | 模型跑 `cat` 或交互式命令时挂到超时 | `Popen` 继承服务进程的 stdin 会一直等输入；必须 `stdin=DEVNULL`，让这类命令立刻 EOF。 |
 
 ## 预设 / 角色卡 / 选项（作者契约）
